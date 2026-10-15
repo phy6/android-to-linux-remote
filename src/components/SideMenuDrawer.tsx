@@ -64,7 +64,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
   isSimulatorActive,
 }) => {
   const { triggerClick } = useHaptics(settings.hapticFeedback, settings.soundFeedback);
-  const [tailscaleIp, setTailscaleIp] = useState(connectionStatus.hostAddress || '192.0.2.10:8080');
+  const [tailscaleIp, setTailscaleIp] = useState(connectionStatus.hostAddress || '');
   const [alertPermission, setAlertPermission] = useState<AlertPermission>(notificationSupport());
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'tailscale' | 'keys' | 'settings'>('tailscale');
@@ -312,7 +312,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                     type="text"
                     value={tailscaleIp}
                     onChange={(e) => setTailscaleIp(e.target.value)}
-                    placeholder="e.g. 192.0.2.10:8080"
+                    placeholder="e.g. my-laptop.tailnet.ts.net:8080"
                     className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-3.5 py-2.5 text-sm text-white font-mono placeholder-slate-600 focus:outline-none focus:border-sky-500"
                   />
                   <span className="text-[10px] text-slate-500 mt-1 block">
@@ -331,11 +331,17 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                 ) : (
                   <button
                     type="submit"
-                    disabled={connectionStatus.connecting}
-                    className="w-full py-2.5 px-4 rounded-xl font-medium text-xs bg-sky-600 text-white hover:bg-sky-500 shadow-md shadow-sky-600/30 transition flex items-center justify-center gap-2"
+                    disabled={connectionStatus.connecting || !tailscaleIp.trim()}
+                    className="w-full py-2.5 px-4 rounded-xl font-medium text-xs bg-sky-600 text-white hover:bg-sky-500 shadow-md shadow-sky-600/30 transition flex items-center justify-center gap-2 disabled:opacity-40 disabled:pointer-events-none"
                   >
                     <Wifi className="w-4 h-4" />
-                    <span>{connectionStatus.connecting ? 'Connecting...' : 'Connect to Laptop'}</span>
+                    <span>
+                      {connectionStatus.connecting
+                        ? 'Connecting...'
+                        : tailscaleIp.trim()
+                          ? 'Connect to Laptop'
+                          : 'Enter your laptop address'}
+                    </span>
                   </button>
                 )}
               </form>

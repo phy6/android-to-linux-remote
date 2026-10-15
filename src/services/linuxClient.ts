@@ -20,7 +20,7 @@ class LinuxClientService {
     connecting: false,
     error: null,
     latencyMs: null,
-    hostAddress: '192.0.2.10:8080',
+    hostAddress: '',
     sessionType: 'auto',
   };
 

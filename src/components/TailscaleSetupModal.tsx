@@ -32,7 +32,7 @@ export const TailscaleSetupModal: React.FC<TailscaleSetupModalProps> = ({
   soundEnabled,
 }) => {
   const { triggerClick } = useHaptics(hapticsEnabled, soundEnabled);
-  const [tailscaleIp, setTailscaleIp] = useState(status.hostAddress || '192.0.2.10:8080');
+  const [tailscaleIp, setTailscaleIp] = useState(status.hostAddress || '');
   const [sessionType, setSessionType] = useState<SessionType>(status.sessionType || 'auto');
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'connect' | 'daemon' | 'wayland_x11'>('connect');
@@ -195,7 +195,7 @@ systemctl --user enable --now taildeck.service`;
                       type="text"
                       value={tailscaleIp}
                       onChange={(e) => setTailscaleIp(e.target.value)}
-                      placeholder="e.g. 192.0.2.10:8080 or my-laptop:8080"
+                      placeholder="e.g. my-laptop.tailnet.ts.net:8080"
                       className="w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3.5 py-2.5 text-sm text-white font-mono placeholder-slate-600 focus:outline-none focus:border-sky-500"
                     />
                   </div>

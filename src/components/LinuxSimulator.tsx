@@ -35,7 +35,7 @@ export const LinuxSimulator: React.FC<LinuxSimulatorProps> = ({
   const [clickRipples, setClickRipples] = useState<{ id: number; x: number; y: number; type: string }[]>([]);
   const [terminalHistory, setTerminalHistory] = useState<string[]>([
     'Linux 6.8.0-generic x86_64 (Wayland session active)',
-    'Tailscale mesh connected: 192.0.2.10 (laptop)',
+    'Tailscale mesh connected to your laptop',
     'taildeck-daemon.py initialized via /dev/uinput (low latency)',
     'Type or speak to send input...',
   ]);

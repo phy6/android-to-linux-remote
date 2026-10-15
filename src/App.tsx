@@ -31,7 +31,7 @@ const DEFAULT_SETTINGS: RemoteSettings = {
   twoFingerRightClick: true,
   tapToClick: true,
   wheelSensitivity: DEFAULT_WHEEL_SPACING,
-  tailscaleIp: '192.0.2.10:8080',
+  tailscaleIp: '',
   tailscalePort: 8080,
   useSimulator: true,
   autoConnect: true,
