@@ -55,8 +55,16 @@ class LinuxClientService {
   public connect(host: string, sessionType: SessionType = 'auto') {
     this.disconnect();
 
-    const cleanHost = host.trim().replace(/^https?:\/\//, '').replace(/^wss?:\/\//, '');
-    const wsUrl = `ws://${cleanHost}`;
+    const raw = host.trim();
+    const pageIsSecure =
+      typeof location !== 'undefined' && location.protocol === 'https:';
+    const explicitSecure = /^wss:\/\//i.test(raw);
+    const cleanHost = raw
+      .replace(/^https:\/\//i, '')
+      .replace(/^wss:\/\//i, '')
+      .replace(/^ws:\/\//i, '')
+      .replace(/^http:\/\//i, '');
+    const wsUrl = `${pageIsSecure || explicitSecure ? 'wss' : 'ws'}://${cleanHost}`;
 
     this.status = {
       ...this.status,
