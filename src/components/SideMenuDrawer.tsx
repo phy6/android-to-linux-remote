@@ -4,6 +4,11 @@ import { linuxClient } from '../services/linuxClient';
 import { useHaptics } from '../hooks/useHaptics';
 import { PWAInstallButton } from './PWAInstallButton';
 import {
+  notificationSupport,
+  requestNotificationPermission,
+  AlertPermission,
+} from '../services/notifications';
+import {
   Wifi,
   WifiOff,
   Activity,
@@ -23,6 +28,7 @@ import {
   Vibrate,
   Gauge,
   Mic,
+  Bell,
   Repeat2,
   CornerDownLeft,
   Delete,
@@ -59,6 +65,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
 }) => {
   const { triggerClick } = useHaptics(settings.hapticFeedback, settings.soundFeedback);
   const [tailscaleIp, setTailscaleIp] = useState(connectionStatus.hostAddress || '192.0.2.10:8080');
+  const [alertPermission, setAlertPermission] = useState<AlertPermission>(notificationSupport());
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'tailscale' | 'keys' | 'settings'>('tailscale');
   const [quickInput, setQuickInput] = useState('');
@@ -530,6 +537,37 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                   className="w-full accent-sky-400 cursor-pointer"
                 />
               </div>
+
+              {/* Connection Alerts */}
+              <div className="flex items-center justify-between gap-3">
+                <span className="font-semibold text-slate-300 flex items-center gap-1.5">
+                  <Bell className="w-3.5 h-3.5 text-sky-400" />
+                  <span>Connection notifications</span>
+                </span>
+                <button
+                  onClick={async () => {
+                    if (settings.connectionAlerts) {
+                      onUpdateSettings({ connectionAlerts: false });
+                      return;
+                    }
+                    const permission = await requestNotificationPermission();
+                    onUpdateSettings({ connectionAlerts: permission === 'granted' });
+                    setAlertPermission(permission);
+                  }}
+                  className={`px-2.5 py-1 rounded-lg text-[11px] font-medium border transition ${
+                    settings.connectionAlerts
+                      ? 'bg-sky-600/80 border-sky-500/60 text-white'
+                      : 'bg-slate-800 border-slate-700 text-slate-400'
+                  }`}
+                >
+                  {settings.connectionAlerts ? 'On' : 'Off'}
+                </button>
+              </div>
+              <p className="text-[10px] text-slate-500 -mt-2">
+                {alertPermission === 'denied'
+                  ? 'Blocked by the browser. Allow notifications for this site in your browser settings.'
+                  : 'Posts a system notification when the link to your laptop comes up or drops.'}
+              </p>
 
               {/* Mic Button Behaviour */}
               <div className="flex items-center justify-between gap-3">

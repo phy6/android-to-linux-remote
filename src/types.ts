@@ -46,4 +46,5 @@ export interface RemoteSettings {
   useSimulator: boolean;
   autoConnect: boolean; // reconnect to the saved host when the app opens
   holdToTalk: boolean; // mic button: long press to talk (true) or tap to talk (false)
+  connectionAlerts: boolean; // post a system notification when the link comes up or drops
 }

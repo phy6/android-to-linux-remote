@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { AlertCircle, Stethoscope } from 'lucide-react';
+import { AlertCircle, Stethoscope, Wifi, WifiOff } from 'lucide-react';
 import { linuxClient } from './services/linuxClient';
 import { ConnectionStatus, RemoteSettings } from './types';
 import {
@@ -14,6 +14,12 @@ import { DictationModal } from './components/DictationModal';
 import { SideMenuDrawer } from './components/SideMenuDrawer';
 import { LinuxSimulator } from './components/LinuxSimulator';
 import { useSpeechRecognition } from './hooks/useSpeechRecognition';
+import {
+  notificationSupport,
+  requestNotificationPermission,
+  showConnectionNotice,
+  AlertPermission,
+} from './services/notifications';
 import { SpeechDiagnosticsPanel } from './components/SpeechDiagnosticsPanel';
 
 const DEFAULT_SETTINGS: RemoteSettings = {
@@ -30,6 +36,7 @@ const DEFAULT_SETTINGS: RemoteSettings = {
   useSimulator: true,
   autoConnect: true,
   holdToTalk: true,
+  connectionAlerts: true,
 };
 
 export default function App() {
@@ -131,6 +138,25 @@ export default function App() {
   // makes push-to-talk fail with no visible reason.
   const [speechNotice, setSpeechNotice] = useState<string | null>(null);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [toast, setToast] = useState<{ text: string; kind: 'ok' | 'warn' } | null>(null);
+  const toastTimerRef = useRef<number | null>(null);
+
+  const showToast = useCallback((text: string, kind: 'ok' | 'warn' = 'ok') => {
+    setToast({ text, kind });
+    if (toastTimerRef.current !== null) {
+      window.clearTimeout(toastTimerRef.current);
+    }
+    toastTimerRef.current = window.setTimeout(() => setToast(null), 4000);
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (toastTimerRef.current !== null) {
+        window.clearTimeout(toastTimerRef.current);
+      }
+    },
+    []
+  );
   const noticeTimerRef = useRef<number | null>(null);
 
   const showSpeechNotice = useCallback((message: string) => {
@@ -193,6 +219,23 @@ export default function App() {
     handleUpdateSettings({ tailscaleIp: host });
   }, [connectionStatus.hostAddress, settings.tailscaleIp]);
 
+  // Announce link state with a real system notification, falling back to an
+  // in-app banner when notifications are not permitted.
+  const prevConnectedRef = useRef<boolean | null>(null);
+  useEffect(() => {
+    const connected = connectionStatus.connected;
+    const previous = prevConnectedRef.current;
+    prevConnectedRef.current = connected;
+    if (previous === null || previous === connected) return;
+    if (!settings.connectionAlerts) return;
+
+    const host = connectionStatus.hostAddress || 'the laptop';
+    void showConnectionNotice({ connected, host }).then((posted) => {
+      if (posted) return;
+      showToast(connected ? `Connected to ${host}` : `Disconnected from ${host}`, connected ? 'ok' : 'warn');
+    });
+  }, [connectionStatus.connected, connectionStatus.hostAddress, settings.connectionAlerts, showToast]);
+
   const handleAppSwitch = (direction: 'prev' | 'next') => {
     setActiveAppIndex((prev) => {
       return direction === 'next' ? (prev + 1) % 6 : (prev - 1 + 6) % 6;
@@ -247,6 +290,24 @@ export default function App() {
         onToggleSimulator={() => setShowSimulator((prev) => !prev)}
         isSimulatorActive={showSimulator}
       />
+
+      {/* Fallback banner when the system notification is unavailable */}
+      {toast && (
+        <div
+          className={`fixed bottom-24 left-1/2 -translate-x-1/2 z-40 flex items-center gap-2 text-xs px-3 py-2 rounded-xl border shadow-lg shadow-black/50 backdrop-blur-sm ${
+            toast.kind === 'ok'
+              ? 'bg-emerald-950/90 border-emerald-700/70 text-emerald-200'
+              : 'bg-amber-950/90 border-amber-700/70 text-amber-200'
+          }`}
+        >
+          {toast.kind === 'ok' ? (
+            <Wifi className="w-3.5 h-3.5 shrink-0" />
+          ) : (
+            <WifiOff className="w-3.5 h-3.5 shrink-0" />
+          )}
+          <span>{toast.text}</span>
+        </div>
+      )}
 
       {/* Speech failure notice so a blocked mic is never silent */}
       {speechNotice && (
