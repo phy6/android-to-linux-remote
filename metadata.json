@@ -1,0 +1,6 @@
+{
+  "name": "TailDeck: Linux Remote",
+  "description": "Android remote trackpad and gesture controller for Linux laptops over Tailscale, supporting Wayland and X11 with dictation and app switching.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
