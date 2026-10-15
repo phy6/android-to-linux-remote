@@ -18,6 +18,60 @@ import subprocess
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 PORT = int(os.environ.get("TAILDECK_PORT", 8080))
+DICTATE_HOST = os.environ.get("TAILDECK_DICTATE_HOST", "127.0.0.1")
+DICTATE_PORT = int(os.environ.get("TAILDECK_DICTATE_PORT", 8090))
+
+OP_START, OP_STOP, OP_PCM, OP_OK = 0x01, 0x02, 0x03, 0x01
+
+
+class DictationBridge:
+    """Relays phone PCM from this daemon's websocket to the local vosk
+    push-to-talk daemon, which recognises it and types the result itself."""
+
+    def __init__(self):
+        self.sock = None
+
+    def _op(self, op, payload=b""):
+        self.sock.sendall(bytes([op]) + payload)
+
+    def start(self):
+        self.stop()
+        try:
+            self.sock = socket.create_connection((DICTATE_HOST, DICTATE_PORT), timeout=10)
+            self.sock.settimeout(30)
+            self._op(OP_START)
+            return self.sock.recv(1) == bytes([OP_OK])
+        except Exception as e:
+            print(f"[TailDeck] dictation bridge unavailable: {e}")
+            self.sock = None
+            return False
+
+    def audio(self, pcm):
+        if not self.sock or not pcm:
+            return
+        try:
+            self._op(OP_PCM, struct.pack("!I", len(pcm)) + pcm)
+        except Exception as e:
+            print(f"[TailDeck] dictation audio dropped: {e}")
+            self.sock = None
+
+    def stop(self):
+        if not self.sock:
+            return
+        try:
+            self._op(OP_STOP)
+            self.sock.recv(1)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+
+
+DICTATION = DictationBridge()
 SESSION_TYPE = os.environ.get("XDG_SESSION_TYPE", "unknown").lower()
 BACKEND_NAME = "none"
 
@@ -40,6 +94,7 @@ class LinuxInputBackend:
                     e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE,
                     e.KEY_LEFTALT, e.KEY_TAB, e.KEY_LEFTSHIFT, e.KEY_LEFTCTRL,
                     e.KEY_ENTER, e.KEY_BACKSPACE, e.KEY_SPACE, e.KEY_ESC,
+                    e.KEY_RIGHTCTRL, e.KEY_RIGHTALT, e.KEY_RIGHTSHIFT,
                     e.KEY_LEFTMETA, e.KEY_VOLUMEUP, e.KEY_VOLUMEDOWN, e.KEY_MUTE
                 ]
             }
@@ -217,7 +272,40 @@ class LinuxInputBackend:
             pyautogui.write(text, interval=0.01)
 
     def key_combo(self, keys):
-        if self.backend == "xdotool":
+        if self.backend == "evdev_uinput":
+            from evdev import ecodes as e
+            names = {
+                "ctrl": e.KEY_LEFTCTRL, "control": e.KEY_LEFTCTRL,
+                "ctrl_l": e.KEY_LEFTCTRL, "ctrl_r": e.KEY_RIGHTCTRL, "rctrl": e.KEY_RIGHTCTRL,
+                "alt": e.KEY_LEFTALT, "alt_l": e.KEY_LEFTALT, "alt_r": e.KEY_RIGHTALT,
+                "shift": e.KEY_LEFTSHIFT, "shift_l": e.KEY_LEFTSHIFT, "shift_r": e.KEY_RIGHTSHIFT,
+                "super": e.KEY_LEFTMETA, "meta": e.KEY_LEFTMETA, "win": e.KEY_LEFTMETA,
+                "tab": e.KEY_TAB, "return": e.KEY_ENTER, "enter": e.KEY_ENTER,
+                "space": e.KEY_SPACE, "esc": e.KEY_ESC, "escape": e.KEY_ESC,
+                "backspace": e.KEY_BACKSPACE,
+            }
+            # Single printable characters, so combos like ctrl+v actually work.
+            for i in range(26):
+                names[chr(ord("a") + i)] = getattr(e, "KEY_" + chr(ord("A") + i))
+            for i in range(10):
+                names[str(i)] = getattr(e, "KEY_" + str(i))
+            names.update({
+                "-": e.KEY_MINUS, "=": e.KEY_EQUAL, "[": e.KEY_LEFTBRACE,
+                "]": e.KEY_RIGHTBRACE, ";": e.KEY_SEMICOLON, "'": e.KEY_APOSTROPHE,
+                "`": e.KEY_GRAVE, "\\": e.KEY_BACKSLASH, ",": e.KEY_COMMA,
+                ".": e.KEY_DOT, "/": e.KEY_SLASH,
+            })
+            codes = [names[k.lower()] for k in keys if k.lower() in names]
+            if not codes:
+                return
+            for c in codes:
+                self.ui.write(e.EV_KEY, c, 1)
+            self.ui.syn()
+            time.sleep(0.02)
+            for c in reversed(codes):
+                self.ui.write(e.EV_KEY, c, 0)
+            self.ui.syn()
+        elif self.backend == "xdotool":
             subprocess.run(["xdotool", "key", "+".join(keys)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         elif self.backend == "ydotool":
             # Quick hotkey fallback
@@ -290,6 +378,14 @@ def handle_websocket(conn):
                     INPUT_HANDLER.type_text(msg.get("text", ""))
                 elif mtype == "key_combo":
                     INPUT_HANDLER.key_combo(msg.get("keys", []))
+                elif mtype == "dictation_start":
+                    ok = DICTATION.start()
+                    send_ws_frame(conn, json.dumps({"type": "dictation_ready", "ok": ok}))
+                elif mtype == "dictation_audio":
+                    DICTATION.audio(base64.b64decode(msg.get("data", "")))
+                elif mtype == "dictation_stop":
+                    DICTATION.stop()
+                    send_ws_frame(conn, json.dumps({"type": "dictation_stopped"}))
                 elif mtype == "ping":
                     pong = {"type": "pong", "timestamp": msg.get("timestamp", time.time() * 1000)}
                     send_ws_frame(conn, json.dumps(pong))
@@ -298,6 +394,7 @@ def handle_websocket(conn):
     except Exception as e:
         pass
     finally:
+        DICTATION.stop()
         try:
             conn.close()
         except Exception:
