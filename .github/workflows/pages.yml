@@ -34,6 +34,7 @@ jobs:
         env:
           # Project Pages are served from /<repo>/ — override to "/" for a custom domain.
           BASE_PATH: /${{ github.event.repository.name }}/
+          GITHUB_SHA: ${{ github.sha }}
         run: bun run build
 
       - uses: actions/configure-pages@v5

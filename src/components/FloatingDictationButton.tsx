@@ -10,6 +10,8 @@ interface FloatingDictationButtonProps {
   soundEnabled: boolean;
   isListening?: boolean;
   isPushToTalkActive?: boolean;
+  /** true: hold to talk then release to send. false: tap to talk, release to send. */
+  holdToTalk?: boolean;
   onPushToTalkStart: () => void;
   onPushToTalkEnd: () => void;
   onPushToTalkCancel?: () => void;
@@ -21,6 +23,7 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
   soundEnabled,
   isListening = false,
   isPushToTalkActive = false,
+  holdToTalk = true,
   onPushToTalkStart,
   onPushToTalkEnd,
   onPushToTalkCancel,
@@ -39,6 +42,7 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
 
   const [isDragging, setIsDragging] = useState(false);
   const [isPressing, setIsPressing] = useState(false);
+  const isPttLabel = holdToTalk ? 'Hold to talk. Tap for full dictation.' : 'Tap to talk.';
   const dragRef = useRef<{
     startX: number;
     startY: number;
@@ -71,14 +75,21 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
     setIsPressing(true);
     (e.target as HTMLElement).setPointerCapture(e.pointerId);
 
-    // Hold to talk: engage push-to-talk once the hold threshold is reached.
-    longPressTimerRef.current = window.setTimeout(() => {
+    const engage = () => {
       longPressTimerRef.current = null;
       if (dragRef.current?.hasMoved) return;
       pttEngagedRef.current = true;
       triggerDictationEngaged();
       onPushToTalkStart();
-    }, LONG_PRESS_MS);
+    };
+
+    if (holdToTalk) {
+      // Hold to talk: engage push-to-talk once the hold threshold is reached.
+      longPressTimerRef.current = window.setTimeout(engage, LONG_PRESS_MS);
+    } else {
+      // Tap to talk: engage immediately on touch.
+      engage();
+    }
   };
 
   const handlePointerMove = (e: React.PointerEvent) => {
@@ -121,8 +132,8 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
       // Saved dragged position
       localStorage.setItem('taildeck_floating_mic_pos', JSON.stringify(pos));
       triggerClick();
-    } else {
-      // Clean tap -> open the full dictation sheet
+    } else if (holdToTalk) {
+      // Clean tap in hold-to-talk mode -> open the full dictation sheet
       triggerDictationEngaged();
       onTriggerDictation();
     }
@@ -174,7 +185,7 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
         onPointerCancel={handlePointerCancel}
         role="button"
         tabIndex={0}
-        aria-label="Hold to talk. Tap for full dictation."
+        aria-label={isPttLabel}
         className={`relative w-14 h-14 rounded-full flex items-center justify-center shadow-[0_6px_20px_rgba(0,0,0,0.6)] border transition-all ${
           isPressing ? 'scale-95' : ''
         } ${
@@ -194,7 +205,7 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
       {/* Hold hint, only while pressing so it never clutters the deck */}
       {isPressing && (
         <span className="absolute left-1/2 top-full mt-2 -translate-x-1/2 whitespace-nowrap text-[10px] font-medium text-sky-200/90 bg-slate-900/90 border border-sky-500/30 rounded-full px-2 py-0.5 pointer-events-none">
-          Hold to talk
+          {holdToTalk ? 'Hold to talk' : 'Tap to talk'}
         </span>
       )}
     </div>

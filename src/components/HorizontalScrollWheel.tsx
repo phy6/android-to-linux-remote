@@ -102,7 +102,7 @@ export const HorizontalScrollWheel: React.FC<HorizontalScrollWheelProps> = ({
   }, []);
 
   return (
-    <div className="w-full select-none bg-slate-950 px-3 py-2 border-b border-slate-900">
+    <div className="w-full select-none bg-slate-950 px-3 py-3 border-b border-slate-900">
       {/* Pure, unmarked, minimalist horizontal roller */}
       <div
         ref={containerRef}
@@ -114,7 +114,7 @@ export const HorizontalScrollWheel: React.FC<HorizontalScrollWheelProps> = ({
         tabIndex={0}
         role="slider"
         aria-label="Horizontal scroll wheel"
-        className={`relative w-full h-9 rounded-xl overflow-hidden cursor-ew-resize select-none border transition-colors touch-none ${
+        className={`relative w-full h-16 rounded-2xl overflow-hidden cursor-ew-resize select-none border transition-colors touch-none ${
           isActivelyScrubbing
             ? 'border-sky-500/40 bg-slate-900 shadow-inner'
             : 'border-slate-800/80 bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950'

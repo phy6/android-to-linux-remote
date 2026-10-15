@@ -10,6 +10,9 @@ export default defineConfig(() => {
 
   return {
     base,
+    define: {
+      __BUILD_SHA__: JSON.stringify(process.env.GITHUB_SHA?.slice(0, 7) ?? 'local'),
+    },
     plugins: [
       react(),
       tailwindcss(),

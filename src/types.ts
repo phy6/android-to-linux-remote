@@ -44,4 +44,6 @@ export interface RemoteSettings {
   tailscaleIp: string;
   tailscalePort: number;
   useSimulator: boolean;
+  autoConnect: boolean; // reconnect to the saved host when the app opens
+  holdToTalk: boolean; // mic button: long press to talk (true) or tap to talk (false)
 }

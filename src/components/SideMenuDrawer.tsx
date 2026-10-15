@@ -22,6 +22,7 @@ import {
   Volume2,
   Vibrate,
   Gauge,
+  Mic,
   Repeat2,
   CornerDownLeft,
   Delete,
@@ -529,6 +530,48 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                   className="w-full accent-sky-400 cursor-pointer"
                 />
               </div>
+
+              {/* Mic Button Behaviour */}
+              <div className="flex items-center justify-between gap-3">
+                <span className="font-semibold text-slate-300 flex items-center gap-1.5">
+                  <Mic className="w-3.5 h-3.5 text-sky-400" />
+                  <span>Long-press mic to talk</span>
+                </span>
+                <button
+                  onClick={() => onUpdateSettings({ holdToTalk: !settings.holdToTalk })}
+                  className={`px-2.5 py-1 rounded-lg text-[11px] font-medium border transition ${
+                    settings.holdToTalk
+                      ? 'bg-sky-600/80 border-sky-500/60 text-white'
+                      : 'bg-slate-800 border-slate-700 text-slate-400'
+                  }`}
+                >
+                  {settings.holdToTalk ? 'Long press' : 'Tap'}
+                </button>
+              </div>
+              <p className="text-[10px] text-slate-500 -mt-2">
+                Hold to talk and release to send. Tap mode starts talking on touch instead.
+              </p>
+
+              {/* Auto Connect */}
+              <div className="flex items-center justify-between gap-3">
+                <span className="font-semibold text-slate-300 flex items-center gap-1.5">
+                  <Wifi className="w-3.5 h-3.5 text-sky-400" />
+                  <span>Reconnect on open</span>
+                </span>
+                <button
+                  onClick={() => onUpdateSettings({ autoConnect: !settings.autoConnect })}
+                  className={`px-2.5 py-1 rounded-lg text-[11px] font-medium border transition ${
+                    settings.autoConnect
+                      ? 'bg-sky-600/80 border-sky-500/60 text-white'
+                      : 'bg-slate-800 border-slate-700 text-slate-400'
+                  }`}
+                >
+                  {settings.autoConnect ? 'On' : 'Off'}
+                </button>
+              </div>
+              <p className="text-[10px] text-slate-500 -mt-2">
+                The host address is remembered automatically once you connect.
+              </p>
 
               {/* App Switcher Travel Distance */}
               <div className="space-y-1.5">

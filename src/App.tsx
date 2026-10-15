@@ -28,6 +28,8 @@ const DEFAULT_SETTINGS: RemoteSettings = {
   tailscaleIp: '192.0.2.10:8080',
   tailscalePort: 8080,
   useSimulator: true,
+  autoConnect: true,
+  holdToTalk: true,
 };
 
 export default function App() {
@@ -171,6 +173,26 @@ export default function App() {
     return unsub;
   }, []);
 
+  // Reconnect to the saved host on launch so the deck is usable immediately.
+  const didAutoConnectRef = useRef(false);
+  useEffect(() => {
+    if (didAutoConnectRef.current) return;
+    didAutoConnectRef.current = true;
+    const host = settings.tailscaleIp?.trim();
+    if (!settings.autoConnect || !host) return;
+    linuxClient.connect(host);
+  }, [settings.autoConnect, settings.tailscaleIp]);
+
+  // Remember whichever host actually answered, so the address is never retyped.
+  const persistedHostRef = useRef<string | null>(null);
+  useEffect(() => {
+    const host = connectionStatus.hostAddress?.trim();
+    if (!host || host === persistedHostRef.current) return;
+    persistedHostRef.current = host;
+    if (host === settings.tailscaleIp) return;
+    handleUpdateSettings({ tailscaleIp: host });
+  }, [connectionStatus.hostAddress, settings.tailscaleIp]);
+
   const handleAppSwitch = (direction: 'prev' | 'next') => {
     setActiveAppIndex((prev) => {
       return direction === 'next' ? (prev + 1) % 6 : (prev - 1 + 6) % 6;
@@ -250,6 +272,7 @@ export default function App() {
       {showDiagnostics && (
         <SpeechDiagnosticsPanel
           diagnostics={speech.diagnostics}
+          buildSha={__BUILD_SHA__}
           error={speech.error}
           permission={speech.permission}
           onClose={() => setShowDiagnostics(false)}
@@ -262,6 +285,7 @@ export default function App() {
         hapticsEnabled={settings.hapticFeedback}
         soundEnabled={settings.soundFeedback}
         isPushToTalkActive={isPttActive}
+        holdToTalk={settings.holdToTalk}
         onPushToTalkStart={handlePttStart}
         onPushToTalkEnd={handlePttEnd}
         onPushToTalkCancel={handlePttCancel}

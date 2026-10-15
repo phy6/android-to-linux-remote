@@ -2,6 +2,7 @@ import React from 'react';
 import { SpeechDiagnostics } from '../hooks/useSpeechRecognition';
 
 interface SpeechDiagnosticsPanelProps {
+  buildSha: string;
   diagnostics: SpeechDiagnostics;
   error: string | null;
   permission: string;
@@ -21,6 +22,7 @@ const rows = (d: SpeechDiagnostics) => [
 ];
 
 export const SpeechDiagnosticsPanel: React.FC<SpeechDiagnosticsPanelProps> = ({
+  buildSha,
   diagnostics,
   error,
   permission,
@@ -45,6 +47,10 @@ export const SpeechDiagnosticsPanel: React.FC<SpeechDiagnosticsPanelProps> = ({
       )}
 
       <dl className="text-[11px] font-mono">
+        <div className="flex justify-between gap-3 py-1 border-b border-slate-800/70">
+          <dt className="text-slate-400">Build</dt>
+          <dd className="text-sky-300 text-right font-mono">{buildSha}</dd>
+        </div>
         {rows(diagnostics).map(([k, v]) => (
           <div key={k} className="flex justify-between gap-3 py-1 border-b border-slate-800/70 last:border-0">
             <dt className="text-slate-400">{k}</dt>
