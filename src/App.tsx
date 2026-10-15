@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { AlertCircle } from 'lucide-react';
+import { AlertCircle, Stethoscope } from 'lucide-react';
 import { linuxClient } from './services/linuxClient';
 import { ConnectionStatus, RemoteSettings } from './types';
 import {
@@ -14,6 +14,7 @@ import { DictationModal } from './components/DictationModal';
 import { SideMenuDrawer } from './components/SideMenuDrawer';
 import { LinuxSimulator } from './components/LinuxSimulator';
 import { useSpeechRecognition } from './hooks/useSpeechRecognition';
+import { SpeechDiagnosticsPanel } from './components/SpeechDiagnosticsPanel';
 
 const DEFAULT_SETTINGS: RemoteSettings = {
   sensitivity: 1.2,
@@ -127,6 +128,7 @@ export default function App() {
   // Surface speech failures on the deck itself, otherwise a blocked microphone
   // makes push-to-talk fail with no visible reason.
   const [speechNotice, setSpeechNotice] = useState<string | null>(null);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
   const noticeTimerRef = useRef<number | null>(null);
 
   const showSpeechNotice = useCallback((message: string) => {
@@ -233,6 +235,25 @@ export default function App() {
           <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
           <span>{speechNotice}</span>
         </button>
+      )}
+
+      {/* Diagnostics trigger so a failing dictation can be inspected on device */}
+      <button
+        onClick={() => setShowDiagnostics(true)}
+        className="fixed top-3 right-3 z-30 p-2 rounded-xl bg-slate-900/80 border border-slate-700/70 text-slate-400 hover:text-sky-300 active:scale-95"
+        title="Dictation diagnostics"
+        aria-label="Dictation diagnostics"
+      >
+        <Stethoscope className="w-4 h-4" />
+      </button>
+
+      {showDiagnostics && (
+        <SpeechDiagnosticsPanel
+          diagnostics={speech.diagnostics}
+          error={speech.error}
+          permission={speech.permission}
+          onClose={() => setShowDiagnostics(false)}
+        />
       )}
 
       {/* Floating Mic: hold to talk (push-to-talk), tap for the dictation sheet, drag to move */}

@@ -34,7 +34,7 @@ const MIC_UNSUPPORTED_MESSAGE =
 const MIC_DENIED_MESSAGE =
   'Microphone blocked. Open your browser site settings, allow the microphone for this site, then hold the mic again.';
 
-const START_TIMEOUT_MS = 2500;
+const START_TIMEOUT_MS = 6000;
 
 declare global {
   interface Window {
@@ -48,6 +48,18 @@ const getSpeechRecognition = (): SpeechRecognitionConstructor | undefined =>
 
 export type SpeechRecognitionController = ReturnType<typeof useSpeechRecognition>;
 
+export interface SpeechDiagnostics {
+  hasSpeechApi: boolean;
+  secureContext: boolean;
+  hasGetUserMedia: boolean;
+  permission: MicPermissionState;
+  lastError: string | null;
+  engineStarted: boolean;
+  attempts: number;
+  micTrackState: string | null;
+  displayMode: string;
+}
+
 export function useSpeechRecognition(defaultLang = 'en-US') {
   const [isListening, setIsListening] = useState(false);
   const [transcript, setTranscript] = useState('');
@@ -56,15 +68,69 @@ export function useSpeechRecognition(defaultLang = 'en-US') {
   const [language, setLanguage] = useState(defaultLang);
   const [isSupported, setIsSupported] = useState(true);
   const [permission, setPermission] = useState<MicPermissionState>('unknown');
+  const [diagnostics, setDiagnostics] = useState<SpeechDiagnostics>({
+    hasSpeechApi: false,
+    secureContext: false,
+    hasGetUserMedia: false,
+    permission: 'unknown',
+    lastError: null,
+    engineStarted: false,
+    attempts: 0,
+    micTrackState: null,
+    displayMode: 'browser',
+  });
 
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
   const transcriptRef = useRef('');
   const engineStartedRef = useRef(false);
   const startTimeoutRef = useRef<number | null>(null);
+  // The probe stream is held open for the whole listening session. Releasing it
+  // immediately makes some Android builds refuse to hand the mic to the
+  // recogniser afterwards.
+  const micStreamRef = useRef<MediaStream | null>(null);
+
+  const diagnosticsRef = useRef<SpeechDiagnostics>({
+    hasSpeechApi: false,
+    secureContext: false,
+    hasGetUserMedia: false,
+    permission: 'unknown',
+    lastError: null,
+    engineStarted: false,
+    attempts: 0,
+    micTrackState: null,
+    displayMode: 'browser',
+  });
+
+  const patchDiagnostics = useCallback((patch: Partial<SpeechDiagnostics>) => {
+    setDiagnostics((prev) => {
+      const next = { ...prev, ...patch };
+      diagnosticsRef.current = next;
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     setIsSupported(!!getSpeechRecognition());
-  }, []);
+    const mode = window.matchMedia('(display-mode: standalone)').matches
+      ? 'installed app'
+      : window.matchMedia('(display-mode: fullscreen)').matches
+        ? 'fullscreen'
+        : 'browser';
+    patchDiagnostics({
+      hasSpeechApi: !!getSpeechRecognition(),
+      secureContext: window.isSecureContext,
+      hasGetUserMedia: !!navigator.mediaDevices?.getUserMedia,
+      displayMode: mode,
+    });
+  }, [patchDiagnostics]);
+
+  const releaseMic = useCallback(() => {
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach((track) => track.stop());
+      micStreamRef.current = null;
+      patchDiagnostics({ micTrackState: null });
+    }
+  }, [patchDiagnostics]);
 
   const clearStartTimeout = useCallback(() => {
     if (startTimeoutRef.current !== null) {
@@ -86,21 +152,27 @@ export function useSpeechRecognition(defaultLang = 'en-US') {
   const ensureMicPermission = useCallback(async (): Promise<boolean> => {
     if (!getSpeechRecognition()) {
       setPermission('unsupported');
+      patchDiagnostics({ lastError: 'no-speech-api' });
       return false;
     }
 
     if (!navigator.mediaDevices?.getUserMedia) {
       setPermission('unsupported');
+      patchDiagnostics({ lastError: 'no-getusermedia' });
       return false;
     }
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      stream.getTracks().forEach((track) => track.stop());
+      // Keep the track open so the recogniser can reuse it.
+      micStreamRef.current = stream;
+      const state = stream.getAudioTracks()[0]?.readyState ?? 'unknown';
       setPermission('granted');
+      patchDiagnostics({ permission: 'granted', micTrackState: state, lastError: null });
       return true;
     } catch (err) {
       const name = (err as DOMException | undefined)?.name ?? 'Error';
+      patchDiagnostics({ lastError: `getUserMedia:${name}` });
       if (name === 'NotAllowedError' || name === 'SecurityError') {
         setPermission('denied');
         setError(MIC_DENIED_MESSAGE);
@@ -110,7 +182,7 @@ export function useSpeechRecognition(defaultLang = 'en-US') {
       }
       return false;
     }
-  }, []);
+  }, [patchDiagnostics]);
 
   const stopListening = useCallback(() => {
     clearStartTimeout();
@@ -122,7 +194,8 @@ export function useSpeechRecognition(defaultLang = 'en-US') {
       }
     }
     setIsListening(false);
-  }, [clearStartTimeout]);
+    releaseMic();
+  }, [clearStartTimeout, releaseMic]);
 
   const abortListening = useCallback(() => {
     clearStartTimeout();
@@ -134,7 +207,8 @@ export function useSpeechRecognition(defaultLang = 'en-US') {
       }
     }
     setIsListening(false);
-  }, [clearStartTimeout]);
+    releaseMic();
+  }, [clearStartTimeout, releaseMic]);
 
   const startListening = useCallback(async (): Promise<boolean> => {
     setError(null);
@@ -166,9 +240,11 @@ export function useSpeechRecognition(defaultLang = 'en-US') {
       recognition.lang = language;
 
       engineStartedRef.current = false;
+      patchDiagnostics({ attempts: diagnosticsRef.current.attempts + 1, engineStarted: false, lastError: null });
       recognition.onstart = () => {
         engineStartedRef.current = true;
         clearStartTimeout();
+        patchDiagnostics({ engineStarted: true, lastError: null });
         setIsListening(true);
       };
 
@@ -195,15 +271,18 @@ export function useSpeechRecognition(defaultLang = 'en-US') {
 
       recognition.onerror = (e: SpeechRecognitionErrorEvent) => {
         clearStartTimeout();
+        patchDiagnostics({ lastError: `speech:${e.error}` });
         if (e.error === 'no-speech') return;
         if (e.error === 'aborted') return;
         setError(`Speech error: ${e.error}`);
         setIsListening(false);
+        releaseMic();
       };
 
       recognition.onend = () => {
         clearStartTimeout();
         setIsListening(false);
+        releaseMic();
       };
 
       recognition.start();
@@ -219,6 +298,7 @@ export function useSpeechRecognition(defaultLang = 'en-US') {
           // Ignore
         }
         setIsListening(false);
+        patchDiagnostics({ lastError: 'engine-timeout', engineStarted: false });
         setError(
           'Speech engine did not start. Close other apps using the microphone and try again.'
         );
@@ -231,7 +311,7 @@ export function useSpeechRecognition(defaultLang = 'en-US') {
       setIsListening(false);
       return false;
     }
-  }, [language, ensureMicPermission, clearStartTimeout, setTranscriptValue]);
+  }, [language, ensureMicPermission, clearStartTimeout, setTranscriptValue, patchDiagnostics, releaseMic]);
 
   const resetTranscript = useCallback(() => {
     setInterimTranscript('');
@@ -247,6 +327,7 @@ export function useSpeechRecognition(defaultLang = 'en-US') {
     error,
     isSupported,
     permission,
+    diagnostics,
     language,
     setLanguage,
     startListening,
