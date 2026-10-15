@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { useSpeechRecognition } from '../hooks/useSpeechRecognition';
+import { SpeechRecognitionController } from '../hooks/useSpeechRecognition';
 import { linuxClient } from '../services/linuxClient';
 import { useHaptics } from '../hooks/useHaptics';
 import { Mic, MicOff, Send, CornerDownLeft, Trash2, X, Globe, Sparkles, AlertCircle } from 'lucide-react';
@@ -9,6 +9,7 @@ interface DictationModalProps {
   onClose: () => void;
   hapticsEnabled: boolean;
   soundEnabled: boolean;
+  speech: SpeechRecognitionController;
 }
 
 const LANGUAGES = [
@@ -27,6 +28,7 @@ export const DictationModal: React.FC<DictationModalProps> = ({
   onClose,
   hapticsEnabled,
   soundEnabled,
+  speech,
 }) => {
   const {
     isListening,
@@ -34,13 +36,12 @@ export const DictationModal: React.FC<DictationModalProps> = ({
     setTranscript,
     interimTranscript,
     error,
-    isSupported,
     language,
     setLanguage,
     startListening,
     stopListening,
     resetTranscript,
-  } = useSpeechRecognition();
+  } = speech;
 
   const { triggerClick, triggerHeavyClick } = useHaptics(hapticsEnabled, soundEnabled);
   const [manualText, setManualText] = useState('');

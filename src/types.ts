@@ -40,7 +40,7 @@ export interface RemoteSettings {
   soundFeedback: boolean;
   twoFingerRightClick: boolean;
   tapToClick: boolean;
-  wheelSensitivity: number; // notches per pixel
+  wheelSensitivity: number; // pixels of travel per app switch
   tailscaleIp: string;
   tailscalePort: number;
   useSimulator: boolean;

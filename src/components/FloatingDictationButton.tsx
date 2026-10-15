@@ -1,12 +1,18 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { Mic } from 'lucide-react';
 import { useHaptics } from '../hooks/useHaptics';
+
+const LONG_PRESS_MS = 320;
 
 interface FloatingDictationButtonProps {
   onTriggerDictation: () => void;
   hapticsEnabled: boolean;
   soundEnabled: boolean;
   isListening?: boolean;
+  isPushToTalkActive?: boolean;
+  onPushToTalkStart: () => void;
+  onPushToTalkEnd: () => void;
+  onPushToTalkCancel?: () => void;
 }
 
 export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = ({
@@ -14,6 +20,10 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
   hapticsEnabled,
   soundEnabled,
   isListening = false,
+  isPushToTalkActive = false,
+  onPushToTalkStart,
+  onPushToTalkEnd,
+  onPushToTalkCancel,
 }) => {
   const { triggerClick, triggerDictationEngaged } = useHaptics(hapticsEnabled, soundEnabled);
 
@@ -28,6 +38,7 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
   });
 
   const [isDragging, setIsDragging] = useState(false);
+  const [isPressing, setIsPressing] = useState(false);
   const dragRef = useRef<{
     startX: number;
     startY: number;
@@ -35,6 +46,17 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
     initialPercentY: number;
     hasMoved: boolean;
   } | null>(null);
+  const longPressTimerRef = useRef<number | null>(null);
+  const pttEngagedRef = useRef(false);
+
+  const clearLongPressTimer = useCallback(() => {
+    if (longPressTimerRef.current !== null) {
+      window.clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => clearLongPressTimer, [clearLongPressTimer]);
 
   const handlePointerDown = (e: React.PointerEvent) => {
     e.preventDefault();
@@ -45,7 +67,18 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
       initialPercentY: pos.y,
       hasMoved: false,
     };
+    pttEngagedRef.current = false;
+    setIsPressing(true);
     (e.target as HTMLElement).setPointerCapture(e.pointerId);
+
+    // Hold to talk: engage push-to-talk once the hold threshold is reached.
+    longPressTimerRef.current = window.setTimeout(() => {
+      longPressTimerRef.current = null;
+      if (dragRef.current?.hasMoved) return;
+      pttEngagedRef.current = true;
+      triggerDictationEngaged();
+      onPushToTalkStart();
+    }, LONG_PRESS_MS);
   };
 
   const handlePointerMove = (e: React.PointerEvent) => {
@@ -54,6 +87,12 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
     const dy = e.clientY - dragRef.current.startY;
 
     if (Math.hypot(dx, dy) > 5) {
+      // Movement cancels push-to-talk so dragging never starts dictation.
+      if (pttEngagedRef.current) {
+        pttEngagedRef.current = false;
+        onPushToTalkCancel?.();
+      }
+      clearLongPressTimer();
       dragRef.current.hasMoved = true;
       setIsDragging(true);
 
@@ -73,18 +112,39 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
 
   const handlePointerUp = (e: React.PointerEvent) => {
     if (!dragRef.current) return;
+    clearLongPressTimer();
 
-    if (dragRef.current.hasMoved) {
+    if (pttEngagedRef.current) {
+      // Release ends the push-to-talk session and types what was spoken.
+      onPushToTalkEnd();
+    } else if (dragRef.current.hasMoved) {
       // Saved dragged position
       localStorage.setItem('taildeck_floating_mic_pos', JSON.stringify(pos));
       triggerClick();
     } else {
-      // Clean tap -> open dictation!
+      // Clean tap -> open the full dictation sheet
       triggerDictationEngaged();
       onTriggerDictation();
     }
 
+    setIsPressing(false);
     setIsDragging(false);
+    dragRef.current = null;
+    pttEngagedRef.current = false;
+    try {
+      (e.target as HTMLElement).releasePointerCapture(e.pointerId);
+    } catch {
+      // Ignore
+    }
+  };
+
+  const handlePointerCancel = (e: React.PointerEvent) => {
+    if (pttEngagedRef.current) {
+      pttEngagedRef.current = false;
+      onPushToTalkCancel?.();
+    }
+    clearLongPressTimer();
+    setIsPressing(false);
     dragRef.current = null;
     try {
       (e.target as HTMLElement).releasePointerCapture(e.pointerId);
@@ -92,6 +152,8 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
       // Ignore
     }
   };
+
+  const active = isPushToTalkActive || isListening;
 
   return (
     <div
@@ -109,23 +171,32 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
-        onPointerCancel={handlePointerUp}
+        onPointerCancel={handlePointerCancel}
         role="button"
         tabIndex={0}
-        aria-label="Dictation Microphone"
-        className={`relative w-14 h-14 rounded-full flex items-center justify-center shadow-[0_6px_20px_rgba(0,0,0,0.6)] border transition-all active:scale-95 ${
-          isListening
+        aria-label="Hold to talk. Tap for full dictation."
+        className={`relative w-14 h-14 rounded-full flex items-center justify-center shadow-[0_6px_20px_rgba(0,0,0,0.6)] border transition-all ${
+          isPressing ? 'scale-95' : ''
+        } ${
+          active
             ? 'bg-rose-600 border-rose-400 text-white shadow-rose-600/50'
             : 'bg-gradient-to-tr from-sky-600 to-blue-500 border-sky-400/60 text-white shadow-sky-600/30 hover:from-sky-500 hover:to-blue-400'
         }`}
       >
-        {/* Subtle pulsing halo when listening */}
-        {isListening && (
+        {/* Pulsing halo while the push-to-talk session is live */}
+        {active && (
           <span className="absolute -inset-2 rounded-full border-2 border-rose-500/60 animate-ping pointer-events-none" />
         )}
 
-        <Mic className={`w-6 h-6 ${isListening ? 'animate-bounce' : ''}`} />
+        <Mic className={`w-6 h-6 ${active ? 'animate-bounce' : ''}`} />
       </div>
+
+      {/* Hold hint, only while pressing so it never clutters the deck */}
+      {isPressing && (
+        <span className="absolute left-1/2 top-full mt-2 -translate-x-1/2 whitespace-nowrap text-[10px] font-medium text-sky-200/90 bg-slate-900/90 border border-sky-500/30 rounded-full px-2 py-0.5 pointer-events-none">
+          Hold to talk
+        </span>
+      )}
     </div>
   );
 };

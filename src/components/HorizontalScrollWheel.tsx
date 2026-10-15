@@ -5,13 +5,21 @@ import { useHaptics } from '../hooks/useHaptics';
 interface HorizontalScrollWheelProps {
   hapticsEnabled: boolean;
   soundEnabled: boolean;
+  /** Pixels of travel per single app switch. Larger means less twitchy. */
   sensitivity?: number;
   onAppSwitch?: (direction: 'prev' | 'next') => void;
 }
 
+// A step must be wide enough that a full-width swipe cannot cycle every app,
+// and small enough that switching still feels deliberate but achievable.
+export const MIN_WHEEL_SPACING = 70;
+export const MAX_WHEEL_SPACING = 260;
+export const DEFAULT_WHEEL_SPACING = 100;
+
 export const HorizontalScrollWheel: React.FC<HorizontalScrollWheelProps> = ({
   hapticsEnabled,
   soundEnabled,
+  sensitivity,
   onAppSwitch,
 }) => {
   const { triggerWheelTick } = useHaptics(hapticsEnabled, soundEnabled);
@@ -21,7 +29,8 @@ export const HorizontalScrollWheel: React.FC<HorizontalScrollWheelProps> = ({
   const accumulatedDeltaRef = useRef(0);
   const [isActivelyScrubbing, setIsActivelyScrubbing] = useState(false);
 
-  const NOTCH_THRESHOLD = 26; // pixels per app rotation step
+  const requested = Number.isFinite(sensitivity) ? (sensitivity as number) : DEFAULT_WHEEL_SPACING;
+  const pixelsPerStep = Math.min(MAX_WHEEL_SPACING, Math.max(MIN_WHEEL_SPACING, requested));
 
   const triggerStep = useCallback(
     (direction: 'prev' | 'next') => {
@@ -49,12 +58,12 @@ export const HorizontalScrollWheel: React.FC<HorizontalScrollWheelProps> = ({
 
     // Left swipe = Shift+Tab (prev)
     // Right swipe = Tab (next)
-    if (accumulatedDeltaRef.current >= NOTCH_THRESHOLD) {
+    if (accumulatedDeltaRef.current >= pixelsPerStep) {
       triggerStep('next');
-      accumulatedDeltaRef.current -= NOTCH_THRESHOLD;
-    } else if (accumulatedDeltaRef.current <= -NOTCH_THRESHOLD) {
+      accumulatedDeltaRef.current -= pixelsPerStep;
+    } else if (accumulatedDeltaRef.current <= -pixelsPerStep) {
       triggerStep('prev');
-      accumulatedDeltaRef.current += NOTCH_THRESHOLD;
+      accumulatedDeltaRef.current += pixelsPerStep;
     }
   };
 
@@ -74,10 +83,10 @@ export const HorizontalScrollWheel: React.FC<HorizontalScrollWheelProps> = ({
     e.preventDefault();
     accumulatedDeltaRef.current -= delta;
 
-    if (accumulatedDeltaRef.current >= NOTCH_THRESHOLD) {
+    if (accumulatedDeltaRef.current >= pixelsPerStep) {
       triggerStep('next');
       accumulatedDeltaRef.current = 0;
-    } else if (accumulatedDeltaRef.current <= -NOTCH_THRESHOLD) {
+    } else if (accumulatedDeltaRef.current <= -pixelsPerStep) {
       triggerStep('prev');
       accumulatedDeltaRef.current = 0;
     }

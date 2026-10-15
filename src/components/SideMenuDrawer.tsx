@@ -22,6 +22,7 @@ import {
   Volume2,
   Vibrate,
   Gauge,
+  Repeat2,
   CornerDownLeft,
   Delete,
   Volume1,
@@ -527,6 +528,30 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                   onChange={(e) => onUpdateSettings({ sensitivity: parseFloat(e.target.value) })}
                   className="w-full accent-sky-400 cursor-pointer"
                 />
+              </div>
+
+              {/* App Switcher Travel Distance */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-slate-300 flex items-center gap-1.5">
+                    <Repeat2 className="w-3.5 h-3.5 text-sky-400" />
+                    <span>App switcher spacing: {settings.wheelSensitivity}px</span>
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min="70"
+                  max="260"
+                  step="10"
+                  value={settings.wheelSensitivity}
+                  onChange={(e) =>
+                    onUpdateSettings({ wheelSensitivity: parseInt(e.target.value, 10) })
+                  }
+                  className="w-full accent-sky-400 cursor-pointer"
+                />
+                <p className="text-[10px] text-slate-500">
+                  Pixels of travel per app switch. Higher values spread the apps further apart.
+                </p>
               </div>
 
               {/* Acceleration Curve */}

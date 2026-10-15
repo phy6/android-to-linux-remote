@@ -1,13 +1,19 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { AlertCircle } from 'lucide-react';
 import { linuxClient } from './services/linuxClient';
 import { ConnectionStatus, RemoteSettings } from './types';
-import { HorizontalScrollWheel } from './components/HorizontalScrollWheel';
+import {
+  HorizontalScrollWheel,
+  MIN_WHEEL_SPACING,
+  DEFAULT_WHEEL_SPACING,
+} from './components/HorizontalScrollWheel';
 import { Trackpad } from './components/Trackpad';
 import { BottomClickButtons } from './components/BottomClickButtons';
 import { FloatingDictationButton } from './components/FloatingDictationButton';
 import { DictationModal } from './components/DictationModal';
 import { SideMenuDrawer } from './components/SideMenuDrawer';
 import { LinuxSimulator } from './components/LinuxSimulator';
+import { useSpeechRecognition } from './hooks/useSpeechRecognition';
 
 const DEFAULT_SETTINGS: RemoteSettings = {
   sensitivity: 1.2,
@@ -17,7 +23,7 @@ const DEFAULT_SETTINGS: RemoteSettings = {
   soundFeedback: true,
   twoFingerRightClick: true,
   tapToClick: true,
-  wheelSensitivity: 26,
+  wheelSensitivity: DEFAULT_WHEEL_SPACING,
   tailscaleIp: '192.0.2.10:8080',
   tailscalePort: 8080,
   useSimulator: true,
@@ -27,7 +33,16 @@ export default function App() {
   const [settings, setSettings] = useState<RemoteSettings>(() => {
     try {
       const saved = localStorage.getItem('taildeck_settings');
-      return saved ? { ...DEFAULT_SETTINGS, ...JSON.parse(saved) } : DEFAULT_SETTINGS;
+      if (!saved) return DEFAULT_SETTINGS;
+      const parsed = JSON.parse(saved) as Partial<RemoteSettings>;
+      // Older builds persisted a far tighter notches-per-pixel value, which
+      // made one swipe cycle every open app. Snap stale values to the default.
+      const wheelSensitivity =
+        typeof parsed.wheelSensitivity === 'number' &&
+        parsed.wheelSensitivity >= MIN_WHEEL_SPACING
+          ? parsed.wheelSensitivity
+          : DEFAULT_WHEEL_SPACING;
+      return { ...DEFAULT_SETTINGS, ...parsed, wheelSensitivity };
     } catch {
       return DEFAULT_SETTINGS;
     }
@@ -40,6 +55,100 @@ export default function App() {
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
   const [isDictationOpen, setIsDictationOpen] = useState(false);
   const [showSimulator, setShowSimulator] = useState(false);
+  const [isPttActive, setIsPttActive] = useState(false);
+
+  const speech = useSpeechRecognition();
+  const pttSendTimerRef = useRef<number | null>(null);
+  const pttTokenRef = useRef(0);
+
+  // Push-to-talk: hold the mic to listen, release to type the words into Linux.
+  const handlePttStart = useCallback(() => {
+    speech.resetTranscript();
+    if (pttSendTimerRef.current !== null) {
+      window.clearTimeout(pttSendTimerRef.current);
+      pttSendTimerRef.current = null;
+    }
+
+    const token = ++pttTokenRef.current;
+    void speech.startListening().then((started) => {
+      // The finger may already be lifted by the time permission resolves.
+      if (pttTokenRef.current !== token) {
+        if (started) speech.abortListening();
+        return;
+      }
+      setIsPttActive(started);
+    });
+  }, [speech]);
+
+  const handlePttEnd = useCallback(() => {
+    // Invalidate any start that is still awaiting permission.
+    pttTokenRef.current += 1;
+    setIsPttActive(false);
+
+    if (pttSendTimerRef.current !== null) {
+      window.clearTimeout(pttSendTimerRef.current);
+      pttSendTimerRef.current = null;
+    }
+
+    speech.stopListening();
+    if (!speech.transcriptRef.current.trim()) return;
+
+    // Give the engine a beat to deliver its final result before reading the text.
+    pttSendTimerRef.current = window.setTimeout(() => {
+      pttSendTimerRef.current = null;
+      const text = speech.transcriptRef.current.trim();
+      if (!text) return;
+      linuxClient.sendTypeText(text);
+      linuxClient.sendKeyCombo(['Return']);
+      speech.resetTranscript();
+    }, 350);
+  }, [speech]);
+
+  const handlePttCancel = useCallback(() => {
+    pttTokenRef.current += 1;
+    setIsPttActive(false);
+    if (pttSendTimerRef.current !== null) {
+      window.clearTimeout(pttSendTimerRef.current);
+      pttSendTimerRef.current = null;
+    }
+    speech.abortListening();
+    speech.resetTranscript();
+  }, [speech]);
+
+  useEffect(
+    () => () => {
+      if (pttSendTimerRef.current !== null) {
+        window.clearTimeout(pttSendTimerRef.current);
+      }
+    },
+    []
+  );
+
+  // Surface speech failures on the deck itself, otherwise a blocked microphone
+  // makes push-to-talk fail with no visible reason.
+  const [speechNotice, setSpeechNotice] = useState<string | null>(null);
+  const noticeTimerRef = useRef<number | null>(null);
+
+  const showSpeechNotice = useCallback((message: string) => {
+    setSpeechNotice(message);
+    if (noticeTimerRef.current !== null) {
+      window.clearTimeout(noticeTimerRef.current);
+    }
+    noticeTimerRef.current = window.setTimeout(() => setSpeechNotice(null), 6000);
+  }, []);
+
+  useEffect(() => {
+    if (speech.error) showSpeechNotice(speech.error);
+  }, [speech.error, showSpeechNotice]);
+
+  useEffect(
+    () => () => {
+      if (noticeTimerRef.current !== null) {
+        window.clearTimeout(noticeTimerRef.current);
+      }
+    },
+    []
+  );
 
   const handleUpdateSettings = (newSettings: Partial<RemoteSettings>) => {
     setSettings((prev) => {
@@ -115,11 +224,26 @@ export default function App() {
         isSimulatorActive={showSimulator}
       />
 
-      {/* Simple Floating Circular Dictation Button (Freely Draggable & Droppable anywhere) */}
+      {/* Speech failure notice so a blocked mic is never silent */}
+      {speechNotice && (
+        <button
+          onClick={() => setSpeechNotice(null)}
+          className="fixed top-3 left-1/2 -translate-x-1/2 z-40 max-w-[90vw] flex items-start gap-2 text-left text-xs px-3 py-2 rounded-xl bg-amber-950/90 border border-amber-700/70 text-amber-200 shadow-lg shadow-black/50 backdrop-blur-sm"
+        >
+          <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+          <span>{speechNotice}</span>
+        </button>
+      )}
+
+      {/* Floating Mic: hold to talk (push-to-talk), tap for the dictation sheet, drag to move */}
       <FloatingDictationButton
         onTriggerDictation={() => setIsDictationOpen(true)}
         hapticsEnabled={settings.hapticFeedback}
         soundEnabled={settings.soundFeedback}
+        isPushToTalkActive={isPttActive}
+        onPushToTalkStart={handlePttStart}
+        onPushToTalkEnd={handlePttEnd}
+        onPushToTalkCancel={handlePttCancel}
       />
 
       {/* Voice Dictation Input Sheet */}
@@ -128,6 +252,7 @@ export default function App() {
         onClose={() => setIsDictationOpen(false)}
         hapticsEnabled={settings.hapticFeedback}
         soundEnabled={settings.soundFeedback}
+        speech={speech}
       />
 
       {/* Embedded Linux Desktop Simulator (If opened from side menu) */}
