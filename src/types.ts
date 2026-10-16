@@ -49,4 +49,5 @@ export interface RemoteSettings {
   tailscaleIp: string;
   autoConnect: boolean; // reconnect to the saved host when the app opens
   connectionAlerts: boolean; // post a system notification when the link comes up or drops
+  buttonScale: number; // global size multiplier for the big thumb controls
 }

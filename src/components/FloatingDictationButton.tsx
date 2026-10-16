@@ -177,7 +177,8 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
         role="button"
         tabIndex={0}
         aria-label={isPttLabel}
-        className={`relative w-[104px] h-[104px] rounded-full flex items-center justify-center shadow-[0_6px_20px_rgba(0,0,0,0.6)] border transition-all ${
+        style={{ width: 'calc(104px * var(--td-scale, 1))', height: 'calc(104px * var(--td-scale, 1))' }}
+        className={`relative rounded-full flex items-center justify-center shadow-[0_6px_20px_rgba(0,0,0,0.6)] border transition-all ${
           isPressing ? 'scale-95' : ''
         } ${
           active

@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import type { CSSProperties } from 'react';
 import { AlertCircle, Check, Wifi, WifiOff } from 'lucide-react';
 import { linuxClient } from './services/linuxClient';
 import { LOCAL_HOST, IS_LOCAL_MODE, describeRoute, servedByLabel } from './services/localMode';
@@ -10,7 +11,12 @@ import {
   DEFAULT_WHEEL_SPACING,
 } from './components/HorizontalScrollWheel';
 import { Trackpad } from './components/Trackpad';
-import { BottomClickButtons } from './components/BottomClickButtons';
+import {
+  BottomClickButtons,
+  MIN_BUTTON_SCALE,
+  MAX_BUTTON_SCALE,
+  DEFAULT_BUTTON_SCALE,
+} from './components/BottomClickButtons';
 import { FloatingDictationButton } from './components/FloatingDictationButton';
 import { DictationModal } from './components/DictationModal';
 import { SideMenuDrawer } from './components/SideMenuDrawer';
@@ -38,6 +44,7 @@ const DEFAULT_SETTINGS: RemoteSettings = {
   tailscaleIp: '',
   autoConnect: true,
   connectionAlerts: true,
+  buttonScale: DEFAULT_BUTTON_SCALE,
 };
 
 export default function App() {
@@ -53,7 +60,12 @@ export default function App() {
         parsed.wheelSensitivity >= MIN_WHEEL_SPACING
           ? parsed.wheelSensitivity
           : DEFAULT_WHEEL_SPACING;
-      return { ...DEFAULT_SETTINGS, ...parsed, wheelSensitivity };
+      // Keep a hand-edited or stale stored size inside the supported range.
+      const buttonScale =
+        typeof parsed.buttonScale === 'number'
+          ? Math.min(MAX_BUTTON_SCALE, Math.max(MIN_BUTTON_SCALE, parsed.buttonScale))
+          : DEFAULT_BUTTON_SCALE;
+      return { ...DEFAULT_SETTINGS, ...parsed, wheelSensitivity, buttonScale };
     } catch {
       return DEFAULT_SETTINGS;
     }
@@ -61,6 +73,11 @@ export default function App() {
 
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>(linuxClient.getStatus());
   const [activeAppIndex, setActiveAppIndex] = useState(0);
+
+  // Live size preview while dragging the resize grip; null means "use the
+  // saved setting". Kept separate so a drag never spams localStorage.
+  const [buttonScalePreview, setButtonScalePreview] = useState<number | null>(null);
+  const effectiveButtonScale = buttonScalePreview ?? settings.buttonScale;
 
   // Side Drawer & Modals
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
@@ -390,7 +407,10 @@ export default function App() {
   }, []);
 
   return (
-    <div className="flex flex-col h-[100dvh] w-full bg-slate-950 text-slate-100 font-sans select-none overflow-hidden touch-none relative">
+    <div
+      className="flex flex-col h-[100dvh] w-full bg-slate-950 text-slate-100 font-sans select-none overflow-hidden touch-none relative"
+      style={{ '--td-scale': effectiveButtonScale } as CSSProperties}
+    >
       {/* Main Remote Deck (Clean, Unmarked, Edge-to-Edge) */}
       <main className="flex-1 flex flex-col h-full w-full bg-slate-950">
         {/* Top: Unmarked Minimal Horizontal Scroll Wheel (left = Shift+Tab, right = Tab) */}
@@ -422,6 +442,12 @@ export default function App() {
             hapticsEnabled={settings.hapticFeedback}
             soundEnabled={settings.soundFeedback}
             onTriggerDictation={() => setIsDictationOpen(true)}
+            buttonScale={effectiveButtonScale}
+            onButtonScaleChange={setButtonScalePreview}
+            onButtonScaleCommit={(scale) => {
+              setButtonScalePreview(null);
+              handleUpdateSettings({ buttonScale: scale });
+            }}
           />
         </div>
       </main>
