@@ -207,6 +207,7 @@ class LinuxInputBackend:
 
         # Priority 2: ydotool (Wayland & X11 native daemon tool)
         if self._command_exists("ydotool"):
+            self._ensure_ydotool_socket()
             self.backend = "ydotool"
             BACKEND_NAME = "ydotool CLI (Wayland & X11)"
             print(f"[TailDeck] Using ydotool for input ({SESSION_TYPE})")
@@ -233,6 +234,25 @@ class LinuxInputBackend:
         self.backend = "cli_fallback"
         BACKEND_NAME = "CLI Helper fallback (wtype / xdotool / ydotool)"
         print(f"[TailDeck] Warning: No direct uinput library found. Will try CLI commands ({SESSION_TYPE})")
+
+    @staticmethod
+    def _ensure_ydotool_socket():
+        # ydotoold usually creates its socket under XDG_RUNTIME_DIR, while the
+        # ydotool client falls back to /tmp/.ydotool_socket. When the two
+        # disagree every input command silently no-ops, so point the client at
+        # whichever socket actually exists.
+        if os.environ.get("YDOTOOL_SOCKET"):
+            return
+        candidates = []
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+        if runtime_dir:
+            candidates.append(os.path.join(runtime_dir, ".ydotool_socket"))
+        candidates.append("/tmp/.ydotool_socket")
+        candidates.append(f"/run/user/{os.getuid()}/.ydotool_socket")
+        for path in candidates:
+            if os.path.exists(path):
+                os.environ["YDOTOOL_SOCKET"] = path
+                return
 
     def _command_exists(self, cmd):
         return subprocess.call(f"type {cmd}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE) == 0
@@ -292,9 +312,13 @@ class LinuxInputBackend:
                 self.ui.write(e.EV_REL, e.REL_HWHEEL, int(dx))
             self.ui.syn()
         elif self.backend == "ydotool":
-            # ydotool mousemove -w
-            step = 1 if dy > 0 else -1
-            subprocess.run(["ydotool", "mousemove", "-w", str(step)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # Wheel moves require both axes on the option form; `-w -x` alone is
+            # rejected, so use the positional `-- <xpos> <ypos>` shape.
+            if dx or dy:
+                subprocess.run(
+                    ["ydotool", "mousemove", "-w", "--", str(int(dx)), str(int(dy))],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
         elif self.backend == "xdotool":
             btn = "4" if dy > 0 else "5"
             subprocess.run(["xdotool", "click", btn], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
