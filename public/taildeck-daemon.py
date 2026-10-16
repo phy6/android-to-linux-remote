@@ -619,6 +619,18 @@ def tailnet_dns_name():
     return None
 
 
+def _parse_headers(raw):
+    """Lower-cased header map from a raw HTTP request head. Enough to read the
+    X-Forwarded-* pair a reverse proxy adds."""
+    headers = {}
+    for line in raw.split("\r\n")[1:]:
+        if not line or ":" not in line:
+            continue
+        name, _, value = line.partition(":")
+        headers[name.strip().lower()] = value.strip()
+    return headers
+
+
 def _classify_route(host):
     """Tailscale hands out CGNAT addresses (100.64.0.0/10); the hotspot is the
     ordinary private ranges. Naming the route is the point of the record."""
@@ -675,9 +687,11 @@ def handle_websocket(conn):
         local_port = conn.getsockname()[1]
     except Exception:
         local_port = PORT
+    started = time.time()
     scheme = "https" if local_port == TLS_PORT else "http"
     route = _classify_route(peer.split(":")[0])
-    started = time.time()
+    logged_peer = peer
+    proxied = False
     is_ws = False
     try:
         data = conn.recv(4096).decode('utf-8', errors='ignore')
@@ -686,8 +700,27 @@ def handle_websocket(conn):
             conn.close()
             return
         is_ws = True
-        print(f"[TailDeck] ws open {peer}", flush=True)
-        record_connection("connected", peer, scheme, route)
+
+        # Behind a reverse proxy (tailscale serve) the socket peer is always
+        # 127.0.0.1, so prefer the real client the edge reported in
+        # X-Forwarded-For. That keeps a proxied session labelled with the
+        # phone's own address and route instead of a meaningless loopback line.
+        headers = _parse_headers(data)
+        forwarded_for = headers.get("x-forwarded-for", "")
+        forwarded_proto = headers.get("x-forwarded-proto", "")
+        proxied = bool(forwarded_for)
+        if forwarded_for:
+            logged_peer = forwarded_for.split(",")[0].strip()
+            route = _classify_route(logged_peer)
+        if forwarded_proto in ("http", "https"):
+            scheme = forwarded_proto
+
+        print(
+            f"[TailDeck] ws open {peer}"
+            f"{' proxy -> ' + logged_peer if proxied else ''}",
+            flush=True,
+        )
+        record_connection("connected", logged_peer, scheme, route, "via=serve" if proxied else "")
 
         key = None
         for line in data.split("\r\n"):
@@ -734,13 +767,14 @@ def handle_websocket(conn):
         while True:
             payload = read_ws_frame(conn)
             if payload is None:
-                print(f"[TailDeck] ws closed {peer} bytes={dictation_bytes}", flush=True)
+                print(f"[TailDeck] ws closed {logged_peer} bytes={dictation_bytes}", flush=True)
                 record_connection(
                     "closed",
-                    peer,
+                    logged_peer,
                     scheme,
                     route,
-                    f"dur={int(time.time() - started)}s bytes={dictation_bytes}",
+                    f"dur={int(time.time() - started)}s bytes={dictation_bytes}"
+                    + (" via=serve" if proxied else ""),
                 )
                 break
             try:
