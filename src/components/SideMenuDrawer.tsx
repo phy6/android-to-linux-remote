@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { ConnectionStatus, RemoteSettings, SessionType } from '../types';
 import { linuxClient } from '../services/linuxClient';
 import { LOCAL_HOST, IS_LOCAL_MODE, describeRoute } from '../services/localMode';
+import { useSavedLaptops } from '../services/savedLaptops';
 import { useHaptics } from '../hooks/useHaptics';
 import { PWAInstallButton } from './PWAInstallButton';
 import {
@@ -115,6 +116,11 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
   onEnterDarkOut,
 }) => {
   const { triggerClick } = useHaptics(settings.hapticFeedback, settings.soundFeedback);
+  const {
+    laptops: savedLaptops,
+    refresh: refreshSavedLaptops,
+    forget: forgetSavedLaptop,
+  } = useSavedLaptops();
   const [tailscaleIp, setTailscaleIp] = useState(connectionStatus.hostAddress || '');
   const [alertPermission, setAlertPermission] = useState<AlertPermission>(notificationSupport());
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
@@ -139,6 +145,12 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
     const t = window.setTimeout(() => quickInputRef.current?.focus(), 320);
     return () => window.clearTimeout(t);
   }, [isOpen, activeTab]);
+
+  // Re-read the saved laptops each time the drawer opens, so a machine we just
+  // connected to shows up without a reload.
+  useEffect(() => {
+    if (isOpen) refreshSavedLaptops();
+  }, [isOpen, refreshSavedLaptops]);
 
   const toggleFullscreen = async () => {
     triggerClick();
@@ -403,6 +415,66 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                   </div>
                 )}
               </div>
+
+              {/* Saved laptops: remembered from past sessions, so switching
+                  machines is one tap rather than retyping an address. */}
+              {savedLaptops.length > 0 && (
+                <div className="space-y-2">
+                  <SectionTitle>My laptops</SectionTitle>
+                  <div className="space-y-1.5">
+                    {savedLaptops.map((laptop) => {
+                      const isCurrent =
+                        connectionStatus.hostAddress === laptop.host && connectionStatus.connected;
+                      return (
+                        <div
+                          key={laptop.host}
+                          className="flex items-center justify-between gap-2 p-2.5 rounded-xl bg-slate-900 border border-slate-800"
+                        >
+                          <div className="min-w-0">
+                            <div className="text-[11px] font-semibold text-white truncate">
+                              {laptop.name}
+                            </div>
+                            <div className="font-mono text-[10px] text-slate-500 truncate">
+                              {laptop.host}
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-1 shrink-0">
+                            {isCurrent ? (
+                              <span className="flex items-center gap-1 text-[10px] text-emerald-400 px-2 py-1 rounded-lg bg-emerald-950 border border-emerald-800">
+                                <Check className="w-3 h-3" />
+                                Connected
+                              </span>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  triggerClick();
+                                  setTailscaleIp(laptop.host);
+                                  linuxClient.connect(laptop.host);
+                                }}
+                                className="px-2.5 py-1.5 rounded-lg bg-sky-600 text-white text-[11px] font-medium hover:bg-sky-500"
+                              >
+                                Connect
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => {
+                                triggerClick();
+                                forgetSavedLaptop(laptop.host);
+                              }}
+                              title="Forget this laptop"
+                              className="p-1.5 rounded-lg bg-slate-800 text-slate-400 hover:text-rose-300"
+                            >
+                              <X className="w-3 h-3" />
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
 
               {/* Address book: the daemon reports every way back to itself, so
                   you never have to run `tailscale ip` on the laptop. */}

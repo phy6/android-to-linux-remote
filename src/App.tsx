@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { AlertCircle, Check, Wifi, WifiOff } from 'lucide-react';
 import { linuxClient } from './services/linuxClient';
 import { LOCAL_HOST, IS_LOCAL_MODE, describeRoute, servedByLabel } from './services/localMode';
+import { rememberLaptop } from './services/savedLaptops';
 import { ConnectionStatus, RemoteSettings } from './types';
 import {
   HorizontalScrollWheel,
@@ -355,6 +356,17 @@ export default function App() {
       showToast(connected ? `Connected to ${host}` : `Disconnected from ${host}`, connected ? 'ok' : 'warn');
     });
   }, [connectionStatus.connected, connectionStatus.hostAddress, settings.connectionAlerts, showToast]);
+
+  // Remember every laptop we actually reach, so the drawer can offer it again
+  // with one tap instead of retyping an address or a tailnet name.
+  useEffect(() => {
+    if (!connectionStatus.connected || !connectionStatus.hostAddress) return;
+    rememberLaptop(connectionStatus.hostAddress, connectionStatus.hostOsInfo?.hostname ?? '');
+  }, [
+    connectionStatus.connected,
+    connectionStatus.hostAddress,
+    connectionStatus.hostOsInfo?.hostname,
+  ]);
 
   const handleAppSwitch = (direction: 'prev' | 'next') => {
     setActiveAppIndex((prev) => {
