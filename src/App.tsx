@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import type { CSSProperties } from 'react';
 import { AlertCircle, Check, Wifi, WifiOff } from 'lucide-react';
+import { useRegisterSW } from 'virtual:pwa-register/react';
 import { linuxClient } from './services/linuxClient';
 import { LOCAL_HOST, IS_LOCAL_MODE, describeRoute, servedByLabel } from './services/localMode';
 import { rememberLaptop } from './services/savedLaptops';
@@ -27,6 +28,7 @@ import {
   notificationSupport,
   requestNotificationPermission,
   showConnectionNotice,
+  showMessageNotice,
   AlertPermission,
 } from './services/notifications';
 import { SpeechDiagnosticsPanel } from './components/SpeechDiagnosticsPanel';
@@ -90,6 +92,27 @@ export default function App() {
   const pttTranscriptTimerRef = useRef<number | null>(null);
 
   const speech = useSpeechRecognition();
+
+  // Register the service worker once, at the root, so an update is noticed even
+  // if the drawer is never opened. The Settings tab's Updates card reads this.
+  const {
+    needRefresh: [appUpdateReady],
+    updateServiceWorker,
+  } = useRegisterSW();
+
+  const applyAppUpdate = useCallback(async () => {
+    if (appUpdateReady) {
+      await updateServiceWorker(true);
+      return;
+    }
+    try {
+      const regs = (await navigator.serviceWorker?.getRegistrations?.()) ?? [];
+      await Promise.all(regs.map((r) => r.unregister()));
+    } catch {
+      // Fall through to the reload.
+    }
+    location.reload();
+  }, [appUpdateReady, updateServiceWorker]);
 
   // Surface speech failures on the deck itself, otherwise a blocked microphone
   // makes push-to-talk fail with no visible reason.
@@ -368,11 +391,25 @@ export default function App() {
     if (!settings.connectionAlerts) return;
 
     const host = connectionStatus.hostAddress || 'the laptop';
-    void showConnectionNotice({ connected, host }).then((posted) => {
+    const route = describeRoute(connectionStatus.hostAddress, IS_LOCAL_MODE, connected);
+    void showConnectionNotice({ connected, host, route }).then((posted) => {
       if (posted) return;
-      showToast(connected ? `Connected to ${host}` : `Disconnected from ${host}`, connected ? 'ok' : 'warn');
+      showToast(
+        connected ? `Connected to ${host} · ${route}` : `Disconnected from ${host}`,
+        connected ? 'ok' : 'warn',
+      );
     });
   }, [connectionStatus.connected, connectionStatus.hostAddress, settings.connectionAlerts, showToast]);
+
+  // Laptop-initiated notices: the daemon pushes `notify` over the live socket,
+  // so anything the laptop wants to say reaches the phone as a pop-up.
+  useEffect(() => {
+    return linuxClient.onNotify(({ title, body }) => {
+      void showMessageNotice({ title, body }).then((posted) => {
+        if (!posted) showToast(body, 'ok');
+      });
+    });
+  }, [showToast]);
 
   // Remember every laptop we actually reach, so the drawer can offer it again
   // with one tap instead of retyping an address or a tailnet name.
@@ -465,6 +502,8 @@ export default function App() {
         onOpenDiagnostics={() => setShowDiagnostics(true)}
         isSimulatorActive={showSimulator}
         onEnterDarkOut={enterDarkOut}
+        appUpdateReady={appUpdateReady}
+        onApplyAppUpdate={applyAppUpdate}
       />
 
       {/* Full-screen push-to-talk state: the mic button sits under the thumb,
@@ -590,6 +629,7 @@ export default function App() {
         onClose={() => setIsDictationOpen(false)}
         hapticsEnabled={settings.hapticFeedback}
         soundEnabled={settings.soundFeedback}
+        host={connectionStatus.hostAddress}
         speech={speech}
       />
 

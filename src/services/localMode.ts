@@ -26,10 +26,10 @@ export const IS_LOCAL_MODE: boolean = LOCAL_HOST !== '';
 export function describeRoute(host: string, localMode: boolean, connected: boolean): string {
   if (!host) return 'no address set';
   if (!connected) return 'not connected';
-  if (localMode) return 'Same hotspot — never leaves the phone';
-  if (/(^|\.)ts\.net(:|$)/i.test(host)) return 'Tailscale — via the carrier/internet';
-  if (/^\d+\.\d+\.\d+\.\d+(:|$)/.test(host)) return 'LAN address — direct';
-  return 'custom host';
+  if (localMode) return 'Local — direct, never leaves this phone';
+  if (/(^|\.)ts\.net(:|$)/i.test(host)) return 'Tailscale — encrypted, direct to your laptop';
+  if (/^\d+\.\d+\.\d+\.\d+(:|$)/.test(host)) return 'Local network — direct';
+  return 'Direct link';
 }
 
 /** Where this copy of the app was loaded from. */

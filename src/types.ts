@@ -1,5 +1,14 @@
 export type SessionType = 'wayland' | 'x11' | 'auto';
 
+export type MediaAction =
+  | 'playpause'
+  | 'next'
+  | 'prev'
+  | 'stop'
+  | 'volup'
+  | 'voldown'
+  | 'mute';
+
 export type InputEventPayload =
   | { type: 'move'; dx: number; dy: number }
   | { type: 'click'; button: 'left' | 'right' | 'middle'; action: 'down' | 'up' | 'click' }
@@ -7,6 +16,7 @@ export type InputEventPayload =
   | { type: 'app_switch'; direction: 'prev' | 'next' } // left (prev = Alt+Shift+Tab) or right (next = Alt+Tab)
   | { type: 'key_combo'; keys: string[] }
   | { type: 'type_text'; text: string }
+  | { type: 'media'; action: MediaAction }
   | { type: 'ping'; timestamp: number };
 
 export interface ConnectionStatus {

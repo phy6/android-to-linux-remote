@@ -7,17 +7,24 @@ Zero external dependencies required (uses Python standard library for WebSocket 
 
 import sys
 import os
+import io
 import json
 import time
 import socket
 import ssl
 import struct
+import tarfile
 import urllib.parse
+import urllib.request
 import hashlib
 import base64
 import threading
 import subprocess
+import tempfile
+import pwd
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
+DAEMON_VERSION = "1.3.0"
 
 PORT = int(os.environ.get("TAILDECK_PORT", 8080))
 DICTATE_HOST = os.environ.get("TAILDECK_DICTATE_HOST", "127.0.0.1")
@@ -505,6 +512,52 @@ class LinuxInputBackend:
             import pyautogui
             pyautogui.hotkey(*keys)
 
+    def media_control(self, action: str):
+        """Transport/volume keys, mapped per backend. The phone's media row
+        drives whatever player the laptop is focused on."""
+        spec = MEDIA_KEYS.get(action)
+        if not spec:
+            return
+        if self.backend == "evdev_uinput":
+            try:
+                from evdev import ecodes as e
+                code = getattr(e, spec["evdev"], None)
+                if code is None:
+                    return
+                self.ui.write(e.EV_KEY, code, 1)
+                self.ui.syn()
+                self.ui.write(e.EV_KEY, code, 0)
+                self.ui.syn()
+            except Exception:
+                pass
+        elif self.backend == "xdotool":
+            subprocess.run(["xdotool", "key", spec["xdotool"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif self.backend == "ydotool":
+            # ydotool takes raw evdev keycodes; press then release.
+            code = spec["code"]
+            subprocess.run(
+                ["ydotool", "key", f"{code}:1", f"{code}:0"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        elif self.backend == "pyautogui":
+            try:
+                import pyautogui
+                pyautogui.press(spec["pyautogui"])
+            except Exception:
+                pass
+
+
+# action -> per-backend key names / evdev codes for the media row.
+MEDIA_KEYS = {
+    "playpause": {"evdev": "KEY_PLAYPAUSE", "xdotool": "XF86AudioPlay", "pyautogui": "playpause", "code": 164},
+    "next": {"evdev": "KEY_NEXTSONG", "xdotool": "XF86AudioNext", "pyautogui": "nexttrack", "code": 163},
+    "prev": {"evdev": "KEY_PREVIOUSSONG", "xdotool": "XF86AudioPrev", "pyautogui": "prevtrack", "code": 165},
+    "stop": {"evdev": "KEY_STOPCD", "xdotool": "XF86AudioStop", "pyautogui": "stop", "code": 166},
+    "volup": {"evdev": "KEY_VOLUMEUP", "xdotool": "XF86AudioRaiseVolume", "pyautogui": "volumeup", "code": 115},
+    "voldown": {"evdev": "KEY_VOLUMEDOWN", "xdotool": "XF86AudioLowerVolume", "pyautogui": "volumedown", "code": 114},
+    "mute": {"evdev": "KEY_MUTE", "xdotool": "XF86AudioMute", "pyautogui": "volumemute", "code": 113},
+}
+
 
 INPUT_HANDLER = LinuxInputBackend()
 
@@ -516,6 +569,20 @@ INPUT_HANDLER = LinuxInputBackend()
 # to the directory holding the built index.html to enable it.
 WEBROOT = os.environ.get("TAILDECK_WEBROOT", os.path.expanduser("~/taildeck-web"))
 
+# Where new releases are published. The phone reads version.json from here to
+# learn that a newer build exists; the daemon pulls the same manifest, the
+# daemon script and the app tarball from here to update itself. Override for a
+# fork or a mirror.
+RELEASE_URL = os.environ.get(
+    "TAILDECK_RELEASE_URL", "https://phy6.github.io/android-to-linux-remote"
+).rstrip("/")
+RELEASE_CACHE_TTL = int(os.environ.get("TAILDECK_RELEASE_TTL", 300))
+RELEASE_CACHE = {"at": 0.0, "data": None}
+RELEASE_LOCK = threading.Lock()
+
+# The systemd --user unit a self-update restarts.
+SERVICE_NAME = os.environ.get("TAILDECK_SERVICE", "taildeck.service")
+
 # Hotspot TLS. http:// on a LAN address is not a secure context, so the phone
 # would refuse to hand over its microphone over the direct route. Serving the
 # same app over https fixes that. The certificate is self-signed, so the phone
@@ -524,6 +591,34 @@ TLS_PORT = int(os.environ.get("TAILDECK_TLS_PORT", 8443))
 TLS_DIR = os.environ.get("TAILDECK_TLS_DIR", os.path.expanduser("~/.config/taildeck/tls"))
 TLS_CERT = os.path.join(TLS_DIR, "taildeck.crt")
 TLS_KEY = os.path.join(TLS_DIR, "taildeck.key")
+# Public half of the local CA, if one was generated. Guests install this once so
+# an iPhone will accept the wss:// socket; see scripts/make-cert.sh.
+TLS_CA = os.path.join(TLS_DIR, "ca.crt")
+
+# A plain folder of text files that the phone can read as dictation scripts.
+# The laptop owns the files; the phone lists and loads them over the same
+# HTTP(S) port it already talks to, so scripts work on the hotspot with no
+# internet and on Tailscale with no extra setup. Only .txt/.md files are served,
+# and a save is written back here.
+SCRIPTS_DIR = os.environ.get(
+    "TAILDECK_SCRIPTS_DIR", os.path.join(os.path.expanduser("~"), "taildeck-scripts")
+)
+SCRIPT_EXT = (".txt", ".md", ".markdown")
+
+# WebAuthn unlock material (phase 1: registration + assertion verification, no
+# PAM yet). The phone registers a biometric-gated passkey; only its public half
+# is stored here, and assertions are verified with the openssl CLI so the daemon
+# keeps its zero-dependency promise.
+AUTH_DIR = os.environ.get("TAILDECK_AUTH_DIR", os.path.expanduser("~/.config/taildeck/auth"))
+AUTH_CRED_FILE = os.path.join(AUTH_DIR, "credentials.json")
+# The relying party must be a real domain (WebAuthn rejects IP literals), so the
+# tailnet name is the natural default. Both can be overridden for testing.
+AUTH_RPID_ENV = os.environ.get("TAILDECK_RPID", "")
+AUTH_ORIGIN_ENV = os.environ.get("TAILDECK_ORIGIN", "")
+AUTH_CHALLENGE_TTL = int(os.environ.get("TAILDECK_AUTH_TTL", 60))
+AUTH_LOCK = threading.Lock()
+AUTH_PENDING = {}
+_AUTH_RPID_CACHE = {"value": None}
 
 MIME_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -548,6 +643,12 @@ def _http(conn, status, ctype, body, cache="no-cache"):
         f"Content-Type: {ctype}\r\n"
         f"Content-Length: {len(body)}\r\n"
         f"Cache-Control: {cache}\r\n"
+        # The app may be served from GitHub Pages while the daemon sits on the
+        # laptop, so the scripts API is cross-origin. These are read-mostly text
+        # endpoints with no credentials; a wildcard origin is deliberate.
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Methods: GET, POST, PUT, OPTIONS\r\n"
+        "Access-Control-Allow-Headers: Content-Type\r\n"
         "Connection: close\r\n\r\n"
     )
     try:
@@ -601,6 +702,758 @@ def serve_static(conn, request_line):
         cache = "public, max-age=3600"
     ctype = MIME_TYPES.get(os.path.splitext(full)[1].lower(), "application/octet-stream")
     _http(conn, "200 OK", ctype, body, cache)
+
+
+# --- SCRIPTS / SNIPPETS API -------------------------------------------------
+#
+# A tiny read/write API over one folder of text files so the phone's dictation
+# modal can list the laptop's scripts and load one into the teleprompter. The
+# folder is the source of truth; the phone may also keep its own local copy.
+
+
+def _json(conn, obj, status="200 OK"):
+    _http(conn, status, "application/json; charset=utf-8", json.dumps(obj).encode("utf-8"))
+
+
+def _safe_script_name(name):
+    """One flat file name, no traversal, a text extension. Returns None if bad."""
+    name = urllib.parse.unquote(name).strip()
+    if not name or name.startswith(".") or "/" in name or "\\" in name:
+        return None
+    if not name.lower().endswith(SCRIPT_EXT):
+        return None
+    if len(name) > 96:
+        return None
+    for ch in name:
+        if not (ch.isalnum() or ch in " ._-()"):
+            return None
+    return name
+
+
+def _read_http_body(conn, raw, headers):
+    try:
+        length = int(headers.get("content-length", "0") or "0")
+    except Exception:
+        length = 0
+    if length <= 0:
+        return b""
+    sep = raw.find(b"\r\n\r\n")
+    body = raw[sep + 4:] if sep >= 0 else b""
+    while len(body) < length:
+        chunk = conn.recv(min(length - len(body), 65536))
+        if not chunk:
+            break
+        body += chunk
+    return body[:length]
+
+
+def _list_scripts():
+    items = []
+    try:
+        names = sorted(os.listdir(SCRIPTS_DIR))
+    except Exception:
+        names = []
+    for name in names:
+        if _safe_script_name(name) is None:
+            continue
+        full = os.path.join(SCRIPTS_DIR, name)
+        try:
+            st = os.stat(full)
+        except Exception:
+            continue
+        if not os.path.isfile(full):
+            continue
+        items.append({"name": name, "size": st.st_size, "modified": int(st.st_mtime)})
+    return items
+
+
+# --- WebAuthn: registration storage and assertion verification ---------------
+
+# P-256 SPKI header, so a COSE EC2 key can be handed to openssl as a public key
+# without a DER writer. 27 bytes; append x (32) then y (32) to finish it.
+_COSE_SPKI_PREFIX = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d03010703420004")
+
+
+def _b64u_decode(text):
+    text = (text or "").strip()
+    pad = "=" * (-len(text) % 4)
+    return base64.urlsafe_b64decode(text + pad)
+
+
+def _b64u_encode(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _cbor_decode(data, idx=0):
+    """Just enough CBOR for a COSE key: ints, byte/text strings, arrays, maps."""
+    ib = data[idx]
+    idx += 1
+    major = ib >> 5
+    ai = ib & 0x1F
+    if ai < 24:
+        val = ai
+    elif ai == 24:
+        val = data[idx]
+        idx += 1
+    elif ai == 25:
+        val = struct.unpack("!H", data[idx:idx + 2])[0]
+        idx += 2
+    elif ai == 26:
+        val = struct.unpack("!I", data[idx:idx + 4])[0]
+        idx += 4
+    elif ai == 27:
+        val = struct.unpack("!Q", data[idx:idx + 8])[0]
+        idx += 8
+    else:
+        raise ValueError("indefinite-length CBOR not supported")
+    if major == 0:
+        return val, idx
+    if major == 1:
+        return -1 - val, idx
+    if major == 2:
+        return bytes(data[idx:idx + val]), idx + val
+    if major == 3:
+        return bytes(data[idx:idx + val]).decode("utf-8", "replace"), idx + val
+    if major == 4:
+        arr = []
+        for _ in range(val):
+            item, idx = _cbor_decode(data, idx)
+            arr.append(item)
+        return arr, idx
+    if major == 5:
+        out = {}
+        for _ in range(val):
+            k, idx = _cbor_decode(data, idx)
+            v, idx = _cbor_decode(data, idx)
+            out[k] = v
+        return out, idx
+    if major == 6:
+        return _cbor_decode(data, idx)
+    raise ValueError("unsupported CBOR major type")
+
+
+def _cose_to_spki(cose_bytes):
+    """COSE EC2/P-256 public key bytes -> DER SubjectPublicKeyInfo."""
+    key, _ = _cbor_decode(cose_bytes, 0)
+    if not isinstance(key, dict):
+        raise ValueError("COSE key is not a map")
+    if key.get(1) != 2 or key.get(-1) != 1:
+        raise ValueError("only EC2/P-256 (ES256) is supported")
+    x, y = key.get(-2), key.get(-3)
+    if not isinstance(x, (bytes, bytearray)) or len(x) != 32:
+        raise ValueError("bad x coordinate")
+    if not isinstance(y, (bytes, bytearray)) or len(y) != 32:
+        raise ValueError("bad y coordinate")
+    return _COSE_SPKI_PREFIX + bytes(x) + bytes(y)
+
+
+def _spki_pem(spki_der):
+    b64 = base64.b64encode(spki_der).decode("ascii")
+    body = "\n".join(b64[i:i + 64] for i in range(0, len(b64), 64))
+    return f"-----BEGIN PUBLIC KEY-----\n{body}\n-----END PUBLIC KEY-----\n"
+
+
+def _verify_es256(spki_der, message, signature_der):
+    """True when signature_der is a valid ECDSA-SHA256 signature over message."""
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            pub = os.path.join(d, "pub.pem")
+            msg = os.path.join(d, "msg.bin")
+            sig = os.path.join(d, "sig.bin")
+            with open(pub, "w", encoding="ascii") as fh:
+                fh.write(_spki_pem(spki_der))
+            with open(msg, "wb") as fh:
+                fh.write(message)
+            with open(sig, "wb") as fh:
+                fh.write(signature_der)
+            res = subprocess.run(
+                ["openssl", "dgst", "-sha256", "-verify", pub, "-signature", sig, msg],
+                capture_output=True, text=True,
+            )
+            return res.returncode == 0
+    except Exception:
+        return False
+
+
+def auth_rpid():
+    if AUTH_RPID_ENV:
+        return AUTH_RPID_ENV
+    if _AUTH_RPID_CACHE["value"] is None:
+        _AUTH_RPID_CACHE["value"] = tailnet_dns_name() or ""
+    return _AUTH_RPID_CACHE["value"]
+
+
+def auth_origin():
+    if AUTH_ORIGIN_ENV:
+        return AUTH_ORIGIN_ENV
+    rp = auth_rpid()
+    return f"https://{rp}" if rp else ""
+
+
+def _default_user():
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except Exception:
+        return os.environ.get("USER", "user")
+
+
+def _load_credentials():
+    try:
+        with open(AUTH_CRED_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_credentials(items):
+    try:
+        os.makedirs(AUTH_DIR, exist_ok=True)
+        tmp = AUTH_CRED_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(items, fh, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, AUTH_CRED_FILE)
+        return True
+    except Exception:
+        return False
+
+
+def _find_credential(credential_id, user=None):
+    for cred in _load_credentials():
+        if cred.get("id") != credential_id:
+            continue
+        if user and cred.get("user") not in (None, user):
+            continue
+        return cred
+    return None
+
+
+def _prune_pending():
+    now = time.time()
+    with AUTH_LOCK:
+        stale = [
+            rid for rid, rec in AUTH_PENDING.items()
+            if now - rec["created"] > rec["ttl"] * 4
+        ]
+        for rid in stale:
+            AUTH_PENDING.pop(rid, None)
+
+
+def auth_begin(user=None, rp_id=None, origin=None):
+    """Mint a challenge and push it to every connected phone. Returns the
+    parameters the authenticator needs, or an error string.
+
+    The relying party is whichever domain the app is served from, so the caller
+    (or the registered credential) names it; the tailnet default is only a
+    fallback. WebAuthn rejects IP-literal rpIds, so hotspot-served pages cannot
+    register at all."""
+    user = user or _default_user()
+    if not rp_id:
+        stored = [c for c in _load_credentials() if c.get("user") in (None, user) and c.get("rpId")]
+        rp_id = stored[0]["rpId"] if stored else auth_rpid()
+    if not rp_id:
+        return None, "no relying-party domain (open the app from a real domain, not an IP)"
+    origin = origin or (AUTH_ORIGIN_ENV or f"https://{rp_id}")
+    _prune_pending()
+    challenge = _b64u_encode(os.urandom(32))
+    request_id = _b64u_encode(os.urandom(12))
+    allow = [c["id"] for c in _load_credentials() if c.get("user") in (None, user)]
+    rec = {
+        "challenge": challenge,
+        "user": user,
+        "rpId": rp_id,
+        "origin": origin,
+        "created": time.time(),
+        "ttl": AUTH_CHALLENGE_TTL,
+        "status": "pending",
+        "ok": False,
+    }
+    with AUTH_LOCK:
+        AUTH_PENDING[request_id] = rec
+    sent = broadcast_json({
+        "type": "auth_challenge",
+        "requestId": request_id,
+        "challenge": challenge,
+        "rpId": rp_id,
+        "origin": origin,
+        "allowCredentials": allow,
+        "timeout": AUTH_CHALLENGE_TTL * 1000,
+    })
+    print(f"[TailDeck] auth_begin user={user} rpId={rp_id} pushed={sent}", flush=True)
+    return {
+        "requestId": request_id,
+        "challenge": challenge,
+        "rpId": rp_id,
+        "origin": origin,
+        "allowCredentials": allow,
+        "timeoutMs": AUTH_CHALLENGE_TTL * 1000,
+    }, None
+
+
+def auth_verify(request_id, payload):
+    """Verify a WebAuthn assertion against the pending challenge."""
+    with AUTH_LOCK:
+        rec = AUTH_PENDING.get(request_id)
+        if rec is None:
+            return False, "unknown request"
+        if rec["status"] != "pending":
+            return rec["ok"], rec["status"]
+        if time.time() - rec["created"] > rec["ttl"]:
+            rec["status"] = "expired"
+            return False, "expired"
+
+    credential_id = payload.get("credentialId")
+    cred = _find_credential(credential_id, rec["user"])
+    if cred is None:
+        with AUTH_LOCK:
+            rec["status"] = "failed:unknown-credential"
+        return False, "unknown credential"
+
+    reason = ""
+    ok = False
+    try:
+        auth_data = _b64u_decode(payload.get("authenticatorData", ""))
+        client_raw = _b64u_decode(payload.get("clientDataJSON", ""))
+        signature = _b64u_decode(payload.get("signature", ""))
+        client = json.loads(client_raw)
+        if client.get("type") != "webauthn.get":
+            reason = "clientData.type"
+        elif client.get("challenge") != rec["challenge"]:
+            reason = "challenge"
+        elif rec["origin"] and client.get("origin") != rec["origin"]:
+            reason = "origin"
+        elif hashlib.sha256(rec["rpId"].encode("utf-8")).digest() != auth_data[:32]:
+            reason = "rpIdHash"
+        elif not (auth_data[32] & 0x01):
+            reason = "user-presence"
+        elif not (auth_data[32] & 0x04):
+            reason = "user-verification"
+        else:
+            spki = _cose_to_spki(_b64u_decode(cred["publicKey"]))
+            message = auth_data + hashlib.sha256(client_raw).digest()
+            ok = _verify_es256(spki, message, signature)
+            if not ok:
+                reason = "signature"
+    except Exception as e:
+        reason = f"malformed:{e}"
+
+    with AUTH_LOCK:
+        rec["ok"] = ok
+        rec["status"] = "verified" if ok else f"failed:{reason}"
+    print(f"[TailDeck] auth_verify {request_id} -> {rec['status']}", flush=True)
+    return ok, rec["status"]
+
+
+def auth_status(request_id):
+    with AUTH_LOCK:
+        rec = AUTH_PENDING.get(request_id)
+        if rec is None:
+            return None
+        if rec["status"] == "pending" and time.time() - rec["created"] > rec["ttl"]:
+            rec["status"] = "expired"
+        return dict(rec)
+
+
+# --- Version checking and self-update --------------------------------------
+#
+# The phone and the laptop both report a version; the phone compares them with
+# the published manifest and offers an update. Updating the *laptop* means
+# pulling the newest daemon script and app tarball from RELEASE_URL, checking
+# their checksums against the manifest, writing them into place and restarting
+# the user service. No root is needed: the service is a --user unit.
+
+def _http_get(url, timeout=30):
+    req = urllib.request.Request(url, headers={"User-Agent": f"TailDeck/{DAEMON_VERSION}"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def release_manifest(force=False, timeout=8):
+    """The published version.json, cached briefly so a burst of checks is cheap."""
+    now = time.time()
+    with RELEASE_LOCK:
+        fresh = RELEASE_CACHE["data"] and (now - RELEASE_CACHE["at"]) < RELEASE_CACHE_TTL
+        if fresh and not force:
+            return RELEASE_CACHE["data"]
+    try:
+        data = json.loads(_http_get(f"{RELEASE_URL}/version.json", timeout=timeout) or "{}")
+    except Exception:
+        return None
+    with RELEASE_LOCK:
+        RELEASE_CACHE.update(at=now, data=data)
+    return data
+
+
+def _in_git_worktree(path):
+    d = os.path.dirname(os.path.abspath(path))
+    while d and d != "/":
+        if os.path.isdir(os.path.join(d, ".git")):
+            return True
+        d = os.path.dirname(d)
+    return False
+
+
+def managed_daemon_path():
+    """Where a self-update should write the daemon, or None.
+
+    install.sh puts it in ~/.local/bin and points the service there. A
+    development checkout (a symlink into a git worktree) is never overwritten,
+    so a self-update only refreshes the app for those boxes."""
+    for p in (os.path.expanduser("~/.local/bin/taildeck-daemon.py"),
+              os.path.expanduser("~/taildeck-daemon.py")):
+        if not os.path.exists(p):
+            continue
+        real = os.path.realpath(p)
+        if _in_git_worktree(real):
+            return None
+        return real
+    return None
+
+
+def _safe_extract_tar(blob, dest):
+    os.makedirs(dest, exist_ok=True)
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tf:
+        for member in tf.getmembers():
+            name = member.name
+            if name.startswith("/") or ".." in name.split("/"):
+                raise ValueError(f"unsafe path in bundle: {name}")
+        tf.extractall(dest)
+
+
+def _schedule_restart():
+    """Restart the user service from outside it, so the restart survives us."""
+    script = f"sleep 1; systemctl --user restart {SERVICE_NAME}"
+    for argv in (["systemd-run", "--user", "--collect", "--unit", "taildeck-selfupdate",
+                  "/bin/sh", "-c", script],):
+        try:
+            subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return "systemd-run"
+        except FileNotFoundError:
+            continue
+    try:
+        subprocess.Popen(["/bin/sh", "-c", script], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return "detached"
+    except Exception:
+        return None
+
+
+def _atomic_write(path, blob):
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(blob)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def perform_update(dry_run=False):
+    """Pull the latest release. Returns (ok, report)."""
+    latest = release_manifest(force=True)
+    if not latest:
+        return False, {"error": f"could not reach the release channel ({RELEASE_URL})"}
+
+    target_daemon = latest.get("daemon")
+    target_app = latest.get("app")
+    files = latest.get("files") or {}
+    report = {
+        "from": DAEMON_VERSION,
+        "to": target_daemon,
+        "app": target_app,
+        "dryRun": bool(dry_run),
+        "steps": [],
+    }
+
+    try:
+        web_blob = _http_get(f"{RELEASE_URL}/taildeck-web.tar.gz", timeout=60)
+    except Exception as e:
+        return False, {"error": f"app download failed: {e}"}
+    web_sha = hashlib.sha256(web_blob).hexdigest()
+    if files.get("web") and files["web"] != web_sha:
+        return False, {"error": "app bundle checksum mismatch", "expected": files["web"], "got": web_sha}
+    report["steps"].append(f"app bundle {len(web_blob)} bytes sha256={web_sha[:12]}")
+
+    daemon_blob = None
+    daemon_path = managed_daemon_path()
+    if daemon_path:
+        try:
+            daemon_blob = _http_get(f"{RELEASE_URL}/taildeck-daemon.py", timeout=30)
+        except Exception as e:
+            return False, {"error": f"daemon download failed: {e}"}
+        daemon_sha = hashlib.sha256(daemon_blob).hexdigest()
+        if files.get("daemon") and files["daemon"] != daemon_sha:
+            return False, {"error": "daemon checksum mismatch", "expected": files["daemon"], "got": daemon_sha}
+        report["steps"].append(f"daemon -> {daemon_path} {len(daemon_blob)} bytes")
+    else:
+        report["steps"].append("daemon skipped (managed locally; app updated only)")
+
+    if dry_run:
+        report["ok"] = True
+        return True, report
+
+    try:
+        _safe_extract_tar(web_blob, WEBROOT)
+        report["steps"].append(f"app written to {WEBROOT}")
+    except Exception as e:
+        return False, {"error": f"could not write the app: {e}"}
+
+    if daemon_path and daemon_blob is not None:
+        try:
+            _atomic_write(daemon_path, daemon_blob)
+            report["steps"].append("daemon written")
+        except Exception as e:
+            return False, {"error": f"could not write the daemon: {e}"}
+        report["restart"] = _schedule_restart()
+        if not report["restart"]:
+            report["steps"].append("restart the service by hand: systemctl --user restart taildeck")
+
+    report["ok"] = True
+    print(f"[TailDeck] self-update: {report}", flush=True)
+    return True, report
+
+
+def handle_api(conn, raw, request_line):
+    """Answer /api/* and the CA download. Returns True when it handled the
+    request, so the caller does not fall through to static file serving."""
+    try:
+        parts = request_line.split()
+        method = parts[0].upper()
+        target = parts[1]
+    except Exception:
+        return False
+    path = target.split("?", 1)[0]
+
+    if path in ("/taildeck-ca.crt", "/ca.crt"):
+        if os.path.isfile(TLS_CA):
+            try:
+                with open(TLS_CA, "rb") as fh:
+                    _http(conn, "200 OK", "application/x-x509-ca-cert", fh.read())
+            except Exception:
+                _http(conn, "500 Internal Server Error", "text/plain; charset=utf-8", b"Unreadable\n")
+        else:
+            _http(conn, "404 Not Found", "text/plain; charset=utf-8",
+                  b"TailDeck: no CA here; the certificate is self-signed.\n")
+        return True
+
+    if not path.startswith("/api/"):
+        return False
+
+    if method == "OPTIONS":
+        _http(conn, "204 No Content", "text/plain; charset=utf-8", b"")
+        return True
+
+    headers = _parse_headers(raw.decode("utf-8", errors="ignore"))
+
+    if path == "/api/scripts" and method == "GET":
+        _json(conn, {"ok": True, "dir": SCRIPTS_DIR, "scripts": _list_scripts()})
+        return True
+
+    if path.startswith("/api/scripts/"):
+        name = _safe_script_name(path[len("/api/scripts/"):])
+        if name is None:
+            _json(conn, {"ok": False, "error": "bad name"}, "400 Bad Request")
+            return True
+        full = os.path.join(SCRIPTS_DIR, name)
+
+        if method == "GET":
+            try:
+                with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+            except FileNotFoundError:
+                _json(conn, {"ok": False, "error": "not found"}, "404 Not Found")
+                return True
+            except Exception:
+                _json(conn, {"ok": False, "error": "unreadable"}, "500 Internal Server Error")
+                return True
+            _json(conn, {"ok": True, "name": name, "text": text})
+            return True
+
+        if method in ("POST", "PUT"):
+            body = _read_http_body(conn, raw, headers)
+            text = body.decode("utf-8", errors="replace")
+            if len(text.encode("utf-8")) > 256 * 1024:
+                _json(conn, {"ok": False, "error": "too large"}, "413 Payload Too Large")
+                return True
+            try:
+                os.makedirs(SCRIPTS_DIR, exist_ok=True)
+                with open(full, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+            except Exception:
+                _json(conn, {"ok": False, "error": "unwritable"}, "500 Internal Server Error")
+                return True
+            print(f"[TailDeck] script saved: {name} ({len(text)} bytes)", flush=True)
+            _json(conn, {"ok": True, "name": name})
+            return True
+
+    if path == "/api/notify" and method in ("POST", "PUT"):
+        body = _read_http_body(conn, raw, headers)
+        try:
+            data = json.loads(body.decode("utf-8", errors="replace") or "{}")
+        except Exception:
+            data = {}
+        title = str(data.get("title") or "TailDeck")
+        text = str(data.get("body") or data.get("message") or "")
+        if not text:
+            _json(conn, {"ok": False, "error": "empty"}, "400 Bad Request")
+            return True
+        sent = broadcast_notify(title, text)
+        print(f"[TailDeck] notify -> {sent} phone(s): {text[:60]}", flush=True)
+        _json(conn, {"ok": True, "sent": sent})
+        return True
+
+    if path == "/api/auth/info" and method == "GET":
+        creds = _load_credentials()
+        _json(conn, {
+            "ok": True,
+            "configured": bool(auth_rpid()),
+            "rpId": auth_rpid(),
+            "origin": auth_origin(),
+            "user": _default_user(),
+            "credentials": [
+                {"id": c.get("id"), "label": c.get("label"), "created": c.get("created")}
+                for c in creds
+            ],
+        })
+        return True
+
+    if path == "/api/webauthn/register" and method in ("POST", "PUT"):
+        body = _read_http_body(conn, raw, headers)
+        try:
+            data = json.loads(body.decode("utf-8", errors="replace") or "{}")
+        except Exception:
+            data = {}
+        cred_id = str(data.get("credentialId") or "").strip()
+        cose_b64 = str(data.get("publicKey") or "").strip()
+        if not cred_id or not cose_b64:
+            _json(conn, {"ok": False, "error": "credentialId and publicKey required"}, "400 Bad Request")
+            return True
+        try:
+            _cose_to_spki(_b64u_decode(cose_b64))
+        except Exception as e:
+            _json(conn, {"ok": False, "error": f"bad public key: {e}"}, "400 Bad Request")
+            return True
+        creds = [c for c in _load_credentials() if c.get("id") != cred_id]
+        creds.append({
+            "id": cred_id,
+            "publicKey": cose_b64,
+            "label": str(data.get("label") or "phone")[:64],
+            "user": str(data.get("user") or _default_user()),
+            "rpId": str(data.get("rpId") or auth_rpid())[:128],
+            "created": int(time.time()),
+        })
+        if not _save_credentials(creds):
+            _json(conn, {"ok": False, "error": "could not store"}, "500 Internal Server Error")
+            return True
+        print(f"[TailDeck] passkey registered: {cred_id} for {creds[-1]['user']}", flush=True)
+        _json(conn, {"ok": True, "count": len(creds)})
+        return True
+
+    if path == "/api/webauthn/credentials" and method == "GET":
+        _json(conn, {"ok": True, "credentials": [
+            {"id": c.get("id"), "label": c.get("label"), "user": c.get("user"), "created": c.get("created")}
+            for c in _load_credentials()
+        ]})
+        return True
+
+    if path.startswith("/api/webauthn/credentials/") and method == "DELETE":
+        cred_id = urllib.parse.unquote(path[len("/api/webauthn/credentials/"):]).strip()
+        creds = _load_credentials()
+        remaining = [c for c in creds if c.get("id") != cred_id]
+        if len(remaining) == len(creds):
+            _json(conn, {"ok": False, "error": "not found"}, "404 Not Found")
+            return True
+        _save_credentials(remaining)
+        _json(conn, {"ok": True, "count": len(remaining)})
+        return True
+
+    if path == "/api/auth/begin" and method in ("POST", "PUT"):
+        body = _read_http_body(conn, raw, headers)
+        try:
+            data = json.loads(body.decode("utf-8", errors="replace") or "{}")
+        except Exception:
+            data = {}
+        info, err = auth_begin(data.get("user"), data.get("rpId"), data.get("origin"))
+        if err:
+            _json(conn, {"ok": False, "error": err}, "409 Conflict")
+            return True
+        _json(conn, {"ok": True, **info})
+        return True
+
+    if path == "/api/auth/response" and method in ("POST", "PUT"):
+        body = _read_http_body(conn, raw, headers)
+        try:
+            data = json.loads(body.decode("utf-8", errors="replace") or "{}")
+        except Exception:
+            data = {}
+        request_id = str(data.get("requestId") or "")
+        ok, status = auth_verify(request_id, data)
+        _json(conn, {"ok": ok, "status": status})
+        return True
+
+    if path == "/api/auth/status" and method == "GET":
+        query = urllib.parse.parse_qs(target.split("?", 1)[1]) if "?" in target else {}
+        request_id = (query.get("requestId") or [""])[0]
+        rec = auth_status(request_id)
+        if rec is None:
+            _json(conn, {"ok": False, "error": "unknown request"}, "404 Not Found")
+            return True
+        _json(conn, {"ok": rec["status"] == "verified", "status": rec["status"], "user": rec["user"]})
+        return True
+
+    if path == "/api/version" and method == "GET":
+        latest = release_manifest()
+        _json(conn, {
+            "ok": True,
+            "daemon": DAEMON_VERSION,
+            "backend": BACKEND_NAME,
+            "release": RELEASE_URL,
+            "webroot": WEBROOT,
+            "managed": managed_daemon_path() is not None,
+            "latest": (latest or {}).get("daemon"),
+            "latestApp": (latest or {}).get("app"),
+            "updateAvailable": bool(latest and latest.get("daemon") and latest["daemon"] != DAEMON_VERSION),
+        })
+        return True
+
+    if path == "/api/update" and method in ("POST", "PUT"):
+        body = _read_http_body(conn, raw, headers)
+        try:
+            data = json.loads(body.decode("utf-8", errors="replace") or "{}")
+        except Exception:
+            data = {}
+
+        # A passkey, once registered, is the gate: the update must be preceded by
+        # a verified assertion. Before any passkey exists, an explicit confirm
+        # from the app is enough so the first update is still possible.
+        creds = _load_credentials()
+        if creds:
+            request_id = str(data.get("requestId") or "")
+            rec = auth_status(request_id)
+            if rec is None or rec.get("status") != "verified":
+                _json(conn, {"ok": False, "error": "unlock with your phone to update",
+                             "status": (rec or {}).get("status", "unknown")}, "403 Forbidden")
+                return True
+            with AUTH_LOCK:
+                AUTH_PENDING.pop(request_id, None)  # single use
+        elif not data.get("confirm"):
+            _json(conn, {"ok": False, "error": "confirmation required"}, "400 Bad Request")
+            return True
+
+        ok, report = perform_update(dry_run=bool(data.get("dryRun")))
+        _json(conn, {"ok": ok, **report}, "200 OK" if ok else "502 Bad Gateway")
+        return True
+
+    _json(conn, {"ok": False, "error": "unknown endpoint"}, "404 Not Found")
+    return True
 
 
 def local_ipv4_addresses():
@@ -702,6 +1555,33 @@ def record_connection(event, peer, scheme, route, extra=""):
         notify_desktop("TailDeck", f"{peer} connected via {route}")
 
 
+# Connected phone sessions, so the laptop can push a notice to all of them at
+# once. Delivery is best-effort: the phone only sees it while its page is alive.
+WS_CLIENTS = set()
+_WS_CLIENTS_LOCK = threading.Lock()
+
+
+def broadcast_json(obj):
+    """Send one JSON message to every connected phone. Returns how many got it."""
+    payload = json.dumps(obj)
+    with _WS_CLIENTS_LOCK:
+        clients = list(WS_CLIENTS)
+    sent = 0
+    for client in clients:
+        try:
+            send_ws_frame(client, payload)
+            sent += 1
+        except Exception:
+            with _WS_CLIENTS_LOCK:
+                WS_CLIENTS.discard(client)
+    return sent
+
+
+def broadcast_notify(title, body):
+    """Send a notice to every connected phone. Returns how many got it."""
+    return broadcast_json({"type": "notify", "title": title, "body": body})
+
+
 def handle_websocket(conn):
     try:
         peer = "{}:{}".format(*conn.getpeername()[:2])
@@ -718,9 +1598,14 @@ def handle_websocket(conn):
     proxied = False
     is_ws = False
     try:
-        data = conn.recv(4096).decode('utf-8', errors='ignore')
+        raw = conn.recv(4096)
+        data = raw.decode('utf-8', errors='ignore')
         if "Upgrade: websocket" not in data:
-            serve_static(conn, data.split("\r\n", 1)[0] if data else "GET / HTTP/1.1")
+            request_line = data.split("\r\n", 1)[0] if data else "GET / HTTP/1.1"
+            if handle_api(conn, raw, request_line):
+                conn.close()
+                return
+            serve_static(conn, request_line)
             conn.close()
             return
         is_ws = True
@@ -783,6 +1668,9 @@ def handle_websocket(conn):
         }
         send_ws_frame(conn, json.dumps(welcome))
 
+        with _WS_CLIENTS_LOCK:
+            WS_CLIENTS.add(conn)
+
         # Per-connection dictation accounting, so a silent session is easy to
         # tell apart from one that never carried any audio.
         dictation_bytes = 0
@@ -812,6 +1700,10 @@ def handle_websocket(conn):
                     INPUT_HANDLER.scroll(msg.get("dx", 0), msg.get("dy", 0))
                 elif mtype == "app_switch":
                     INPUT_HANDLER.app_switch(msg.get("direction", "next"))
+                elif mtype == "media":
+                    INPUT_HANDLER.media_control(msg.get("action", ""))
+                elif mtype == "auth_response":
+                    auth_verify(msg.get("requestId", ""), msg)
                 elif mtype == "type_text":
                     INPUT_HANDLER.type_text(msg.get("text", ""))
                 elif mtype == "key_combo":
@@ -842,6 +1734,8 @@ def handle_websocket(conn):
     finally:
         if is_ws:
             DICTATION.stop(conn)
+            with _WS_CLIENTS_LOCK:
+                WS_CLIENTS.discard(conn)
         try:
             conn.close()
         except Exception:
@@ -935,7 +1829,49 @@ def build_tls_context():
     return ctx
 
 
+def _cli_notify(args):
+    """`taildeck-daemon.py notify "text"` -- push a notice to the phone by
+    talking to the already-running daemon over loopback, so it can ride the
+    live WebSocket instead of opening a new connection."""
+    text = " ".join(args).strip()
+    if not text:
+        print("usage: taildeck-daemon.py notify \"message\"", file=sys.stderr)
+        return 2
+    payload = json.dumps({"title": "TailDeck", "body": text}).encode("utf-8")
+    head = (
+        "POST /api/notify HTTP/1.1\r\n"
+        "Host: 127.0.0.1\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {len(payload)}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode("utf-8")
+    # Either listener shares the same connected-phone set, so the first one
+    # that answers is enough; trying both would double-send the notice.
+    for port, scheme in ((TLS_PORT, "https"), (PORT, "http")):
+        try:
+            raw_conn = socket.create_connection(("127.0.0.1", port), timeout=3)
+            if scheme == "https":
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                conn = ctx.wrap_socket(raw_conn, server_hostname="127.0.0.1")
+            else:
+                conn = raw_conn
+            conn.sendall(head + payload)
+            status = conn.recv(256).decode("utf-8", errors="ignore").split("\r\n", 1)[0]
+            conn.close()
+            if " 200 " in status:
+                print(f"[TailDeck] notify sent: {text}")
+                return 0
+        except Exception:
+            continue
+    print("[TailDeck] notify: no running daemon answered", file=sys.stderr)
+    return 1
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "notify":
+        sys.exit(_cli_notify(sys.argv[2:]))
     try:
         tls_context = build_tls_context()
 
@@ -946,6 +1882,15 @@ if __name__ == "__main__":
               f"(notify={'on' if NOTIFY_CONNECTIONS else 'off'})")
         print(f"[TailDeck] Web app root: {WEBROOT} "
               f"({'found' if os.path.isfile(os.path.join(WEBROOT, 'index.html')) else 'not published'})")
+        print(f"[TailDeck] Scripts folder: {SCRIPTS_DIR} "
+              f"({'found' if os.path.isdir(SCRIPTS_DIR) else 'created on first save'})")
+        print(f"[TailDeck] Notify a phone: python3 {os.path.basename(sys.argv[0])} notify \"message\"")
+        print(f"[TailDeck] Passkey unlock: "
+              f"{'rpId=' + auth_rpid() if auth_rpid() else 'no tailnet domain yet (WebAuthn needs one)'} "
+              f"({len(_load_credentials())} credential(s))")
+        if os.path.isfile(TLS_CA):
+            print(f"[TailDeck] Guest CA: https://<laptop-ip>:{TLS_PORT}/taildeck-ca.crt "
+                  f"(install once on an iPhone for the wss:// direct route)")
         for ip in local_ipv4_addresses():
             if tls_context is not None:
                 print(f"[TailDeck] Same-hotspot URL: https://{ip}:{TLS_PORT}/   (recommended - allows dictation)")

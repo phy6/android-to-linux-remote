@@ -1,6 +1,7 @@
 node_modules/
 build/
 dist/
+dist-webroot/
 coverage/
 .DS_Store
 *.log

@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { ConnectionStatus, RemoteSettings, SessionType } from '../types';
+import { ConnectionStatus, RemoteSettings, SessionType, MediaAction } from '../types';
 import { linuxClient } from '../services/linuxClient';
 import { LOCAL_HOST, IS_LOCAL_MODE, describeRoute } from '../services/localMode';
 import { useSavedLaptops } from '../services/savedLaptops';
@@ -8,6 +8,7 @@ import { useHaptics } from '../hooks/useHaptics';
 import { PWAInstallButton } from './PWAInstallButton';
 import { PairingCodeModal } from './PairingCodeModal';
 import { ScanPairingModal } from './ScanPairingModal';
+import { UpdatesPanel } from './UpdatesPanel';
 import {
   notificationSupport,
   requestNotificationPermission,
@@ -46,6 +47,11 @@ import {
   Volume1,
   VolumeX,
   Play,
+  Pause,
+  SkipBack,
+  SkipForward,
+  Square,
+  Music,
   ArrowUp,
   ArrowDown,
   ArrowLeft,
@@ -109,6 +115,8 @@ interface SideMenuDrawerProps {
   onOpenDiagnostics: () => void;
   isSimulatorActive: boolean;
   onEnterDarkOut: () => void;
+  appUpdateReady: boolean;
+  onApplyAppUpdate: () => void;
 }
 
 export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
@@ -123,8 +131,14 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
   onOpenDiagnostics,
   isSimulatorActive,
   onEnterDarkOut,
+  appUpdateReady,
+  onApplyAppUpdate,
 }) => {
   const { triggerClick } = useHaptics(settings.hapticFeedback, settings.soundFeedback);
+  const pressMedia = (action: MediaAction) => {
+    triggerClick();
+    linuxClient.sendMedia(action);
+  };
   const {
     laptops: savedLaptops,
     refresh: refreshSavedLaptops,
@@ -133,7 +147,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
   const [tailscaleIp, setTailscaleIp] = useState(connectionStatus.hostAddress || '');
   const [alertPermission, setAlertPermission] = useState<AlertPermission>(notificationSupport());
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<'tailscale' | 'keys' | 'settings' | 'help'>('keys');
+  const [activeTab, setActiveTab] = useState<'tailscale' | 'keys' | 'media' | 'settings' | 'help'>('keys');
   const [pairMode, setPairMode] = useState<'show' | 'scan' | null>(null);
   const [quickInput, setQuickInput] = useState('');
   const quickInputRef = useRef<HTMLInputElement>(null);
@@ -362,6 +376,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
           {(
             [
               { id: 'keys', label: 'Keyboard', Icon: Keyboard },
+              { id: 'media', label: 'Media', Icon: Music },
               { id: 'tailscale', label: 'Connection', Icon: Wifi },
               { id: 'settings', label: 'Settings', Icon: Sliders },
               { id: 'help', label: 'Help', Icon: HelpCircle },
@@ -929,6 +944,72 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
             </div>
           )}
 
+          {/* TAB: MEDIA — transport and volume for whatever player the laptop
+              has focused. Keys ride the same channel as the keyboard. */}
+          {activeTab === 'media' && (
+            <div className="space-y-4">
+              <SectionTitle>Media controls</SectionTitle>
+              <p className="text-xs text-slate-400">
+                Drives whichever player is focused on the laptop — music, video,
+                or a browser tab.
+              </p>
+
+              <div className="grid grid-cols-3 gap-3">
+                {(
+                  [
+                    { action: 'prev', label: 'Previous', Icon: SkipBack },
+                    { action: 'playpause', label: 'Play / Pause', Icon: Play },
+                    { action: 'next', label: 'Next', Icon: SkipForward },
+                  ] as const
+                ).map(({ action, label, Icon }) => (
+                  <button
+                    key={action}
+                    type="button"
+                    onClick={() => pressMedia(action)}
+                    className={`flex flex-col items-center justify-center gap-2 py-5 rounded-2xl font-medium text-xs border transition active:scale-95 ${
+                      action === 'playpause'
+                        ? 'bg-sky-600/90 border-sky-500 text-white hover:bg-sky-500'
+                        : 'bg-slate-900 border-slate-800 text-slate-200 hover:bg-slate-800'
+                    }`}
+                  >
+                    <Icon className="w-6 h-6" />
+                    <span>{label}</span>
+                  </button>
+                ))}
+              </div>
+
+              <button
+                type="button"
+                onClick={() => pressMedia('stop')}
+                className="w-full flex items-center justify-center gap-2 py-3.5 rounded-xl font-medium text-xs bg-slate-900 border border-slate-800 text-slate-300 hover:bg-slate-800 active:scale-95 transition"
+              >
+                <Square className="w-4 h-4" />
+                <span>Stop</span>
+              </button>
+
+              <SectionTitle>Volume</SectionTitle>
+              <div className="grid grid-cols-3 gap-3">
+                {(
+                  [
+                    { action: 'voldown', label: 'Quieter', Icon: Volume1 },
+                    { action: 'mute', label: 'Mute', Icon: VolumeX },
+                    { action: 'volup', label: 'Louder', Icon: Volume2 },
+                  ] as const
+                ).map(({ action, label, Icon }) => (
+                  <button
+                    key={action}
+                    type="button"
+                    onClick={() => pressMedia(action)}
+                    className="flex flex-col items-center justify-center gap-2 py-5 rounded-2xl font-medium text-xs bg-slate-900 border border-slate-800 text-slate-200 hover:bg-slate-800 active:scale-95 transition"
+                  >
+                    <Icon className="w-6 h-6" />
+                    <span>{label}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* TAB 3: SETTINGS */}
           {activeTab === 'settings' && (
             <div className="space-y-5 text-xs">
@@ -1059,11 +1140,14 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                   checked={isFullscreen}
                   onChange={() => void toggleFullscreen()}
                 />
-
-                <p className="text-[10px] text-slate-500 px-1">
-                  TailDeck {__BUILD_SHA__}
-                </p>
               </section>
+
+              <UpdatesPanel
+                host={connectionStatus.hostAddress || tailscaleIp}
+                connected={connectionStatus.connected}
+                appUpdateReady={appUpdateReady}
+                onApplyAppUpdate={onApplyAppUpdate}
+              />
 
               <section className="space-y-3 pt-4 border-t border-slate-800">
                 <SectionTitle>Developer</SectionTitle>
@@ -1190,6 +1274,9 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                     ['Top bar', 'Swipe left / right to switch apps (Shift+Tab / Tab).'],
                     ['Bottom buttons', 'Left and right click. Hold the left button to start dictation.'],
                     ['Mic button', 'Hold to talk, release to type it. Drag the mic to move it.'],
+                    ['Scripts & teleprompter', 'In dictation, pick a script from the laptop and press Scroll to read it as it glides; what is heard is shown below to check.'],
+                    ['Media', 'The Media tab sends play / pause, track skip, and volume to whatever player the laptop has focused.'],
+                    ['Notices from the laptop', 'On the laptop run: python3 taildeck-daemon.py notify "message" — it pops up on the phone while this app is open.'],
                     ['Resize', 'Long-press the right button, then drag up / down to size the big buttons.'],
                   ].map(([label, text]) => (
                     <div key={label} className="p-3 rounded-xl bg-slate-900 border border-slate-800">
@@ -1208,6 +1295,28 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                     ['Same hotspot', "Open the laptop's own https://<laptop>:8443/ once in the phone browser and accept the certificate warning, then connect here."],
                     ['Tailscale', 'Works with real certificates, so there is no warning to clear. Best when both are on your tailnet.'],
                     ['Control-only (http)', 'Keys and clicks work over http with no certificate. The screen stream needs https.'],
+                  ].map(([label, text]) => (
+                    <div key={label} className="p-3 rounded-xl bg-slate-900 border border-slate-800">
+                      <div className="font-medium text-slate-200">{label}</div>
+                      <div className="text-[11px] text-slate-400 leading-snug mt-0.5">{text}</div>
+                    </div>
+                  ))}
+                </div>
+              </section>
+
+              {/* Sharing with a guest */}
+              <section className="space-y-2 pt-4 border-t border-slate-800">
+                <SectionTitle>Let a guest drive</SectionTitle>
+                <p className="text-[11px] text-slate-400 leading-snug">
+                  The app is just a web page, so a friend can borrow it without installing anything.
+                  They get the normal camera / microphone prompt once, and nothing is kept after
+                  they close the tab.
+                </p>
+                <div className="space-y-1.5">
+                  {[
+                    ['Android guest', 'Open the laptop\'s https URL on the hotspot and accept the warning once. Works straight away.'],
+                    ['iPhone guest — CA', 'iOS Safari refuses a self-signed socket. Install the laptop\'s CA once, then it works: open https://<laptop-ip>:8443/taildeck-ca.crt, Settings > Profile Downloaded > Install, then Settings > General > About > Certificate Trust Settings > enable full trust.'],
+                    ['iPhone guest — Tailscale', 'No certificate work: the guest installs Tailscale, you share the machine (Admin console > Machines > Share) and send the invite link. Real certificates, so Safari is happy.'],
                   ].map(([label, text]) => (
                     <div key={label} className="p-3 rounded-xl bg-slate-900 border border-slate-800">
                       <div className="font-medium text-slate-200">{label}</div>

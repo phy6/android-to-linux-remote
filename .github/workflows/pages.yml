@@ -47,6 +47,25 @@ jobs:
           bun run build -- --outDir dist-webroot --emptyOutDir
           tar czf dist/taildeck-web.tar.gz -C dist-webroot .
 
+      - name: Stamp the release manifest with the bundle checksum
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          WEB_SHA=$(sha256sum dist/taildeck-web.tar.gz | cut -d' ' -f1)
+          python3 - "$WEB_SHA" "${{ github.sha }}" <<'PY'
+          import json, sys
+          sha = sys.argv[1]
+          gitsha = sys.argv[2][:7]
+          p = 'dist/version.json'
+          d = json.load(open(p))
+          d['appSha'] = gitsha
+          d.setdefault('files', {})['web'] = sha
+          with open(p, 'w') as fh:
+              json.dump(d, fh, indent=2)
+              fh.write('\n')
+          print(open(p).read())
+          PY
+
       - uses: actions/configure-pages@v5
 
       - uses: actions/upload-pages-artifact@v3

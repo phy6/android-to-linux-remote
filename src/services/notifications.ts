@@ -20,6 +20,8 @@ export async function requestNotificationPermission(): Promise<AlertPermission> 
 interface ConnectionNotice {
   connected: boolean;
   host: string;
+  /** Plain-English route, e.g. "Local network — direct". No ISP or carrier wording. */
+  route?: string;
 }
 
 /**
@@ -27,13 +29,14 @@ interface ConnectionNotice {
  * false when notifications are unavailable so the caller can fall back to an
  * in-app banner.
  */
-export async function showConnectionNotice({ connected, host }: ConnectionNotice): Promise<boolean> {
+export async function showConnectionNotice({ connected, host, route }: ConnectionNotice): Promise<boolean> {
   if (typeof window === 'undefined' || !('Notification' in window)) return false;
   if (Notification.permission !== 'granted') return false;
 
   const title = connected ? 'TailDeck connected' : 'TailDeck disconnected';
+  const where = route ? `${host} · ${route}` : host;
   const options: NotificationOptions & { renotify?: boolean } = {
-    body: connected ? `Linked to ${host}` : `Lost the link to ${host}`,
+    body: connected ? `Linked to ${where}` : `Lost the link to ${where}`,
     icon: iconPath(),
     badge: iconPath(),
     tag: 'taildeck-connection',
@@ -61,9 +64,48 @@ export async function showConnectionNotice({ connected, host }: ConnectionNotice
   }
 }
 
+interface MessageNotice {
+  title?: string;
+  body: string;
+}
+
+/**
+ * Posts a laptop-initiated notice (e.g. `taildeck-daemon.py notify "..."`) as a
+ * real system notification. Best-effort: it only lands while this page is alive.
+ */
+export async function showMessageNotice({ title = 'TailDeck', body }: MessageNotice): Promise<boolean> {
+  if (typeof window === 'undefined' || !('Notification' in window)) return false;
+  if (Notification.permission !== 'granted') return false;
+
+  const options: NotificationOptions & { renotify?: boolean } = {
+    body,
+    icon: iconPath(),
+    badge: iconPath(),
+    tag: 'taildeck-message',
+    renotify: true,
+    data: { url: window.location.href },
+  };
+
+  try {
+    const registration = await navigator.serviceWorker?.ready;
+    if (registration?.showNotification) {
+      await registration.showNotification(title, options);
+      return true;
+    }
+  } catch {
+    // Fall through to the constructor below.
+  }
+
+  try {
+    new Notification(title, options);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Tapping the notification should bring the deck back to the front. */
-export function focusOnNotificationClick(): void {
-  if (typeof navigator === 'undefined') return;
+export function focusOnNotificationClick(): void {  if (typeof navigator === 'undefined') return;
   navigator.serviceWorker?.addEventListener('message', (event) => {
     if ((event.data as { type?: string })?.type !== 'taildeck-focus') return;
     window.focus();

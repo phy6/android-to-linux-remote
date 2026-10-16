@@ -115,11 +115,11 @@ else
   warn "Web app bundle unavailable; the phone can still load the app from GitHub Pages."
 fi
 
-# --- 5. Self-signed certificate for the hotspot https route -----------------
+# --- 5. Local CA + server certificate for the hotspot https route -----------
 mkdir -p "$TLS_DIR"
-if [ ! -f "$TLS_DIR/taildeck.crt" ]; then
+if [ ! -f "$TLS_DIR/taildeck.crt" ] || [ ! -f "$TLS_DIR/ca.crt" ]; then
   if have openssl; then
-    log "Generating a self-signed certificate..."
+    log "Generating a local CA and server certificate..."
     SAN="DNS:localhost,IP:127.0.0.1,DNS:$(hostname)"
     if have tailscale; then
       TN="$(tailscale status --json 2>/dev/null \
@@ -132,9 +132,22 @@ if [ ! -f "$TLS_DIR/taildeck.crt" ]; then
         *:*)     SAN="${SAN},IP:${ip}" ;;
       esac
     done
-    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-      -keyout "$TLS_DIR/taildeck.key" -out "$TLS_DIR/taildeck.crt" \
-      -subj "/CN=taildeck" -addext "subjectAltName=${SAN}" >/dev/null 2>&1 \
+    {
+      if [ ! -f "$TLS_DIR/ca.key" ]; then
+        openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes \
+          -keyout "$TLS_DIR/ca.key" -out "$TLS_DIR/ca.crt" \
+          -subj "/CN=TailDeck Local CA" \
+          -addext "basicConstraints=critical,CA:TRUE" \
+          -addext "keyUsage=critical,keyCertSign,cRLSign"
+      fi
+      openssl genrsa -out "$TLS_DIR/taildeck.key" 2048
+      openssl req -new -key "$TLS_DIR/taildeck.key" -out "$TLS_DIR/taildeck.csr" -subj "/CN=TailDeck"
+      printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=%s\n' "$SAN" > "$TLS_DIR/san.ext"
+      openssl x509 -req -in "$TLS_DIR/taildeck.csr" \
+        -CA "$TLS_DIR/ca.crt" -CAkey "$TLS_DIR/ca.key" -CAcreateserial \
+        -out "$TLS_DIR/taildeck.crt" -days 825 -sha256 -extfile "$TLS_DIR/san.ext"
+      rm -f "$TLS_DIR/taildeck.csr" "$TLS_DIR/san.ext"
+    } >/dev/null 2>&1 \
       && log "Certificate written to ${TLS_DIR}" \
       || warn "Could not create a certificate; https stays off, http still works."
   else

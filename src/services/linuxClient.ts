@@ -1,4 +1,7 @@
-import { ConnectionStatus, InputEventPayload, SessionType } from '../types';
+import { ConnectionStatus, InputEventPayload, MediaAction, SessionType } from '../types';
+import type { AuthAssertion, AuthChallenge } from './authClient';
+
+export type { MediaAction };
 
 // WebSocket.OPEN is not reliably present on the constructor in every runtime
 // (shims and wrapped builds can omit the statics), so compare against the
@@ -8,12 +11,16 @@ const WS_OPEN = 1;
 type EventCallback = (event: InputEventPayload) => void;
 type StatusCallback = (status: ConnectionStatus) => void;
 type DictationTextCallback = (text: string) => void;
+type NotifyCallback = (notice: { title: string; body: string }) => void;
+type AuthChallengeCallback = (challenge: AuthChallenge) => void;
 
 class LinuxClientService {
   private socket: WebSocket | null = null;
   private listeners: Set<EventCallback> = new Set();
   private statusListeners: Set<StatusCallback> = new Set();
   private dictationTextListeners: Set<DictationTextCallback> = new Set();
+  private notifyListeners: Set<NotifyCallback> = new Set();
+  private authChallengeListeners: Set<AuthChallengeCallback> = new Set();
   private pendingDx = 0;
   private dictationReady = false;
   private dictationWaiter: ((ok: boolean) => void) | null = null;
@@ -41,6 +48,22 @@ class LinuxClientService {
     this.dictationTextListeners.add(callback);
     return () => {
       this.dictationTextListeners.delete(callback);
+    };
+  }
+
+  /** Laptop-initiated notices (e.g. `taildeck-daemon.py notify "..."`). */
+  public onNotify(callback: NotifyCallback): () => void {
+    this.notifyListeners.add(callback);
+    return () => {
+      this.notifyListeners.delete(callback);
+    };
+  }
+
+  /** The laptop asking this phone to sign a WebAuthn challenge (unlock). */
+  public onAuthChallenge(callback: AuthChallengeCallback): () => void {
+    this.authChallengeListeners.add(callback);
+    return () => {
+      this.authChallengeListeners.delete(callback);
     };
   }
 
@@ -133,8 +156,37 @@ class LinuxClientService {
                 }
               });
             }
-          } else if (data.type === 'host_info') {
-            this.status = {
+          } else if (data.type === 'notify') {
+            const notice = {
+              title: String(data.title ?? 'TailDeck'),
+              body: String(data.body ?? ''),
+            };
+            this.notifyListeners.forEach((cb) => {
+              try {
+                cb(notice);
+              } catch {
+                // A listener throwing must not break the socket handler.
+              }
+            });
+          } else if (data.type === 'auth_challenge') {
+            const challenge: AuthChallenge = {
+              requestId: String(data.requestId ?? ''),
+              challenge: String(data.challenge ?? ''),
+              rpId: String(data.rpId ?? ''),
+              origin: String(data.origin ?? ''),
+              allowCredentials: Array.isArray(data.allowCredentials)
+                ? data.allowCredentials.map((c: unknown) => String(c))
+                : [],
+              timeoutMs: Number(data.timeout) || 60000,
+            };
+            this.authChallengeListeners.forEach((cb) => {
+              try {
+                cb(challenge);
+              } catch {
+                // A listener throwing must not break the socket handler.
+              }
+            });
+          } else if (data.type === 'host_info') {            this.status = {
               ...this.status,
               hostOsInfo: {
                 hostname: data.hostname || 'linux-laptop',
@@ -335,6 +387,18 @@ class LinuxClientService {
     const payload: InputEventPayload = { type: 'key_combo', keys };
     this.sendRaw(payload);
     this.notifyLocalEvent(payload);
+  }
+
+  /** Transport/volume keys for whatever player the laptop has focused. */
+  public sendMedia(action: MediaAction) {
+    const payload: InputEventPayload = { type: 'media', action };
+    this.sendRaw(payload);
+    this.notifyLocalEvent(payload);
+  }
+
+  /** The signed WebAuthn assertion that answers an auth_challenge. */
+  public sendAuthResponse(assertion: AuthAssertion) {
+    this.sendRaw({ type: 'auth_response', ...assertion });
   }
 }
 
