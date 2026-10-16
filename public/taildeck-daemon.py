@@ -334,6 +334,34 @@ class LinuxInputBackend:
             import pyautogui
             pyautogui.scroll(int(dy * 10))
 
+    def release_all(self):
+        """Drop every button and modifier this virtual device may still hold.
+        A client that vanishes between a `down` and its `up` (a drag, or a
+        middle-button hold) would otherwise leave the desktop stuck pressed —
+        Chrome autoscroll and runaway selection both start that way."""
+        try:
+            if self.backend == "evdev_uinput":
+                from evdev import ecodes as e
+                held = (
+                    e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE,
+                    e.KEY_LEFTCTRL, e.KEY_RIGHTCTRL,
+                    e.KEY_LEFTALT, e.KEY_RIGHTALT,
+                    e.KEY_LEFTSHIFT, e.KEY_RIGHTSHIFT,
+                    e.KEY_LEFTMETA, e.KEY_RIGHTMETA,
+                )
+                for code in held:
+                    self.ui.write(e.EV_KEY, code, 0)
+                self.ui.syn()
+            elif self.backend == "xdotool":
+                for btn in ("1", "2", "3"):
+                    subprocess.run(["xdotool", "mouseup", btn],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                for mod in ("ctrl", "alt", "shift", "super"):
+                    subprocess.run(["xdotool", "keyup", mod],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
     def app_switch(self, direction: str):
         """
         Rotates between applications:
@@ -1817,6 +1845,8 @@ def handle_websocket(conn):
     finally:
         if is_ws:
             DICTATION.stop(conn)
+            # Never let a half-finished drag or held key outlive its client.
+            INPUT_HANDLER.release_all()
             with _WS_CLIENTS_LOCK:
                 WS_CLIENTS.discard(conn)
         try:
