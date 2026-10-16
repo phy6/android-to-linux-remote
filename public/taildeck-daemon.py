@@ -23,6 +23,16 @@ PORT = int(os.environ.get("TAILDECK_PORT", 8080))
 DICTATE_HOST = os.environ.get("TAILDECK_DICTATE_HOST", "127.0.0.1")
 DICTATE_PORT = int(os.environ.get("TAILDECK_DICTATE_PORT", 8090))
 
+# Every client that reaches the daemon gets a durable line here plus a desktop
+# notification on the laptop, whether it arrived on the hotspot or over
+# Tailscale. The phone already notifies itself on connect; this is the laptop's
+# own record of who reached it and by which route.
+CONNECTION_LOG = os.environ.get(
+    "TAILDECK_CONN_LOG",
+    os.path.join(os.path.expanduser("~"), ".local", "state", "taildeck", "connections.log"),
+)
+NOTIFY_CONNECTIONS = os.environ.get("TAILDECK_NOTIFY", "1").lower() not in ("0", "false", "no")
+
 OP_START, OP_STOP, OP_PCM, OP_TEXT, OP_OK = 0x01, 0x02, 0x03, 0x04, 0x01
 
 
@@ -609,11 +619,65 @@ def tailnet_dns_name():
     return None
 
 
+def _classify_route(host):
+    """Tailscale hands out CGNAT addresses (100.64.0.0/10); the hotspot is the
+    ordinary private ranges. Naming the route is the point of the record."""
+    try:
+        first, second = (int(part) for part in host.split(".")[:2])
+    except Exception:
+        return "unknown"
+    if first == 100 and 64 <= second <= 127:
+        return "Tailscale"
+    if first == 127:
+        return "local"
+    if first == 10 or (first == 192 and second == 168) or (first == 172 and 16 <= second <= 31):
+        return "hotspot"
+    return "network"
+
+
+def notify_desktop(summary, body):
+    """Best-effort laptop notification; a headless or DBus-less run just skips."""
+    try:
+        subprocess.Popen(
+            ["notify-send", "-a", "TailDeck", summary, body],
+            env=os.environ.copy(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+def record_connection(event, peer, scheme, route, extra=""):
+    """Append one line to the connection log and, on arrival, notify the laptop.
+    Logging and notify-send must never be able to break a session."""
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"{stamp} {event:<9} {peer} {route} {scheme}"
+    if extra:
+        line += f" {extra}"
+    try:
+        os.makedirs(os.path.dirname(CONNECTION_LOG), exist_ok=True)
+        with open(CONNECTION_LOG, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        pass
+    print(f"[TailDeck] {line}", flush=True)
+    if event == "connected" and NOTIFY_CONNECTIONS:
+        notify_desktop("TailDeck", f"{peer} connected via {route}")
+
+
 def handle_websocket(conn):
     try:
         peer = "{}:{}".format(*conn.getpeername()[:2])
     except Exception:
         peer = "?"
+    try:
+        local_port = conn.getsockname()[1]
+    except Exception:
+        local_port = PORT
+    scheme = "https" if local_port == TLS_PORT else "http"
+    route = _classify_route(peer.split(":")[0])
+    started = time.time()
     is_ws = False
     try:
         data = conn.recv(4096).decode('utf-8', errors='ignore')
@@ -623,6 +687,7 @@ def handle_websocket(conn):
             return
         is_ws = True
         print(f"[TailDeck] ws open {peer}", flush=True)
+        record_connection("connected", peer, scheme, route)
 
         key = None
         for line in data.split("\r\n"):
@@ -670,6 +735,13 @@ def handle_websocket(conn):
             payload = read_ws_frame(conn)
             if payload is None:
                 print(f"[TailDeck] ws closed {peer} bytes={dictation_bytes}", flush=True)
+                record_connection(
+                    "closed",
+                    peer,
+                    scheme,
+                    route,
+                    f"dur={int(time.time() - started)}s bytes={dictation_bytes}",
+                )
                 break
             try:
                 msg = json.loads(payload)
@@ -812,6 +884,8 @@ if __name__ == "__main__":
         print(f"[TailDeck] Daemon listening on 0.0.0.0:{PORT} (Tailscale IP compatible)")
         print(f"[TailDeck] Session: {SESSION_TYPE.upper()} | Backend: {BACKEND_NAME}")
         print("[TailDeck] Ready for Android remote trackpad connection!")
+        print(f"[TailDeck] Connection log: {CONNECTION_LOG} "
+              f"(notify={'on' if NOTIFY_CONNECTIONS else 'off'})")
         print(f"[TailDeck] Web app root: {WEBROOT} "
               f"({'found' if os.path.isfile(os.path.join(WEBROOT, 'index.html')) else 'not published'})")
         for ip in local_ipv4_addresses():
