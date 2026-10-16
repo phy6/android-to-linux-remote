@@ -289,7 +289,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
             </div>
             <div>
               <h3 className="font-semibold text-white text-sm leading-tight">TailDeck Menu</h3>
-              <p className="text-[11px] text-slate-400">Tailscale & Linux Host Remote</p>
+              <p className="text-[11px] text-slate-400">Laptop remote control</p>
             </div>
           </div>
 
