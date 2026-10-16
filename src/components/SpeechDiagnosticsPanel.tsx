@@ -1,11 +1,22 @@
 import React from 'react';
 import { SpeechDiagnostics } from '../hooks/useSpeechRecognition';
 
+export interface RouteInfo {
+  origin: string;
+  servedBy: string;
+  route: string;
+  host: string;
+  transport: string;
+  latencyMs: number | null;
+  localMode: boolean;
+}
+
 interface SpeechDiagnosticsPanelProps {
   buildSha: string;
   diagnostics: SpeechDiagnostics;
   error: string | null;
   permission: string;
+  route: RouteInfo;
   onClose: () => void;
 }
 
@@ -26,6 +37,7 @@ export const SpeechDiagnosticsPanel: React.FC<SpeechDiagnosticsPanelProps> = ({
   diagnostics,
   error,
   permission,
+  route,
   onClose,
 }) => (
   <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
@@ -61,6 +73,29 @@ export const SpeechDiagnosticsPanel: React.FC<SpeechDiagnosticsPanelProps> = ({
           <dt className="text-slate-400">Reported permission</dt>
           <dd className="text-slate-200 text-right">{permission}</dd>
         </div>
+      </dl>
+
+      <h4 className="mt-4 mb-1 text-[11px] font-semibold text-slate-300">Route</h4>
+      <dl className="text-[11px] font-mono">
+        {[
+          ['Page origin', route.origin || 'unknown'],
+          ['Served by', route.servedBy],
+          ['Route in use', route.route],
+          ['Transport', route.transport],
+          ['Connected host', route.host],
+          ['Latency', route.latencyMs === null ? '—' : `${route.latencyMs} ms`],
+        ].map(([k, v]) => (
+          <div key={k} className="flex justify-between gap-3 py-1 border-b border-slate-800/70 last:border-0">
+            <dt className="text-slate-400">{k}</dt>
+            <dd
+              className={`text-right break-all ${
+                k === 'Route in use' && route.localMode ? 'text-emerald-300' : 'text-slate-200'
+              }`}
+            >
+              {v}
+            </dd>
+          </div>
+        ))}
       </dl>
 
       <p className="mt-3 text-[10px] text-slate-500 leading-relaxed">

@@ -10,8 +10,6 @@ interface FloatingDictationButtonProps {
   soundEnabled: boolean;
   isListening?: boolean;
   isPushToTalkActive?: boolean;
-  /** Kept for compatibility; push-to-talk now always starts on touch-down. */
-  holdToTalk?: boolean;
   onPushToTalkStart: () => void;
   onPushToTalkEnd: () => void;
   onPushToTalkCancel?: () => void;
@@ -23,7 +21,6 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
   soundEnabled,
   isListening = false,
   isPushToTalkActive = false,
-  holdToTalk = true,
   onPushToTalkStart,
   onPushToTalkEnd,
   onPushToTalkCancel,

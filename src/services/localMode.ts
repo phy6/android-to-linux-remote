@@ -21,3 +21,21 @@ export const LOCAL_HOST: string = localHost();
 
 /** True when the app itself was loaded from the laptop daemon. */
 export const IS_LOCAL_MODE: boolean = LOCAL_HOST !== '';
+
+/** Human-readable description of how the phone is currently reaching the laptop. */
+export function describeRoute(host: string, localMode: boolean, connected: boolean): string {
+  if (!host) return 'no address set';
+  if (!connected) return 'not connected';
+  if (localMode) return 'Same hotspot — never leaves the phone';
+  if (/(^|\.)ts\.net(:|$)/i.test(host)) return 'Tailscale — via the carrier/internet';
+  if (/^\d+\.\d+\.\d+\.\d+(:|$)/.test(host)) return 'LAN address — direct';
+  return 'custom host';
+}
+
+/** Where this copy of the app was loaded from. */
+export function servedByLabel(): string {
+  if (typeof location === 'undefined') return 'unknown';
+  if (IS_LOCAL_MODE) return 'the laptop itself (local)';
+  if (LOOPBACK.test(location.hostname)) return 'a local dev server';
+  return 'GitHub Pages';
+}

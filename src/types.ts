@@ -42,9 +42,6 @@ export interface RemoteSettings {
   tapToClick: boolean;
   wheelSensitivity: number; // pixels of travel per app switch
   tailscaleIp: string;
-  tailscalePort: number;
-  useSimulator: boolean;
   autoConnect: boolean; // reconnect to the saved host when the app opens
-  holdToTalk: boolean; // mic button: long press to talk (true) or tap to talk (false)
   connectionAlerts: boolean; // post a system notification when the link comes up or drops
 }

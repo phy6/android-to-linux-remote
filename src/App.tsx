@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { AlertCircle, Check, Stethoscope, Wifi, WifiOff } from 'lucide-react';
 import { linuxClient } from './services/linuxClient';
-import { LOCAL_HOST, IS_LOCAL_MODE } from './services/localMode';
+import { LOCAL_HOST, IS_LOCAL_MODE, describeRoute, servedByLabel } from './services/localMode';
 import { ConnectionStatus, RemoteSettings } from './types';
 import {
   HorizontalScrollWheel,
@@ -34,10 +34,7 @@ const DEFAULT_SETTINGS: RemoteSettings = {
   tapToClick: true,
   wheelSensitivity: DEFAULT_WHEEL_SPACING,
   tailscaleIp: '',
-  tailscalePort: 8080,
-  useSimulator: true,
   autoConnect: true,
-  holdToTalk: true,
   connectionAlerts: true,
 };
 
@@ -325,7 +322,16 @@ export default function App() {
 
   useEffect(() => {
     if (!IS_LOCAL_MODE) return;
-    showToast('Local mode: connected straight over the hotspot', 'ok');
+    // A browser only exposes the microphone in a secure context, and a plain
+    // http LAN address is not one. Trackpad and keys work; talking cannot.
+    // Say so here rather than let the mic button fail without explanation.
+    const secure = typeof window !== 'undefined' && window.isSecureContext;
+    showToast(
+      secure
+        ? 'Local mode: connected straight over the hotspot'
+        : 'Same hotspot: trackpad and keys work, but talking needs the secure Tailscale link',
+      secure ? 'ok' : 'warn',
+    );
   }, [showToast]);
 
   // Announce link state with a real system notification, falling back to an
@@ -499,17 +505,30 @@ export default function App() {
           buildSha={__BUILD_SHA__}
           error={speech.error}
           permission={speech.permission}
+          route={{
+            origin: typeof location !== 'undefined' ? location.origin : '',
+            servedBy: servedByLabel(),
+            route: describeRoute(
+              connectionStatus.hostAddress,
+              IS_LOCAL_MODE,
+              connectionStatus.connected,
+            ),
+            host: connectionStatus.hostAddress || '—',
+            transport:
+              typeof location !== 'undefined' && location.protocol === 'https:' ? 'wss' : 'ws',
+            latencyMs: connectionStatus.latencyMs,
+            localMode: IS_LOCAL_MODE,
+          }}
           onClose={() => setShowDiagnostics(false)}
         />
       )}
 
-      {/* Floating Mic: hold to talk (push-to-talk), tap for the dictation sheet, drag to move */}
+      {/* Floating Mic: push-to-talk on touch-down, release to send, drag to move */}
       <FloatingDictationButton
         onTriggerDictation={() => setIsDictationOpen(true)}
         hapticsEnabled={settings.hapticFeedback}
         soundEnabled={settings.soundFeedback}
         isPushToTalkActive={isPttActive}
-        holdToTalk={settings.holdToTalk}
         onPushToTalkStart={handlePttStart}
         onPushToTalkEnd={handlePttEnd}
         onPushToTalkCancel={handlePttCancel}
