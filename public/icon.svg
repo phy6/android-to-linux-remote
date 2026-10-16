@@ -1,24 +1,29 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
-  <rect width="512" height="512" rx="128" fill="#0f172a"/>
-  <!-- Trackpad area glow -->
-  <rect x="56" y="96" width="400" height="240" rx="28" fill="#1e293b" stroke="#3b82f6" stroke-width="6"/>
-  <line x1="256" y1="96" x2="256" y2="336" stroke="#334155" stroke-dasharray="8 8" stroke-width="2"/>
-  <circle cx="256" cy="216" r="36" fill="#3b82f6" fill-opacity="0.25"/>
-  <circle cx="256" cy="216" r="16" fill="#60a5fa"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0e1729"/>
+      <stop offset="1" stop-color="#1d2b47"/>
+    </linearGradient>
+    <radialGradient id="sheen" cx="0.28" cy="0.12" r="0.62">
+      <stop offset="0" stop-color="#3b82f6" stop-opacity="0.30"/>
+      <stop offset="1" stop-color="#3b82f6" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="cursor" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#60a5fa" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#60a5fa" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
 
-  <!-- Left Click Button -->
-  <rect x="56" y="360" width="190" height="96" rx="20" fill="#2563eb" stroke="#60a5fa" stroke-width="4"/>
-  <path d="M125 408h52M151 382v52" stroke="#ffffff" stroke-width="5" stroke-linecap="round"/>
+  <rect width="512" height="512" rx="116" fill="url(#bg)"/>
+  <rect width="512" height="512" rx="116" fill="url(#sheen)"/>
 
-  <!-- Right Click Button -->
-  <rect x="266" y="360" width="190" height="96" rx="20" fill="#1e293b" stroke="#475569" stroke-width="4"/>
-  <circle cx="361" cy="408" r="12" fill="#94a3b8"/>
+  <rect x="100" y="118" width="312" height="218" rx="44"
+        fill="#17233b" stroke="#3f7fe8" stroke-width="9"/>
+  <circle cx="256" cy="206" r="52" fill="url(#cursor)"/>
+  <circle cx="256" cy="206" r="27" fill="#60a5fa"/>
 
-  <!-- Top dial indicator (Horizontal scroll wheel) -->
-  <rect x="146" y="32" width="220" height="44" rx="12" fill="#1e293b" stroke="#0284c7" stroke-width="4"/>
-  <line x1="186" y1="38" x2="186" y2="70" stroke="#38bdf8" stroke-width="4" stroke-linecap="round"/>
-  <line x1="221" y1="38" x2="221" y2="70" stroke="#38bdf8" stroke-width="4" stroke-linecap="round"/>
-  <line x1="256" y1="36" x2="256" y2="72" stroke="#ffffff" stroke-width="6" stroke-linecap="round"/>
-  <line x1="291" y1="38" x2="291" y2="70" stroke="#38bdf8" stroke-width="4" stroke-linecap="round"/>
-  <line x1="326" y1="38" x2="326" y2="70" stroke="#38bdf8" stroke-width="4" stroke-linecap="round"/>
+  <rect x="100" y="362" width="146" height="90" rx="26" fill="#2f6fe4"/>
+  <rect x="266" y="362" width="146" height="90" rx="26"
+        fill="#17233b" stroke="#45536e" stroke-width="7"/>
+  <circle cx="339" cy="407" r="15" fill="#fb7185"/>
 </svg>

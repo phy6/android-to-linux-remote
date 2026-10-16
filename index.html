@@ -10,8 +10,11 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="TailDeck" />
-    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <!-- %BASE_URL% keeps these working both on the Pages subpath and when the
+         daemon serves the app over http on the hotspot. -->
+    <link rel="apple-touch-icon" href="%BASE_URL%apple-touch-icon.png" />
+    <link rel="icon" href="%BASE_URL%favicon.ico" sizes="any" />
+    <link rel="icon" type="image/svg+xml" href="%BASE_URL%icon.svg" />
     <meta property="og:title" content="TailDeck: Linux Remote (Wayland & X11)" />
     <meta property="og:description" content="Android remote control trackpad, horizontal app switcher, and dictation for Linux laptops over Tailscale." />
     <meta property="og:type" content="website" />

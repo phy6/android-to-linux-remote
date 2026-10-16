@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { ConnectionStatus, RemoteSettings, SessionType } from '../types';
 import { linuxClient } from '../services/linuxClient';
+import { LOCAL_HOST } from '../services/localMode';
 import { useHaptics } from '../hooks/useHaptics';
 import { PWAInstallButton } from './PWAInstallButton';
 import {
@@ -321,6 +322,20 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                     Find IP on laptop: <code className="text-sky-400">tailscale ip -4</code>
                   </span>
                 </div>
+
+                {LOCAL_HOST && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setTailscaleIp(LOCAL_HOST);
+                      linuxClient.connect(LOCAL_HOST);
+                    }}
+                    className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl font-medium text-xs bg-emerald-600/20 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-600/30 transition"
+                  >
+                    <Wifi className="w-4 h-4" />
+                    <span>Same hotspot ({LOCAL_HOST})</span>
+                  </button>
+                )}
 
                 {connectionStatus.connected ? (
                   <button

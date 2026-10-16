@@ -11,6 +11,7 @@ import json
 import time
 import socket
 import struct
+import urllib.parse
 import hashlib
 import base64
 import threading
@@ -368,10 +369,113 @@ INPUT_HANDLER = LinuxInputBackend()
 
 # --- STANDALONE RFC6455 WEBSOCKET IMPLEMENTATION (No pip required) ---
 
+# The same port answers plain GETs with the built app, so on a hotspot the
+# phone can load it from the laptop itself and talk to it over ws:// with no
+# Tailscale, no cellular data and no internet round trip. Set TAILDECK_WEBROOT
+# to the directory holding the built index.html to enable it.
+WEBROOT = os.environ.get("TAILDECK_WEBROOT", os.path.expanduser("~/taildeck-web"))
+
+MIME_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".webmanifest": "application/manifest+json",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".svg": "image/svg+xml",
+    ".ico": "image/x-icon",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".map": "application/json",
+    ".txt": "text/plain; charset=utf-8",
+}
+
+
+def _http(conn, status, ctype, body, cache="no-cache"):
+    head = (
+        f"HTTP/1.1 {status}\r\n"
+        f"Content-Type: {ctype}\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        f"Cache-Control: {cache}\r\n"
+        "Connection: close\r\n\r\n"
+    )
+    try:
+        conn.sendall(head.encode("utf-8") + body)
+    except Exception:
+        pass
+
+
+def serve_static(conn, request_line):
+    try:
+        target = request_line.split()[1]
+    except Exception:
+        target = "/"
+    target = target.split("?", 1)[0].split("#", 1)[0]
+    root = os.path.abspath(WEBROOT)
+
+    if not os.path.isdir(root):
+        _http(conn, "404 Not Found", "text/plain; charset=utf-8",
+              b"TailDeck: no app published here. Set TAILDECK_WEBROOT.\n")
+        return
+
+    rel = urllib.parse.unquote(target).lstrip("/")
+    full = os.path.abspath(os.path.join(root, rel))
+    if full != root and not full.startswith(root + os.sep):
+        full = os.path.join(root, "index.html")   # path traversal guard
+    if os.path.isdir(full):
+        full = os.path.join(full, "index.html")
+    if not os.path.isfile(full):
+        # Navigations fall back to the app shell; a missing asset is a real 404,
+        # otherwise a broken path would quietly return HTML instead of failing.
+        if os.path.splitext(full)[1]:
+            _http(conn, "404 Not Found", "text/plain; charset=utf-8", b"Not found\n")
+            return
+        full = os.path.join(root, "index.html")
+    if not os.path.isfile(full):
+        _http(conn, "404 Not Found", "text/plain; charset=utf-8", b"Not found\n")
+        return
+
+    try:
+        with open(full, "rb") as fh:
+            body = fh.read()
+    except Exception:
+        _http(conn, "500 Internal Server Error", "text/plain; charset=utf-8", b"Unreadable\n")
+        return
+
+    if os.path.basename(full) == "index.html":
+        cache = "no-cache"
+    elif "/assets/" in full.replace(os.sep, "/"):
+        cache = "public, max-age=31536000, immutable"
+    else:
+        cache = "public, max-age=3600"
+    ctype = MIME_TYPES.get(os.path.splitext(full)[1].lower(), "application/octet-stream")
+    _http(conn, "200 OK", ctype, body, cache)
+
+
+def local_ipv4_addresses():
+    """Addresses a phone on the same hotspot could reach the laptop on."""
+    found = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            found.add(info[4][0])
+    except Exception:
+        pass
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.connect(("8.8.8.8", 80))
+        found.add(probe.getsockname()[0])
+        probe.close()
+    except Exception:
+        pass
+    return sorted(ip for ip in found if not ip.startswith("127."))
+
+
 def handle_websocket(conn):
     try:
-        data = conn.recv(1024).decode('utf-8', errors='ignore')
+        data = conn.recv(4096).decode('utf-8', errors='ignore')
         if "Upgrade: websocket" not in data:
+            serve_static(conn, data.split("\r\n", 1)[0] if data else "GET / HTTP/1.1")
             conn.close()
             return
 
@@ -509,6 +613,10 @@ def run_ws_server():
     print(f"[TailDeck] Daemon listening on 0.0.0.0:{PORT} (Tailscale IP compatible)")
     print(f"[TailDeck] Session: {SESSION_TYPE.upper()} | Backend: {BACKEND_NAME}")
     print("[TailDeck] Ready for Android remote trackpad connection!")
+    print(f"[TailDeck] Web app root: {WEBROOT} "
+          f"({'found' if os.path.isfile(os.path.join(WEBROOT, 'index.html')) else 'not published'})")
+    for ip in local_ipv4_addresses():
+        print(f"[TailDeck] Same-hotspot URL: http://{ip}:{PORT}/")
     while True:
         conn, addr = server.accept()
         t = threading.Thread(target=handle_websocket, args=(conn,), daemon=True)

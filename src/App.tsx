@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { AlertCircle, Check, Stethoscope, Wifi, WifiOff } from 'lucide-react';
 import { linuxClient } from './services/linuxClient';
+import { LOCAL_HOST, IS_LOCAL_MODE } from './services/localMode';
 import { ConnectionStatus, RemoteSettings } from './types';
 import {
   HorizontalScrollWheel,
@@ -300,12 +301,14 @@ export default function App() {
     return unsub;
   }, []);
 
-  // Reconnect to the saved host on launch so the deck is usable immediately.
+  // Reconnect on launch so the deck is usable immediately. When the app was
+  // served by the laptop itself the local address wins: it is on the hotspot,
+  // so it is faster, free of mobile data, and needs no tailnet at all.
   const didAutoConnectRef = useRef(false);
   useEffect(() => {
     if (didAutoConnectRef.current) return;
     didAutoConnectRef.current = true;
-    const host = settings.tailscaleIp?.trim();
+    const host = LOCAL_HOST || settings.tailscaleIp?.trim();
     if (!settings.autoConnect || !host) return;
     linuxClient.connect(host);
   }, [settings.autoConnect, settings.tailscaleIp]);
@@ -319,6 +322,11 @@ export default function App() {
     if (host === settings.tailscaleIp) return;
     handleUpdateSettings({ tailscaleIp: host });
   }, [connectionStatus.hostAddress, settings.tailscaleIp]);
+
+  useEffect(() => {
+    if (!IS_LOCAL_MODE) return;
+    showToast('Local mode: connected straight over the hotspot', 'ok');
+  }, [showToast]);
 
   // Announce link state with a real system notification, falling back to an
   // in-app banner when notifications are not permitted.
