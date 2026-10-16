@@ -587,6 +587,28 @@ def local_ipv4_addresses():
     return sorted(ip for ip in found if not ip.startswith("127."))
 
 
+def tailnet_dns_name():
+    """MagicDNS name of this machine, if the Tailscale CLI can tell us.
+
+    The tailnet suffix is per-account and cannot be derived from the hostname,
+    so ask tailscale itself. A missing CLI or a logged-out node simply means we
+    report no tailnet name rather than inventing one.
+    """
+    try:
+        res = subprocess.run(
+            ["tailscale", "status", "--json"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if res.returncode == 0 and res.stdout:
+            self_info = (json.loads(res.stdout) or {}).get("Self") or {}
+            name = str(self_info.get("DNSName") or "").rstrip(".")
+            if name:
+                return name
+    except Exception:
+        pass
+    return None
+
+
 def handle_websocket(conn):
     try:
         peer = "{}:{}".format(*conn.getpeername()[:2])
@@ -630,7 +652,12 @@ def handle_websocket(conn):
             "hostname": socket.gethostname(),
             "os": sys.platform,
             "session": "Wayland" if "wayland" in SESSION_TYPE else ("X11" if "x11" in SESSION_TYPE else "Unknown"),
-            "backend": BACKEND_NAME
+            "backend": BACKEND_NAME,
+            # How the phone can reach this laptop next time. The LAN addresses
+            # only work on the same hotspot; the tailnet name works anywhere.
+            "addresses": local_ipv4_addresses(),
+            "tailnet": tailnet_dns_name(),
+            "ports": {"http": PORT, "https": TLS_PORT},
         }
         send_ws_frame(conn, json.dumps(welcome))
 

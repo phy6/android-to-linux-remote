@@ -21,6 +21,11 @@ export interface ConnectionStatus {
     os: string;
     session: 'Wayland' | 'X11' | 'Unknown';
     backend: string;
+    // Reported by the daemon so the app can hand the user every way back to
+    // this laptop: LAN addresses (same hotspot only) and the tailnet name.
+    addresses?: string[];
+    tailnet?: string | null;
+    ports?: { http: number; https: number };
   };
 }
 

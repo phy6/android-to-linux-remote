@@ -29,6 +29,10 @@ import {
   Volume2,
   Vibrate,
   Gauge,
+  Zap,
+  MousePointerClick,
+  MousePointer2,
+  MoveVertical,
   Mic,
   Bell,
   Repeat2,
@@ -354,9 +358,9 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                   <div>
                     <div className="text-xs font-semibold text-white">
                       {connectionStatus.connected
-                        ? 'Connected to Linux Host'
+                        ? 'Connected to laptop'
                         : connectionStatus.connecting
-                        ? 'Connecting to Tailscale...'
+                        ? 'Connecting to laptop...'
                         : 'Disconnected'}
                     </div>
                     {connectionStatus.connected && connectionStatus.hostOsInfo && (
@@ -387,21 +391,109 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                 )}
               </div>
 
+              {/* Address book: the daemon reports every way back to itself, so
+                  you never have to run `tailscale ip` on the laptop. */}
+              {connectionStatus.connected &&
+                connectionStatus.hostOsInfo &&
+                (connectionStatus.hostOsInfo.addresses?.length ||
+                  connectionStatus.hostOsInfo.tailnet) && (
+                  <div className="space-y-2">
+                    <SectionTitle>Reach this laptop at</SectionTitle>
+                    <div className="space-y-1.5">
+                      {(connectionStatus.hostOsInfo.addresses ?? []).map((ip) => {
+                        const port = connectionStatus.hostOsInfo?.ports?.https ?? 8443;
+                        const value = `${ip}:${port}`;
+                        const isCurrent =
+                          connectionStatus.hostAddress.replace(/:\d+$/, '') === ip;
+                        return (
+                          <div
+                            key={ip}
+                            className="flex items-center justify-between gap-2 p-2.5 rounded-xl bg-slate-900 border border-slate-800"
+                          >
+                            <div className="min-w-0">
+                              <div className="font-mono text-[11px] text-emerald-300 truncate">
+                                {value}
+                              </div>
+                              <div className="text-[10px] text-slate-500">
+                                {isCurrent ? 'Connected now' : 'Same hotspot (LAN)'}
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-1 shrink-0">
+                              <button
+                                type="button"
+                                onClick={() => copyToClipboard(value, `ip-${ip}`)}
+                                title="Copy address"
+                                className="p-1.5 rounded-lg bg-slate-800 text-slate-300 hover:bg-slate-700"
+                              >
+                                {copiedCode === `ip-${ip}` ? (
+                                  <Check className="w-3 h-3 text-emerald-400" />
+                                ) : (
+                                  <Copy className="w-3 h-3" />
+                                )}
+                              </button>
+                              {!isCurrent && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setTailscaleIp(value);
+                                    linuxClient.connect(value);
+                                  }}
+                                  className="px-2.5 py-1.5 rounded-lg bg-sky-600 text-white text-[11px] font-medium hover:bg-sky-500"
+                                >
+                                  Use
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+
+                      {connectionStatus.hostOsInfo.tailnet && (
+                        <div className="flex items-center justify-between gap-2 p-2.5 rounded-xl bg-slate-900 border border-slate-800">
+                          <div className="min-w-0">
+                            <div className="font-mono text-[11px] text-sky-300 truncate">
+                              {connectionStatus.hostOsInfo.tailnet}
+                            </div>
+                            <div className="text-[10px] text-slate-500">
+                              Tailnet name (works on any network)
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              copyToClipboard(connectionStatus.hostOsInfo?.tailnet ?? '', 'tailnet')
+                            }
+                            title="Copy tailnet name"
+                            className="p-1.5 rounded-lg bg-slate-800 text-slate-300 hover:bg-slate-700 shrink-0"
+                          >
+                            {copiedCode === 'tailnet' ? (
+                              <Check className="w-3 h-3 text-emerald-400" />
+                            ) : (
+                              <Copy className="w-3 h-3" />
+                            )}
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
               {/* IP Input Form */}
               <form onSubmit={handleConnect} className="space-y-3">
                 <div>
                   <label className="text-xs font-semibold text-slate-300 block mb-1">
-                    Laptop Tailscale IP:
+                    Laptop address:
                   </label>
                   <input
                     type="text"
                     value={tailscaleIp}
                     onChange={(e) => setTailscaleIp(e.target.value)}
-                    placeholder="e.g. my-laptop.tailnet.ts.net:8080"
+                    placeholder="e.g. my-laptop.tailnet.ts.net:8443"
                     className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-3.5 py-2.5 text-sm text-white font-mono placeholder-slate-600 focus:outline-none focus:border-sky-500"
                   />
                   <span className="text-[10px] text-slate-500 mt-1 block">
-                    Find IP on laptop: <code className="text-sky-400">tailscale ip -4</code>
+                    On the same hotspot the app finds the laptop for you. Over Tailscale, use its
+                    name like <code className="text-sky-400">my-laptop.tailnet.ts.net</code>.
                   </span>
                 </div>
 
@@ -478,11 +570,24 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                 </a>
               </div>
 
-              {/* Wayland & X11 compatibility badge */}
+              {/* Input method actually in use, straight from the daemon: the
+                  backend differs per machine (uinput vs ydotool vs xdotool), so
+                  a hard-coded claim would be wrong on some laptops. */}
               <div className="p-2.5 rounded-xl bg-sky-950/20 border border-sky-500/20 text-slate-400 text-[11px] flex items-start gap-2">
                 <Shield className="w-4 h-4 text-sky-400 shrink-0 mt-0.5" />
                 <span>
-                  Uses Linux kernel <code className="text-sky-300">/dev/uinput</code>. Compatible with GNOME Wayland, KDE Plasma 6, Hyprland, Sway, and X11.
+                  {connectionStatus.connected && connectionStatus.hostOsInfo ? (
+                    <>
+                      Session{' '}
+                      <code className="text-sky-300">{connectionStatus.hostOsInfo.session}</code>,
+                      input via <code className="text-sky-300">{connectionStatus.hostOsInfo.backend}</code>.
+                    </>
+                  ) : (
+                    <>
+                      Works on X11 and Wayland (GNOME, KDE Plasma, Hyprland, Sway). Connect to see
+                      the method in use.
+                    </>
+                  )}
                 </span>
               </div>
             </div>
@@ -641,7 +746,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
           {activeTab === 'settings' && (
             <div className="space-y-5 text-xs">
               <section className="space-y-3">
-                <SectionTitle>Touchpad</SectionTitle>
+                <SectionTitle>Pointer &amp; trackpad</SectionTitle>
 
                 <div className="space-y-1.5">
                   <span className="font-semibold text-slate-300 flex items-center gap-1.5">
@@ -660,8 +765,9 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                 </div>
 
                 <div className="space-y-1.5">
-                  <span className="font-semibold text-slate-300">
-                    Acceleration: {settings.acceleration.toFixed(2)}
+                  <span className="font-semibold text-slate-300 flex items-center gap-1.5">
+                    <Zap className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>Acceleration: {settings.acceleration.toFixed(2)}</span>
                   </span>
                   <input
                     type="range"
@@ -677,7 +783,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                 <div className="space-y-1.5">
                   <span className="font-semibold text-slate-300 flex items-center gap-1.5">
                     <Repeat2 className="w-3.5 h-3.5 text-sky-400" />
-                    <span>App switcher spacing: {settings.wheelSensitivity}px</span>
+                    <span>App-switch distance: {settings.wheelSensitivity}px</span>
                   </span>
                   <input
                     type="range"
@@ -696,16 +802,19 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                 </div>
 
                 <ToggleRow
+                  icon={<MousePointerClick className="w-4 h-4 text-sky-400" />}
                   label="Tap to Click"
                   checked={settings.tapToClick}
                   onChange={(v) => onUpdateSettings({ tapToClick: v })}
                 />
                 <ToggleRow
+                  icon={<MousePointer2 className="w-4 h-4 text-sky-400" />}
                   label="Two-Finger Right Click"
                   checked={settings.twoFingerRightClick}
                   onChange={(v) => onUpdateSettings({ twoFingerRightClick: v })}
                 />
                 <ToggleRow
+                  icon={<MoveVertical className="w-4 h-4 text-sky-400" />}
                   label="Invert Scroll Direction"
                   checked={settings.invertScroll}
                   onChange={(v) => onUpdateSettings({ invertScroll: v })}
@@ -764,6 +873,14 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                   onChange={() => void toggleFullscreen()}
                 />
 
+                <p className="text-[10px] text-slate-500 px-1">
+                  TailDeck {__BUILD_SHA__}
+                </p>
+              </section>
+
+              <section className="space-y-3 pt-4 border-t border-slate-800">
+                <SectionTitle>Developer</SectionTitle>
+
                 <button
                   type="button"
                   onClick={() => {
@@ -788,10 +905,6 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                   <Monitor className="w-4 h-4" />
                   <span>{isSimulatorActive ? 'Hide Desktop Simulator' : 'Show Desktop Simulator'}</span>
                 </button>
-
-                <p className="text-[10px] text-slate-500 px-1">
-                  TailDeck {__BUILD_SHA__}
-                </p>
               </section>
             </div>
           )}

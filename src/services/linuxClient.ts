@@ -141,6 +141,9 @@ class LinuxClientService {
                 os: data.os || 'Linux',
                 session: data.session || 'Wayland',
                 backend: data.backend || 'uinput',
+                addresses: Array.isArray(data.addresses) ? data.addresses : [],
+                tailnet: data.tailnet ?? null,
+                ports: data.ports,
               },
             };
             this.notifyStatus();
