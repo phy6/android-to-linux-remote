@@ -4,6 +4,13 @@ import { ConnectionStatus } from '../types';
 // phone back to the hosted page instead of to a laptop.
 const HOSTED_HOSTS = ['phy6.github.io', 'localhost', '127.0.0.1'];
 
+// Tailscale hands out CGNAT addresses (100.64.0.0/10); those are not reachable
+// from a phone that is merely on the same hotspot.
+function isTailnetIp(ip: string): boolean {
+  const parts = ip.split('.').map(Number);
+  return parts.length === 4 && parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127;
+}
+
 export interface PairingRoute {
   id: string;
   label: string;
@@ -46,6 +53,7 @@ export function pairingRoutes(status: ConnectionStatus, originHost?: string): Pa
 
   const httpsPort = info?.ports?.https ?? 8443;
   for (const ip of info?.addresses ?? []) {
+    if (isTailnetIp(ip)) continue;
     add(
       `lan-${ip}`,
       'Same Wi-Fi / hotspot',
