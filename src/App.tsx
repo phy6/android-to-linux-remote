@@ -21,6 +21,7 @@ import {
   AlertPermission,
 } from './services/notifications';
 import { SpeechDiagnosticsPanel } from './components/SpeechDiagnosticsPanel';
+import { PcmCapture } from './services/audioCapture';
 
 const DEFAULT_SETTINGS: RemoteSettings = {
   sensitivity: 1.2,
@@ -68,71 +69,6 @@ export default function App() {
   const [isPttActive, setIsPttActive] = useState(false);
 
   const speech = useSpeechRecognition();
-  const pttSendTimerRef = useRef<number | null>(null);
-  const pttTokenRef = useRef(0);
-
-  // Push-to-talk: hold the mic to listen, release to type the words into Linux.
-  const handlePttStart = useCallback(() => {
-    speech.resetTranscript();
-    if (pttSendTimerRef.current !== null) {
-      window.clearTimeout(pttSendTimerRef.current);
-      pttSendTimerRef.current = null;
-    }
-
-    const token = ++pttTokenRef.current;
-    void speech.startListening().then((started) => {
-      // The finger may already be lifted by the time permission resolves.
-      if (pttTokenRef.current !== token) {
-        if (started) speech.abortListening();
-        return;
-      }
-      setIsPttActive(started);
-    });
-  }, [speech]);
-
-  const handlePttEnd = useCallback(() => {
-    // Invalidate any start that is still awaiting permission.
-    pttTokenRef.current += 1;
-    setIsPttActive(false);
-
-    if (pttSendTimerRef.current !== null) {
-      window.clearTimeout(pttSendTimerRef.current);
-      pttSendTimerRef.current = null;
-    }
-
-    speech.stopListening();
-    if (!speech.transcriptRef.current.trim()) return;
-
-    // Give the engine a beat to deliver its final result before reading the text.
-    pttSendTimerRef.current = window.setTimeout(() => {
-      pttSendTimerRef.current = null;
-      const text = speech.transcriptRef.current.trim();
-      if (!text) return;
-      linuxClient.sendTypeText(text);
-      linuxClient.sendKeyCombo(['Return']);
-      speech.resetTranscript();
-    }, 350);
-  }, [speech]);
-
-  const handlePttCancel = useCallback(() => {
-    pttTokenRef.current += 1;
-    setIsPttActive(false);
-    if (pttSendTimerRef.current !== null) {
-      window.clearTimeout(pttSendTimerRef.current);
-      pttSendTimerRef.current = null;
-    }
-    speech.abortListening();
-    speech.resetTranscript();
-  }, [speech]);
-
-  useEffect(
-    () => () => {
-      if (pttSendTimerRef.current !== null) {
-        window.clearTimeout(pttSendTimerRef.current);
-      }
-    },
-    []
-  );
 
   // Surface speech failures on the deck itself, otherwise a blocked microphone
   // makes push-to-talk fail with no visible reason.
@@ -175,6 +111,133 @@ export default function App() {
     () => () => {
       if (noticeTimerRef.current !== null) {
         window.clearTimeout(noticeTimerRef.current);
+      }
+    },
+    []
+  );
+
+  const pttSendTimerRef = useRef<number | null>(null);
+  const pttTokenRef = useRef(0);
+  const captureRef = useRef<PcmCapture | null>(null);
+  const daemonPttRef = useRef(false);
+
+  // Push-to-talk: hold the mic to listen, release to type the words into Linux.
+  const handlePttStart = useCallback(() => {
+    speech.resetTranscript();
+    if (pttSendTimerRef.current !== null) {
+      window.clearTimeout(pttSendTimerRef.current);
+      pttSendTimerRef.current = null;
+    }
+
+    const token = ++pttTokenRef.current;
+
+    // Prefer the laptop's own offline recogniser: it is already warm, works
+    // offline and does not depend on the browser speech engine. Fall back to
+    // the browser only when the daemon cannot take the session.
+    void linuxClient.startDictation().then(async (ok) => {
+      if (pttTokenRef.current !== token) {
+        if (ok) linuxClient.stopDictation();
+        return;
+      }
+      if (ok) {
+        daemonPttRef.current = true;
+        const capture = new PcmCapture({
+          onChunk: (pcm) => linuxClient.sendDictationAudio(pcm),
+          onError: () => showToast('Microphone unavailable', 'warn'),
+        });
+        captureRef.current = capture;
+        try {
+          await capture.start();
+        } catch {
+          linuxClient.stopDictation();
+          daemonPttRef.current = false;
+          showSpeechNotice(
+            'Microphone blocked. Allow it for this site in your browser settings.'
+          );
+          setIsPttActive(false);
+          return;
+        }
+        if (pttTokenRef.current !== token) {
+          capture.stop();
+          linuxClient.stopDictation();
+          daemonPttRef.current = false;
+          return;
+        }
+        setIsPttActive(true);
+        return;
+      }
+
+      daemonPttRef.current = false;
+      void speech.startListening().then((started) => {
+        if (pttTokenRef.current !== token) {
+          if (started) speech.abortListening();
+          return;
+        }
+        setIsPttActive(started);
+      });
+    });
+  }, [speech, showToast, showSpeechNotice]);
+
+  const handlePttEnd = useCallback(() => {
+    // Invalidate any start that is still awaiting permission.
+    pttTokenRef.current += 1;
+    setIsPttActive(false);
+
+    if (pttSendTimerRef.current !== null) {
+      window.clearTimeout(pttSendTimerRef.current);
+      pttSendTimerRef.current = null;
+    }
+
+    // The laptop recognises the audio it already has and types the result
+    // itself, so release just has to close the stream.
+    if (daemonPttRef.current) {
+      daemonPttRef.current = false;
+      const capture = captureRef.current;
+      captureRef.current = null;
+      // Send a little trailing audio before closing the session.
+      window.setTimeout(() => {
+        capture?.stop();
+        linuxClient.stopDictation();
+      }, 120);
+      return;
+    }
+
+    speech.stopListening();
+    if (!speech.transcriptRef.current.trim()) return;
+
+    // Give the engine a beat to deliver its final result before reading the text.
+    pttSendTimerRef.current = window.setTimeout(() => {
+      pttSendTimerRef.current = null;
+      const text = speech.transcriptRef.current.trim();
+      if (!text) return;
+      linuxClient.sendTypeText(text);
+      linuxClient.sendKeyCombo(['Return']);
+      speech.resetTranscript();
+    }, 350);
+  }, [speech]);
+
+  const handlePttCancel = useCallback(() => {
+    pttTokenRef.current += 1;
+    setIsPttActive(false);
+    if (pttSendTimerRef.current !== null) {
+      window.clearTimeout(pttSendTimerRef.current);
+      pttSendTimerRef.current = null;
+    }
+    if (daemonPttRef.current) {
+      daemonPttRef.current = false;
+      captureRef.current?.stop();
+      captureRef.current = null;
+      linuxClient.stopDictation();
+      return;
+    }
+    speech.abortListening();
+    speech.resetTranscript();
+  }, [speech]);
+
+  useEffect(
+    () => () => {
+      if (pttSendTimerRef.current !== null) {
+        window.clearTimeout(pttSendTimerRef.current);
       }
     },
     []

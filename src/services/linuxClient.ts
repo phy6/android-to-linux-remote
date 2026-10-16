@@ -1,5 +1,10 @@
 import { ConnectionStatus, InputEventPayload, SessionType } from '../types';
 
+// WebSocket.OPEN is not reliably present on the constructor in every runtime
+// (shims and wrapped builds can omit the statics), so compare against the
+// numeric readyState value from the spec instead.
+const WS_OPEN = 1;
+
 type EventCallback = (event: InputEventPayload) => void;
 type StatusCallback = (status: ConnectionStatus) => void;
 
@@ -8,6 +13,8 @@ class LinuxClientService {
   private listeners: Set<EventCallback> = new Set();
   private statusListeners: Set<StatusCallback> = new Set();
   private pendingDx = 0;
+  private dictationReady = false;
+  private dictationWaiter: ((ok: boolean) => void) | null = null;
   private pendingDy = 0;
   private pendingScrollX = 0;
   private pendingScrollY = 0;
@@ -98,6 +105,13 @@ class LinuxClientService {
             const latency = Math.max(1, Math.round(now - this.pingStart));
             this.status = { ...this.status, latencyMs: latency };
             this.notifyStatus();
+          } else if (data.type === 'dictation_ready') {
+            this.dictationReady = !!data.ok;
+            const resolve = this.dictationWaiter;
+            this.dictationWaiter = null;
+            resolve?.(this.dictationReady);
+          } else if (data.type === 'dictation_stopped') {
+            this.dictationReady = false;
           } else if (data.type === 'host_info') {
             this.status = {
               ...this.status,
@@ -165,7 +179,7 @@ class LinuxClientService {
   private startPingLoop() {
     this.stopPingLoop();
     this.pingInterval = window.setInterval(() => {
-      if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+      if (this.socket && this.socket.readyState === WS_OPEN) {
         this.pingStart = performance.now();
         this.sendRaw({ type: 'ping', timestamp: Date.now() });
       }
@@ -180,7 +194,7 @@ class LinuxClientService {
   }
 
   private sendRaw(data: unknown) {
-    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+    if (this.socket && this.socket.readyState === WS_OPEN) {
       this.socket.send(JSON.stringify(data));
     }
   }
@@ -240,6 +254,51 @@ class LinuxClientService {
     const payload: InputEventPayload = { type: 'app_switch', direction };
     this.sendRaw(payload);
     this.notifyLocalEvent(payload);
+  }
+
+  /** Ask the laptop to open a recognition session on its local engine. */
+  public startDictation(timeoutMs = 4000): Promise<boolean> {
+    if (!this.socket || this.socket.readyState !== WS_OPEN) {
+      return Promise.resolve(false);
+    }
+    const socket = this.socket;
+    return new Promise<boolean>((resolve) => {
+      const timer = window.setTimeout(() => {
+        if (this.dictationWaiter === wrapped) this.dictationWaiter = null;
+        resolve(false);
+      }, timeoutMs);
+      const wrapped = (ok: boolean) => {
+        window.clearTimeout(timer);
+        resolve(ok);
+      };
+      this.dictationWaiter = wrapped;
+      socket.send(JSON.stringify({ type: 'dictation_start' }));
+    });
+  }
+
+  /** Stream one chunk of 16 kHz mono s16le PCM to the laptop. */
+  public sendDictationAudio(pcm: ArrayBuffer) {
+    if (!this.socket || this.socket.readyState !== WS_OPEN) return;
+    if (!this.dictationReady) return;
+    const bytes = new Uint8Array(pcm);
+    let binary = '';
+    const CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+    }
+    this.socket.send(
+      JSON.stringify({ type: 'dictation_audio', data: btoa(binary) })
+    );
+  }
+
+  public stopDictation() {
+    if (!this.socket || this.socket.readyState !== WS_OPEN) return;
+    this.socket.send(JSON.stringify({ type: 'dictation_stop' }));
+    this.dictationReady = false;
+  }
+
+  public get isDictationReady(): boolean {
+    return this.dictationReady;
   }
 
   public sendTypeText(text: string) {
