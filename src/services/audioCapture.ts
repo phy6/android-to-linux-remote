@@ -118,6 +118,10 @@ export class PcmCapture {
     node.port.onmessage = (event: MessageEvent<Float32Array>) => {
       this.push(event.data);
     };
+    // The microphone has to be wired into the tap. process() receives its input
+    // array from connected upstream nodes, so without this the tap runs on an
+    // empty input and never posts a sample.
+    this.source.connect(node);
     // A muted sink keeps the graph pulled on machines with no output device,
     // where connecting straight to destination can leave the node idle.
     this.sink = this.ctx.createGain();
@@ -134,6 +138,9 @@ export class PcmCapture {
     node.onaudioprocess = (event) => {
       this.push(new Float32Array(event.inputBuffer.getChannelData(0)));
     };
+    // Same wiring as the worklet path: a ScriptProcessor pulls silence unless
+    // the microphone is connected into it.
+    this.source.connect(node);
     // A muted sink keeps the graph pulled on machines with no output device,
     // where connecting straight to destination can leave the node idle.
     this.sink = this.ctx.createGain();
