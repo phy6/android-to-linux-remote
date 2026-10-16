@@ -1,0 +1,74 @@
+#!/bin/sh
+# TailDeck PAM helper -- lets a phone that just approved this account satisfy
+# authentication on the laptop.
+#
+# pam_exec.so runs this as root during the auth phase of a PAM service. It reads
+# NO password: it simply asks the user's TailDeck daemon whether the phone has a
+# fresh, single-use grant for $PAM_USER. Exit 0 means "authenticated"; any other
+# value lets the remaining PAM modules (e.g. pam_unix) run as usual, so a
+# missing phone or a stopped daemon can never lock anyone out.
+#
+# Place it at /usr/local/sbin/taildeck-pam (root:root 0755). Wire it in with a
+# line such as:
+#     auth  sufficient  pam_exec.so  quiet  /usr/local/sbin/taildeck-pam
+# ("sufficient" => phone replaces the password; use "required" instead to make
+# the phone an *extra* factor alongside the password.)
+
+set -u
+
+# pam_exec hands us a minimal environment; make sure the tools we use are found.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+log() { command -v logger >/dev/null 2>&1 && logger -t taildeck-pam "$1" || true; }
+
+user="${PAM_USER:-${USER:-}}"
+if [ -z "$user" ]; then
+    log "no PAM_USER; skipping"
+    exit 1
+fi
+
+key_file="${TAILDECK_PAM_KEY_FILE:-/etc/taildeck/pam.key}"
+if [ ! -r "$key_file" ]; then
+    # pam_exec does not elevate: the greeter runs it as root (reads
+    # /etc/taildeck/pam.key), but the screen locker runs it as the user, who can
+    # only read their own 0600 twin. Same secret, so either source works.
+    user_home=""
+    if command -v getent >/dev/null 2>&1; then
+        user_home="$(getent passwd "$user" | cut -d: -f6)"
+    fi
+    if [ -n "$user_home" ] && [ -r "$user_home/.config/taildeck/pam.key" ]; then
+        key_file="$user_home/.config/taildeck/pam.key"
+    fi
+fi
+if [ ! -r "$key_file" ]; then
+    log "key file $key_file not readable; phone unlock not configured for $user"
+    exit 1
+fi
+key="$(cat "$key_file")"
+[ -n "$key" ] || exit 1
+
+if ! command -v curl >/dev/null 2>&1; then
+    log "curl missing; cannot reach the daemon"
+    exit 1
+fi
+
+port="${TAILDECK_PORT:-8080}"
+url="http://127.0.0.1:${port}/api/auth/consume"
+payload="{\"user\":\"${user}\"}"
+
+resp="$(curl -fsS --max-time 4 -X POST "$url" \
+    -H "X-TailDeck-Pam-Key: ${key}" \
+    -H 'Content-Type: application/json' \
+    -d "$payload" 2>/dev/null)" || resp=""
+
+case "$resp" in
+    *'"ok": true'*|*'"ok":true'*)
+        log "granted for $user (service=${PAM_SERVICE:-?} tty=${PAM_TTY:-?})"
+        exit 0
+        ;;
+    *)
+        log "no grant for $user (service=${PAM_SERVICE:-?})"
+        exit 1
+        ;;
+esac

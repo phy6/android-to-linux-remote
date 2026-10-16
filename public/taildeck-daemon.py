@@ -17,6 +17,7 @@ import tarfile
 import urllib.parse
 import urllib.request
 import hashlib
+import hmac
 import base64
 import threading
 import subprocess
@@ -24,7 +25,7 @@ import tempfile
 import pwd
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-DAEMON_VERSION = "1.3.0"
+DAEMON_VERSION = "1.4.0"
 
 PORT = int(os.environ.get("TAILDECK_PORT", 8080))
 DICTATE_HOST = os.environ.get("TAILDECK_DICTATE_HOST", "127.0.0.1")
@@ -620,6 +621,17 @@ AUTH_LOCK = threading.Lock()
 AUTH_PENDING = {}
 _AUTH_RPID_CACHE = {"value": None}
 
+# Phase 2: a verified phone assertion leaves a short-lived, single-use "grant"
+# that the root-owned PAM helper may spend to satisfy auth for that one user.
+# The helper proves it is the helper with a shared secret the daemon reads from
+# a 0600 user-owned file (its twin lives at /etc/taildeck/pam.key, 0400 root).
+AUTH_GRANT_TTL = int(os.environ.get("TAILDECK_GRANT_TTL", 30))
+PAM_KEY_ENV = os.environ.get("TAILDECK_PAM_KEY", "")
+PAM_KEY_FILE = os.environ.get(
+    "TAILDECK_PAM_KEY_FILE", os.path.expanduser("~/.config/taildeck/pam.key")
+)
+AUTH_GRANTS = {}
+
 MIME_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
@@ -1041,6 +1053,13 @@ def auth_verify(request_id, payload):
     with AUTH_LOCK:
         rec["ok"] = ok
         rec["status"] = "verified" if ok else f"failed:{reason}"
+        if ok:
+            now = time.time()
+            AUTH_GRANTS[rec["user"]] = {
+                "nonce": request_id,
+                "created": now,
+                "expires": now + AUTH_GRANT_TTL,
+            }
     print(f"[TailDeck] auth_verify {request_id} -> {rec['status']}", flush=True)
     return ok, rec["status"]
 
@@ -1053,6 +1072,50 @@ def auth_status(request_id):
         if rec["status"] == "pending" and time.time() - rec["created"] > rec["ttl"]:
             rec["status"] = "expired"
         return dict(rec)
+
+
+def _pam_key():
+    """The shared secret the PAM helper must present. Read once from the env or
+    the 0600 key file; empty means phone-unlock is not configured."""
+    if PAM_KEY_ENV:
+        return PAM_KEY_ENV
+    try:
+        with open(PAM_KEY_FILE, "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except Exception:
+        return ""
+
+
+def _consume_grant(user, key):
+    """Spend a verified grant for *user*. Single use, short TTL, secret-gated."""
+    expected = _pam_key()
+    if not expected:
+        return False, "not configured"
+    if not key or not hmac.compare_digest(str(key), expected):
+        print("[TailDeck] pam consume rejected: bad key", flush=True)
+        return False, "forbidden"
+    now = time.time()
+    with AUTH_LOCK:
+        for u in list(AUTH_GRANTS):
+            if AUTH_GRANTS[u]["expires"] < now:
+                AUTH_GRANTS.pop(u, None)
+        grant = AUTH_GRANTS.pop(user, None)
+    if grant is None:
+        print(f"[TailDeck] pam consume for {user}: no grant", flush=True)
+        return False, "no grant"
+    if grant["expires"] < now:
+        print(f"[TailDeck] pam consume for {user}: expired", flush=True)
+        return False, "expired"
+    print(f"[TailDeck] pam consume for {user}: granted (nonce {grant['nonce']})", flush=True)
+    return True, "ok"
+
+
+def _peer_is_loopback(conn):
+    try:
+        addr = conn.getpeername()[0]
+    except Exception:
+        return False
+    return addr in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
 
 
 # --- Version checking and self-update --------------------------------------
@@ -1407,6 +1470,26 @@ def handle_api(conn, raw, request_line):
             _json(conn, {"ok": False, "error": "unknown request"}, "404 Not Found")
             return True
         _json(conn, {"ok": rec["status"] == "verified", "status": rec["status"], "user": rec["user"]})
+        return True
+
+    if path == "/api/auth/consume" and method in ("POST", "PUT"):
+        # Called by the root-owned PAM helper during the auth phase. Gated by a
+        # shared secret and by the connection arriving on the loopback socket.
+        body = _read_http_body(conn, raw, headers)
+        try:
+            data = json.loads(body.decode("utf-8", errors="replace") or "{}")
+        except Exception:
+            data = {}
+        user = str(data.get("user") or "")
+        key = headers.get("x-taildeck-pam-key", "")
+        if not _peer_is_loopback(conn):
+            _json(conn, {"ok": False, "status": "not local"}, "403 Forbidden")
+            return True
+        if not user:
+            _json(conn, {"ok": False, "status": "no user"}, "400 Bad Request")
+            return True
+        ok, status = _consume_grant(user, key)
+        _json(conn, {"ok": ok, "status": status}, "200 OK" if ok else "403 Forbidden")
         return True
 
     if path == "/api/version" and method == "GET":

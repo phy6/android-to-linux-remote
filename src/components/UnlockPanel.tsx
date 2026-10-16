@@ -7,12 +7,13 @@
 // page loaded straight from the laptop's IP cannot create a passkey.
 
 import React, { useCallback, useEffect, useState } from 'react';
-import { Fingerprint, KeyRound, ShieldAlert, Trash2 } from 'lucide-react';
+import { Fingerprint, KeyRound, ShieldAlert, Trash2, Unlock } from 'lucide-react';
 import {
   AuthInfo,
   deleteCredential,
   fetchAuthInfo,
   registerPasskey,
+  verifyWithPhone,
   webAuthnAvailable,
 } from '../services/authClient';
 
@@ -79,6 +80,25 @@ export const UnlockPanel: React.FC<UnlockPanelProps> = ({ host, connected }) => 
     }
   };
 
+  const unlockNow = async () => {
+    setBusy(true);
+    setMessage(null);
+    try {
+      const result = await verifyWithPhone(host, { user: info?.user || '' });
+      if (!result.ok) {
+        setMessage(
+          result.error === 'cancelled'
+            ? 'Unlock cancelled.'
+            : result.error || 'Could not unlock the laptop.',
+        );
+        return;
+      }
+      setMessage('Approved — submit the lock screen within 30 seconds to unlock.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const credentials = info?.credentials ?? [];
 
   return (
@@ -111,6 +131,18 @@ export const UnlockPanel: React.FC<UnlockPanelProps> = ({ host, connected }) => 
 
       {!connected && (
         <p className="text-[11px] text-slate-500">Connect to a laptop to set up unlock.</p>
+      )}
+
+      {connected && credentials.length > 0 && (
+        <button
+          type="button"
+          onClick={() => void unlockNow()}
+          disabled={busy || !canUse}
+          className="w-full flex items-center justify-center gap-2 py-3 px-4 rounded-xl font-medium text-xs bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/25 disabled:opacity-40 disabled:pointer-events-none transition"
+        >
+          <Unlock className="w-4 h-4" />
+          <span>Unlock laptop now</span>
+        </button>
       )}
 
       {connected && (

@@ -1,0 +1,32 @@
+#!/bin/sh
+# Attention cue for admin (polkit) prompts.
+#
+# Installed as /usr/local/sbin/taildeck-beep and run via pam_exec from the
+# polkit-1 PAM stack, so it fires the moment something asks to run as root. The
+# polkit agent runs in the session, so this reaches the user's own audio AND can
+# nudge the phone through the daemon's notify endpoint. It never affects the
+# result of authentication (the PAM line is 'optional').
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+user="${PAM_USER:-${USER:-}}"
+
+# Audible cue on the user's session (fire-and-forget so the prompt is not held).
+if command -v paplay >/dev/null 2>&1 && [ -r /usr/share/sounds/freedesktop/stereo/bell.oga ]; then
+    paplay /usr/share/sounds/freedesktop/stereo/bell.oga >/dev/null 2>&1 &
+elif command -v aplay >/dev/null 2>&1 && [ -r /usr/share/sounds/alsa/Front_Center.wav ]; then
+    aplay -q /usr/share/sounds/alsa/Front_Center.wav >/dev/null 2>&1 &
+else
+    printf '\a' >/dev/tty 2>/dev/null || true
+fi
+
+# Tell the phone too, without holding up the prompt.
+port="${TAILDECK_PORT:-8080}"
+msg="admin approval requested${user:+ for $user}"
+if command -v curl >/dev/null 2>&1; then
+    curl -fsS --max-time 1 -X POST "http://127.0.0.1:${port}/api/notify" \
+        -H 'Content-Type: application/json' \
+        -d "{\"title\":\"TailDeck\",\"body\":\"${msg}\"}" >/dev/null 2>&1 || true
+fi
+
+exit 0
