@@ -10,6 +10,7 @@ import os
 import json
 import time
 import socket
+import ssl
 import struct
 import urllib.parse
 import hashlib
@@ -375,6 +376,15 @@ INPUT_HANDLER = LinuxInputBackend()
 # to the directory holding the built index.html to enable it.
 WEBROOT = os.environ.get("TAILDECK_WEBROOT", os.path.expanduser("~/taildeck-web"))
 
+# Hotspot TLS. http:// on a LAN address is not a secure context, so the phone
+# would refuse to hand over its microphone over the direct route. Serving the
+# same app over https fixes that. The certificate is self-signed, so the phone
+# shows one warning to tap through. See scripts/make-cert.sh.
+TLS_PORT = int(os.environ.get("TAILDECK_TLS_PORT", 8443))
+TLS_DIR = os.environ.get("TAILDECK_TLS_DIR", os.path.expanduser("~/.config/taildeck/tls"))
+TLS_CERT = os.path.join(TLS_DIR, "taildeck.crt")
+TLS_KEY = os.path.join(TLS_DIR, "taildeck.key")
+
 MIME_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
@@ -605,25 +615,59 @@ def read_ws_frame(conn):
     except Exception:
         return None
 
-def run_ws_server():
+def run_ws_server(port=PORT, tls_context=None):
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("0.0.0.0", PORT))
+    server.bind(("0.0.0.0", port))
     server.listen(10)
-    print(f"[TailDeck] Daemon listening on 0.0.0.0:{PORT} (Tailscale IP compatible)")
-    print(f"[TailDeck] Session: {SESSION_TYPE.upper()} | Backend: {BACKEND_NAME}")
-    print("[TailDeck] Ready for Android remote trackpad connection!")
-    print(f"[TailDeck] Web app root: {WEBROOT} "
-          f"({'found' if os.path.isfile(os.path.join(WEBROOT, 'index.html')) else 'not published'})")
-    for ip in local_ipv4_addresses():
-        print(f"[TailDeck] Same-hotspot URL: http://{ip}:{PORT}/")
+
+    if tls_context is not None:
+        server = tls_context.wrap_socket(server, server_side=True)
+        print(f"[TailDeck] Daemon listening on 0.0.0.0:{port} (https)")
+
     while True:
-        conn, addr = server.accept()
+        try:
+            conn, addr = server.accept()
+        except ssl.SSLError as e:
+            print(f"[TailDeck] TLS handshake failed: {e}")
+            continue
         t = threading.Thread(target=handle_websocket, args=(conn,), daemon=True)
         t.start()
 
+
+def build_tls_context():
+    """Load the self-signed certificate, or explain how to make one."""
+    if not (os.path.isfile(TLS_CERT) and os.path.isfile(TLS_KEY)):
+        print(f"[TailDeck] No certificate at {TLS_DIR} - hotspot mode stays http only")
+        print("[TailDeck]   run scripts/make-cert.sh to enable https on the direct route")
+        return None
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(TLS_CERT, TLS_KEY)
+    return ctx
+
+
 if __name__ == "__main__":
     try:
+        tls_context = build_tls_context()
+
+        print(f"[TailDeck] Daemon listening on 0.0.0.0:{PORT} (Tailscale IP compatible)")
+        print(f"[TailDeck] Session: {SESSION_TYPE.upper()} | Backend: {BACKEND_NAME}")
+        print("[TailDeck] Ready for Android remote trackpad connection!")
+        print(f"[TailDeck] Web app root: {WEBROOT} "
+              f"({'found' if os.path.isfile(os.path.join(WEBROOT, 'index.html')) else 'not published'})")
+        for ip in local_ipv4_addresses():
+            if tls_context is not None:
+                print(f"[TailDeck] Same-hotspot URL: https://{ip}:{TLS_PORT}/   (recommended - allows dictation)")
+                print(f"[TailDeck]                  http://{ip}:{PORT}/    (control only)")
+            else:
+                print(f"[TailDeck] Same-hotspot URL: http://{ip}:{PORT}/")
+
+        if tls_context is not None:
+            t = threading.Thread(
+                target=run_ws_server, kwargs={"port": TLS_PORT, "tls_context": tls_context}, daemon=True
+            )
+            t.start()
+
         run_ws_server()
     except KeyboardInterrupt:
         print("\n[TailDeck] Daemon stopped.")
