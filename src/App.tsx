@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { AlertCircle, Check, Stethoscope, Wifi, WifiOff } from 'lucide-react';
+import { AlertCircle, Check, Wifi, WifiOff } from 'lucide-react';
 import { linuxClient } from './services/linuxClient';
 import { LOCAL_HOST, IS_LOCAL_MODE, describeRoute, servedByLabel } from './services/localMode';
 import { ConnectionStatus, RemoteSettings } from './types';
@@ -317,6 +317,9 @@ export default function App() {
     if (!host || host === persistedHostRef.current) return;
     persistedHostRef.current = host;
     if (host === settings.tailscaleIp) return;
+    // The hotspot address is derived from the page origin, so storing it would
+    // only print it back into the visible address field.
+    if (host === LOCAL_HOST) return;
     handleUpdateSettings({ tailscaleIp: host });
   }, [connectionStatus.hostAddress, settings.tailscaleIp]);
 
@@ -404,6 +407,7 @@ export default function App() {
         onUpdateSettings={handleUpdateSettings}
         onToggleSimulator={() => setShowSimulator((prev) => !prev)}
         onOpenDictation={() => setIsDictationOpen(true)}
+        onOpenDiagnostics={() => setShowDiagnostics(true)}
         isSimulatorActive={showSimulator}
       />
 
@@ -488,16 +492,6 @@ export default function App() {
           <span>{speechNotice}</span>
         </button>
       )}
-
-      {/* Diagnostics trigger so a failing dictation can be inspected on device */}
-      <button
-        onClick={() => setShowDiagnostics(true)}
-        className="fixed top-3 right-3 z-30 p-2 rounded-xl bg-slate-900/80 border border-slate-700/70 text-slate-400 hover:text-sky-300 active:scale-95"
-        title="Dictation diagnostics"
-        aria-label="Dictation diagnostics"
-      >
-        <Stethoscope className="w-4 h-4" />
-      </button>
 
       {showDiagnostics && (
         <SpeechDiagnosticsPanel

@@ -20,6 +20,7 @@ import {
   Shield,
   Layers,
   Sliders,
+  Maximize,
   Keyboard,
   Monitor,
   X,
@@ -42,6 +43,45 @@ import {
   ArrowRight,
 } from 'lucide-react';
 
+const ToggleRow: React.FC<{
+  icon?: React.ReactNode;
+  label: string;
+  hint?: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+}> = ({ icon, label, hint, checked, onChange }) => (
+  <div className="space-y-1">
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      onClick={() => onChange(!checked)}
+      className="w-full flex items-center justify-between gap-3 p-3.5 rounded-xl bg-slate-900 border border-slate-800 active:scale-[0.99] transition"
+    >
+      <span className="flex items-center gap-2 font-medium text-slate-300">
+        {icon}
+        <span>{label}</span>
+      </span>
+      <span
+        className={`relative shrink-0 w-12 h-7 rounded-full border transition-colors ${
+          checked ? 'bg-sky-600 border-sky-500' : 'bg-slate-800 border-slate-700'
+        }`}
+      >
+        <span
+          className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow transition-all ${
+            checked ? 'left-6' : 'left-0.5'
+          }`}
+        />
+      </span>
+    </button>
+    {hint && <p className="text-[10px] text-slate-500 px-1">{hint}</p>}
+  </div>
+);
+
+const SectionTitle: React.FC<{ children: React.ReactNode }> = ({ children }) => (
+  <h4 className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">{children}</h4>
+);
+
 interface SideMenuDrawerProps {
   isOpen: boolean;
   onClose: () => void;
@@ -51,6 +91,7 @@ interface SideMenuDrawerProps {
   onUpdateSettings: (newSettings: Partial<RemoteSettings>) => void;
   onToggleSimulator: () => void;
   onOpenDictation: () => void;
+  onOpenDiagnostics: () => void;
   isSimulatorActive: boolean;
 }
 
@@ -63,14 +104,35 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
   onUpdateSettings,
   onToggleSimulator,
   onOpenDictation,
+  onOpenDiagnostics,
   isSimulatorActive,
 }) => {
   const { triggerClick } = useHaptics(settings.hapticFeedback, settings.soundFeedback);
   const [tailscaleIp, setTailscaleIp] = useState(connectionStatus.hostAddress || '');
   const [alertPermission, setAlertPermission] = useState<AlertPermission>(notificationSupport());
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<'tailscale' | 'keys' | 'settings'>('tailscale');
+  const [activeTab, setActiveTab] = useState<'tailscale' | 'keys' | 'settings'>('keys');
   const [quickInput, setQuickInput] = useState('');
+  const [isFullscreen, setIsFullscreen] = useState<boolean>(
+    () => typeof document !== 'undefined' && !!document.fullscreenElement,
+  );
+
+  useEffect(() => {
+    const onChange = () => setIsFullscreen(!!document.fullscreenElement);
+    document.addEventListener('fullscreenchange', onChange);
+    return () => document.removeEventListener('fullscreenchange', onChange);
+  }, []);
+
+  const toggleFullscreen = async () => {
+    triggerClick();
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      else await document.documentElement.requestFullscreen();
+    } catch {
+      // iOS Safari has no element fullscreen; the installed app is already
+      // fullscreen there, so there is nothing to do.
+    }
+  };
 
   // Drag handle gesture refs
   const drawerRef = useRef<HTMLDivElement>(null);
@@ -129,7 +191,10 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
     setQuickInput('');
   };
 
-  const oneLinerCommand = `curl -sSL "${window.location.origin}/taildeck-daemon.py" -o taildeck-daemon.py && python3 taildeck-daemon.py`;
+  // The public URL is stable. Interpolating window.location.origin put the
+  // phone's or the laptop's private hotspot IP into every copy of this command.
+  const DAEMON_URL = 'https://phy6.github.io/android-to-linux-remote/taildeck-daemon.py';
+  const oneLinerCommand = `curl -sSL "${DAEMON_URL}" -o taildeck-daemon.py && python3 taildeck-daemon.py`;
 
   // Edge drag detection on left side of screen
   useEffect(() => {
@@ -236,43 +301,29 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
           </button>
         </div>
 
-        {/* Navigation Tabs */}
-        <div className="flex border-b border-slate-800 bg-slate-900/40 px-3 pt-2 gap-1 text-xs">
-          <button
-            onClick={() => setActiveTab('tailscale')}
-            className={`pb-2.5 px-3 font-medium transition-colors border-b-2 flex items-center gap-1.5 ${
-              activeTab === 'tailscale'
-                ? 'border-sky-400 text-sky-400'
-                : 'border-transparent text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <Wifi className="w-3.5 h-3.5" />
-            <span>Tailscale</span>
-          </button>
-
-          <button
-            onClick={() => setActiveTab('keys')}
-            className={`pb-2.5 px-3 font-medium transition-colors border-b-2 flex items-center gap-1.5 ${
-              activeTab === 'keys'
-                ? 'border-sky-400 text-sky-400'
-                : 'border-transparent text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <Keyboard className="w-3.5 h-3.5" />
-            <span>Keyboard</span>
-          </button>
-
-          <button
-            onClick={() => setActiveTab('settings')}
-            className={`pb-2.5 px-3 font-medium transition-colors border-b-2 flex items-center gap-1.5 ${
-              activeTab === 'settings'
-                ? 'border-sky-400 text-sky-400'
-                : 'border-transparent text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <Sliders className="w-3.5 h-3.5" />
-            <span>Touchpad</span>
-          </button>
+        {/* Navigation Tabs: full width and tall, with the icon above the
+            label, so they can be hit by feel without reading them. */}
+        <div className="flex border-b border-slate-800 bg-slate-900/40">
+          {(
+            [
+              { id: 'keys', label: 'Keyboard', Icon: Keyboard },
+              { id: 'tailscale', label: 'Connection', Icon: Wifi },
+              { id: 'settings', label: 'Settings', Icon: Sliders },
+            ] as const
+          ).map(({ id, label, Icon }) => (
+            <button
+              key={id}
+              onClick={() => setActiveTab(id)}
+              className={`flex-1 flex flex-col items-center justify-center gap-1 py-3.5 font-medium transition-colors border-b-2 ${
+                activeTab === id
+                  ? 'border-sky-400 text-sky-400 bg-sky-500/5'
+                  : 'border-transparent text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Icon className="w-5 h-5" />
+              <span className="text-xs">{label}</span>
+            </button>
+          ))}
         </div>
 
         {/* Drawer Body Content */}
@@ -325,11 +376,6 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                         connectionStatus.connected,
                       )}
                     </div>
-                    {connectionStatus.hostAddress && (
-                      <div className="text-[10px] font-mono text-slate-500">
-                        {connectionStatus.hostAddress}
-                      </div>
-                    )}
                   </div>
                 </div>
 
@@ -369,7 +415,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                     className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl font-medium text-xs bg-emerald-600/20 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-600/30 transition"
                   >
                     <Wifi className="w-4 h-4" />
-                    <span>Same hotspot ({LOCAL_HOST})</span>
+                    <span>Connect over the hotspot</span>
                   </button>
                 )}
 
@@ -423,7 +469,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                   <span className="text-xs text-slate-300">taildeck-daemon.py</span>
                 </div>
                 <a
-                  href="/taildeck-daemon.py"
+                  href={DAEMON_URL}
                   download="taildeck-daemon.py"
                   className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 text-sky-400 text-xs font-medium hover:bg-slate-700 transition"
                 >
@@ -453,7 +499,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                   onOpenDictation();
                   onClose();
                 }}
-                className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl font-medium bg-rose-600/90 text-white hover:bg-rose-500 active:scale-95 transition"
+                className="w-full flex items-center justify-center gap-2 py-5 px-4 rounded-xl font-medium text-sm bg-rose-600/90 text-white hover:bg-rose-500 active:scale-95 transition"
               >
                 <Mic className="w-4 h-4" />
                 <span>Open full dictation sheet</span>
@@ -472,7 +518,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                   autoCapitalize="off"
                   spellCheck={false}
                   placeholder="Type here — it lands on the laptop live"
-                  className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-sky-500 font-mono"
+                  className="w-full bg-slate-900 border border-slate-800 rounded-xl px-4 py-4 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-sky-500 font-mono"
                 />
                 <p className="text-[10px] text-slate-500 px-1">
                   Sent as you type. Enter presses Return.
@@ -483,37 +529,37 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
               <div className="grid grid-cols-3 gap-1.5 pt-1">
                 <button
                   onClick={() => sendKey('Super_L')}
-                  className="py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-sky-400 font-bold active:scale-95 text-xs"
+                  className="py-5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-sky-400 font-bold active:scale-95 text-xs"
                 >
                   SUPER (Win)
                 </button>
                 <button
                   onClick={() => sendKey('Escape')}
-                  className="py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 active:scale-95 text-xs"
+                  className="py-5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 active:scale-95 text-xs"
                 >
                   ESC
                 </button>
                 <button
                   onClick={() => sendKey('Tab')}
-                  className="py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 active:scale-95 text-xs"
+                  className="py-5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 active:scale-95 text-xs"
                 >
                   TAB
                 </button>
                 <button
                   onClick={() => sendKey('Control_L')}
-                  className="py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 active:scale-95 text-xs"
+                  className="py-5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 active:scale-95 text-xs"
                 >
                   CTRL
                 </button>
                 <button
                   onClick={() => sendKey('Alt_L')}
-                  className="py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 active:scale-95 text-xs"
+                  className="py-5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 active:scale-95 text-xs"
                 >
                   ALT
                 </button>
                 <button
                   onClick={() => sendKey('BackSpace')}
-                  className="py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-rose-300 flex items-center justify-center active:scale-95"
+                  className="py-5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-rose-300 flex items-center justify-center active:scale-95"
                 >
                   <Delete className="w-4 h-4" />
                 </button>
@@ -523,28 +569,28 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
               <div className="flex items-center justify-around bg-slate-900/60 p-2 rounded-xl border border-slate-800">
                 <button
                   onClick={() => sendKey('XF86AudioMute')}
-                  className="p-2 rounded-lg hover:bg-slate-800 text-slate-400"
+                  className="p-4 rounded-lg hover:bg-slate-800 text-slate-400"
                   title="Mute"
                 >
                   <VolumeX className="w-4 h-4" />
                 </button>
                 <button
                   onClick={() => sendKey('XF86AudioLowerVolume')}
-                  className="p-2 rounded-lg hover:bg-slate-800 text-slate-400"
+                  className="p-4 rounded-lg hover:bg-slate-800 text-slate-400"
                   title="Volume Down"
                 >
                   <Volume1 className="w-4 h-4" />
                 </button>
                 <button
                   onClick={() => sendKey('XF86AudioRaiseVolume')}
-                  className="p-2 rounded-lg hover:bg-slate-800 text-slate-400"
+                  className="p-4 rounded-lg hover:bg-slate-800 text-slate-400"
                   title="Volume Up"
                 >
                   <Volume2 className="w-4 h-4" />
                 </button>
                 <button
                   onClick={() => sendKey('XF86AudioPlay')}
-                  className="p-2 rounded-lg hover:bg-slate-800 text-slate-400"
+                  className="p-4 rounded-lg hover:bg-slate-800 text-slate-400"
                   title="Play / Pause"
                 >
                   <Play className="w-4 h-4" />
@@ -555,34 +601,34 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
               <div className="flex items-center justify-center gap-2 pt-2">
                 <button
                   onClick={() => sendKey('Left')}
-                  className="p-2.5 rounded-xl bg-slate-900 border border-slate-800 text-slate-300 active:bg-slate-800"
+                  className="p-4 rounded-xl bg-slate-900 border border-slate-800 text-slate-300 active:bg-slate-800"
                 >
                   <ArrowLeft className="w-4 h-4" />
                 </button>
                 <div className="flex flex-col gap-1.5">
                   <button
                     onClick={() => sendKey('Up')}
-                    className="p-2 rounded-xl bg-slate-900 border border-slate-800 text-slate-300 active:bg-slate-800"
+                    className="p-4 rounded-xl bg-slate-900 border border-slate-800 text-slate-300 active:bg-slate-800"
                   >
                     <ArrowUp className="w-4 h-4" />
                   </button>
                   <button
                     onClick={() => sendKey('Down')}
-                    className="p-2 rounded-xl bg-slate-900 border border-slate-800 text-slate-300 active:bg-slate-800"
+                    className="p-4 rounded-xl bg-slate-900 border border-slate-800 text-slate-300 active:bg-slate-800"
                   >
                     <ArrowDown className="w-4 h-4" />
                   </button>
                 </div>
                 <button
                   onClick={() => sendKey('Right')}
-                  className="p-2.5 rounded-xl bg-slate-900 border border-slate-800 text-slate-300 active:bg-slate-800"
+                  className="p-4 rounded-xl bg-slate-900 border border-slate-800 text-slate-300 active:bg-slate-800"
                 >
                   <ArrowRight className="w-4 h-4" />
                 </button>
 
                 <button
                   onClick={() => sendKey('Return')}
-                  className="px-4 py-3 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-medium flex items-center gap-1.5 text-xs active:scale-95 ml-2"
+                  className="px-5 py-6 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-medium flex items-center gap-1.5 text-sm active:scale-95 ml-2"
                 >
                   <CornerDownLeft className="w-4 h-4" />
                   <span>ENTER</span>
@@ -591,37 +637,106 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
             </div>
           )}
 
-          {/* TAB 3: TOUCHPAD SETTINGS */}
+          {/* TAB 3: SETTINGS */}
           {activeTab === 'settings' && (
-            <div className="space-y-4 text-xs">
-              {/* Sensitivity Slider */}
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between">
+            <div className="space-y-5 text-xs">
+              <section className="space-y-3">
+                <SectionTitle>Touchpad</SectionTitle>
+
+                <div className="space-y-1.5">
                   <span className="font-semibold text-slate-300 flex items-center gap-1.5">
                     <Gauge className="w-3.5 h-3.5 text-sky-400" />
                     <span>Sensitivity: {settings.sensitivity.toFixed(1)}x</span>
                   </span>
+                  <input
+                    type="range"
+                    min="0.5"
+                    max="3.0"
+                    step="0.1"
+                    value={settings.sensitivity}
+                    onChange={(e) => onUpdateSettings({ sensitivity: parseFloat(e.target.value) })}
+                    className="w-full accent-sky-400 cursor-pointer"
+                  />
                 </div>
-                <input
-                  type="range"
-                  min="0.5"
-                  max="3.0"
-                  step="0.1"
-                  value={settings.sensitivity}
-                  onChange={(e) => onUpdateSettings({ sensitivity: parseFloat(e.target.value) })}
-                  className="w-full accent-sky-400 cursor-pointer"
-                />
-              </div>
 
-              {/* Connection Alerts */}
-              <div className="flex items-center justify-between gap-3">
-                <span className="font-semibold text-slate-300 flex items-center gap-1.5">
-                  <Bell className="w-3.5 h-3.5 text-sky-400" />
-                  <span>Connection notifications</span>
-                </span>
-                <button
-                  onClick={async () => {
-                    if (settings.connectionAlerts) {
+                <div className="space-y-1.5">
+                  <span className="font-semibold text-slate-300">
+                    Acceleration: {settings.acceleration.toFixed(2)}
+                  </span>
+                  <input
+                    type="range"
+                    min="1.0"
+                    max="2.0"
+                    step="0.05"
+                    value={settings.acceleration}
+                    onChange={(e) => onUpdateSettings({ acceleration: parseFloat(e.target.value) })}
+                    className="w-full accent-emerald-400 cursor-pointer"
+                  />
+                </div>
+
+                <div className="space-y-1.5">
+                  <span className="font-semibold text-slate-300 flex items-center gap-1.5">
+                    <Repeat2 className="w-3.5 h-3.5 text-sky-400" />
+                    <span>App switcher spacing: {settings.wheelSensitivity}px</span>
+                  </span>
+                  <input
+                    type="range"
+                    min="70"
+                    max="260"
+                    step="10"
+                    value={settings.wheelSensitivity}
+                    onChange={(e) =>
+                      onUpdateSettings({ wheelSensitivity: parseInt(e.target.value, 10) })
+                    }
+                    className="w-full accent-sky-400 cursor-pointer"
+                  />
+                  <p className="text-[10px] text-slate-500">
+                    Pixels of travel per app switch. Higher values spread the apps further apart.
+                  </p>
+                </div>
+
+                <ToggleRow
+                  label="Tap to Click"
+                  checked={settings.tapToClick}
+                  onChange={(v) => onUpdateSettings({ tapToClick: v })}
+                />
+                <ToggleRow
+                  label="Two-Finger Right Click"
+                  checked={settings.twoFingerRightClick}
+                  onChange={(v) => onUpdateSettings({ twoFingerRightClick: v })}
+                />
+                <ToggleRow
+                  label="Invert Scroll Direction"
+                  checked={settings.invertScroll}
+                  onChange={(v) => onUpdateSettings({ invertScroll: v })}
+                />
+              </section>
+
+              <section className="space-y-3 pt-4 border-t border-slate-800">
+                <SectionTitle>Feedback</SectionTitle>
+                <ToggleRow
+                  icon={<Vibrate className="w-4 h-4 text-sky-400" />}
+                  label="Haptic Vibration"
+                  checked={settings.hapticFeedback}
+                  onChange={(v) => onUpdateSettings({ hapticFeedback: v })}
+                />
+                <ToggleRow
+                  icon={<Volume2 className="w-4 h-4 text-indigo-400" />}
+                  label="Click Sounds"
+                  checked={settings.soundFeedback}
+                  onChange={(v) => onUpdateSettings({ soundFeedback: v })}
+                />
+                <ToggleRow
+                  icon={<Bell className="w-4 h-4 text-sky-400" />}
+                  label="Connection notifications"
+                  hint={
+                    alertPermission === 'denied'
+                      ? 'Blocked by the browser. Allow notifications for this site in your browser settings.'
+                      : 'Posts a system notification when the link to your laptop comes up or drops.'
+                  }
+                  checked={settings.connectionAlerts}
+                  onChange={async (v) => {
+                    if (!v) {
                       onUpdateSettings({ connectionAlerts: false });
                       return;
                     }
@@ -629,156 +744,42 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                     onUpdateSettings({ connectionAlerts: permission === 'granted' });
                     setAlertPermission(permission);
                   }}
-                  className={`px-2.5 py-1 rounded-lg text-[11px] font-medium border transition ${
-                    settings.connectionAlerts
-                      ? 'bg-sky-600/80 border-sky-500/60 text-white'
-                      : 'bg-slate-800 border-slate-700 text-slate-400'
-                  }`}
-                >
-                  {settings.connectionAlerts ? 'On' : 'Off'}
-                </button>
-              </div>
-              <p className="text-[10px] text-slate-500 -mt-2">
-                {alertPermission === 'denied'
-                  ? 'Blocked by the browser. Allow notifications for this site in your browser settings.'
-                  : 'Posts a system notification when the link to your laptop comes up or drops.'}
-              </p>
-
-              {/* Mic Button Behaviour */}
-              <div className="flex items-start gap-1.5">
-                <Mic className="w-3.5 h-3.5 text-sky-400 mt-0.5 shrink-0" />
-                <p className="text-[10px] text-slate-500 leading-relaxed">
-                  The mic button always talks while you hold it and sends when you let go.
-                </p>
-              </div>
-
-              {/* Auto Connect */}
-              <div className="flex items-center justify-between gap-3">
-                <span className="font-semibold text-slate-300 flex items-center gap-1.5">
-                  <Wifi className="w-3.5 h-3.5 text-sky-400" />
-                  <span>Reconnect on open</span>
-                </span>
-                <button
-                  onClick={() => onUpdateSettings({ autoConnect: !settings.autoConnect })}
-                  className={`px-2.5 py-1 rounded-lg text-[11px] font-medium border transition ${
-                    settings.autoConnect
-                      ? 'bg-sky-600/80 border-sky-500/60 text-white'
-                      : 'bg-slate-800 border-slate-700 text-slate-400'
-                  }`}
-                >
-                  {settings.autoConnect ? 'On' : 'Off'}
-                </button>
-              </div>
-              <p className="text-[10px] text-slate-500 -mt-2">
-                The host address is remembered automatically once you connect.
-              </p>
-
-              {/* App Switcher Travel Distance */}
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <span className="font-semibold text-slate-300 flex items-center gap-1.5">
-                    <Repeat2 className="w-3.5 h-3.5 text-sky-400" />
-                    <span>App switcher spacing: {settings.wheelSensitivity}px</span>
-                  </span>
-                </div>
-                <input
-                  type="range"
-                  min="70"
-                  max="260"
-                  step="10"
-                  value={settings.wheelSensitivity}
-                  onChange={(e) =>
-                    onUpdateSettings({ wheelSensitivity: parseInt(e.target.value, 10) })
-                  }
-                  className="w-full accent-sky-400 cursor-pointer"
                 />
-                <p className="text-[10px] text-slate-500">
-                  Pixels of travel per app switch. Higher values spread the apps further apart.
-                </p>
-              </div>
+              </section>
 
-              {/* Acceleration Curve */}
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <span className="font-semibold text-slate-300">
-                    Acceleration: {settings.acceleration.toFixed(2)}
-                  </span>
-                </div>
-                <input
-                  type="range"
-                  min="1.0"
-                  max="2.0"
-                  step="0.05"
-                  value={settings.acceleration}
-                  onChange={(e) => onUpdateSettings({ acceleration: parseFloat(e.target.value) })}
-                  className="w-full accent-emerald-400 cursor-pointer"
+              <section className="space-y-3 pt-4 border-t border-slate-800">
+                <SectionTitle>App</SectionTitle>
+                <ToggleRow
+                  icon={<Wifi className="w-4 h-4 text-sky-400" />}
+                  label="Reconnect on open"
+                  hint="The host address is remembered automatically once you connect."
+                  checked={settings.autoConnect}
+                  onChange={(v) => onUpdateSettings({ autoConnect: v })}
                 />
-              </div>
+                <ToggleRow
+                  icon={<Maximize className="w-4 h-4 text-sky-400" />}
+                  label="Full screen"
+                  hint="Hides the browser chrome. Installed copies already open full screen."
+                  checked={isFullscreen}
+                  onChange={() => void toggleFullscreen()}
+                />
 
-              {/* Toggles */}
-              <div className="space-y-2 pt-2 border-t border-slate-800">
-                <label className="flex items-center justify-between p-2.5 rounded-xl bg-slate-900 border border-slate-800 cursor-pointer">
-                  <div className="flex items-center gap-2">
-                    <Vibrate className="w-4 h-4 text-sky-400" />
-                    <span className="font-medium text-slate-300">Haptic Vibration</span>
-                  </div>
-                  <input
-                    type="checkbox"
-                    checked={settings.hapticFeedback}
-                    onChange={(e) => onUpdateSettings({ hapticFeedback: e.target.checked })}
-                    className="w-4 h-4 accent-sky-500 rounded"
-                  />
-                </label>
-
-                <label className="flex items-center justify-between p-2.5 rounded-xl bg-slate-900 border border-slate-800 cursor-pointer">
-                  <div className="flex items-center gap-2">
-                    <Volume2 className="w-4 h-4 text-indigo-400" />
-                    <span className="font-medium text-slate-300">Click Sounds</span>
-                  </div>
-                  <input
-                    type="checkbox"
-                    checked={settings.soundFeedback}
-                    onChange={(e) => onUpdateSettings({ soundFeedback: e.target.checked })}
-                    className="w-4 h-4 accent-indigo-500 rounded"
-                  />
-                </label>
-
-                <label className="flex items-center justify-between p-2.5 rounded-xl bg-slate-900 border border-slate-800 cursor-pointer">
-                  <span className="font-medium text-slate-300">Tap to Click</span>
-                  <input
-                    type="checkbox"
-                    checked={settings.tapToClick}
-                    onChange={(e) => onUpdateSettings({ tapToClick: e.target.checked })}
-                    className="w-4 h-4 accent-sky-500 rounded"
-                  />
-                </label>
-
-                <label className="flex items-center justify-between p-2.5 rounded-xl bg-slate-900 border border-slate-800 cursor-pointer">
-                  <span className="font-medium text-slate-300">Two-Finger Right Click</span>
-                  <input
-                    type="checkbox"
-                    checked={settings.twoFingerRightClick}
-                    onChange={(e) => onUpdateSettings({ twoFingerRightClick: e.target.checked })}
-                    className="w-4 h-4 accent-sky-500 rounded"
-                  />
-                </label>
-
-                <label className="flex items-center justify-between p-2.5 rounded-xl bg-slate-900 border border-slate-800 cursor-pointer">
-                  <span className="font-medium text-slate-300">Invert Scroll Direction</span>
-                  <input
-                    type="checkbox"
-                    checked={settings.invertScroll}
-                    onChange={(e) => onUpdateSettings({ invertScroll: e.target.checked })}
-                    className="w-4 h-4 accent-sky-500 rounded"
-                  />
-                </label>
-              </div>
-
-              {/* Linux Desktop Simulator Toggle */}
-              <div className="pt-2">
                 <button
+                  type="button"
+                  onClick={() => {
+                    onOpenDiagnostics();
+                    onClose();
+                  }}
+                  className="w-full py-3.5 px-3 rounded-xl border border-slate-800 bg-slate-900 text-slate-300 hover:bg-slate-800 flex items-center justify-center gap-2 font-medium transition"
+                >
+                  <Activity className="w-4 h-4 text-sky-400" />
+                  <span>Dictation diagnostics</span>
+                </button>
+
+                <button
+                  type="button"
                   onClick={onToggleSimulator}
-                  className={`w-full py-2.5 px-3 rounded-xl border flex items-center justify-center gap-2 text-xs font-medium transition ${
+                  className={`w-full py-3.5 px-3 rounded-xl border flex items-center justify-center gap-2 font-medium transition ${
                     isSimulatorActive
                       ? 'bg-sky-500/20 border-sky-400 text-sky-300'
                       : 'bg-slate-900 border-slate-800 text-slate-300 hover:bg-slate-800'
@@ -787,7 +788,11 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                   <Monitor className="w-4 h-4" />
                   <span>{isSimulatorActive ? 'Hide Desktop Simulator' : 'Show Desktop Simulator'}</span>
                 </button>
-              </div>
+
+                <p className="text-[10px] text-slate-500 px-1">
+                  TailDeck {__BUILD_SHA__}
+                </p>
+              </section>
             </div>
           )}
         </div>

@@ -4,6 +4,11 @@ import { useHaptics } from '../hooks/useHaptics';
 
 const LONG_PRESS_MS = 320;
 
+// A press is a press even if the finger rolls. The old 5px threshold made the
+// button cancel dictation on the slightest movement, which forced you to look
+// at the screen to land it. 22px is about a thumb's natural drift.
+const DRAG_CANCEL_PX = 22;
+
 interface FloatingDictationButtonProps {
   onTriggerDictation: () => void;
   hapticsEnabled: boolean;
@@ -87,7 +92,7 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
     const dx = e.clientX - dragRef.current.startX;
     const dy = e.clientY - dragRef.current.startY;
 
-    if (Math.hypot(dx, dy) > 5) {
+    if (Math.hypot(dx, dy) > DRAG_CANCEL_PX) {
       // Movement cancels push-to-talk so dragging never starts dictation.
       if (pttEngagedRef.current) {
         pttEngagedRef.current = false;
@@ -172,7 +177,7 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
         role="button"
         tabIndex={0}
         aria-label={isPttLabel}
-        className={`relative w-14 h-14 rounded-full flex items-center justify-center shadow-[0_6px_20px_rgba(0,0,0,0.6)] border transition-all ${
+        className={`relative w-[84px] h-[84px] rounded-full flex items-center justify-center shadow-[0_6px_20px_rgba(0,0,0,0.6)] border transition-all ${
           isPressing ? 'scale-95' : ''
         } ${
           active
@@ -182,10 +187,10 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
       >
         {/* Pulsing halo while the push-to-talk session is live */}
         {active && (
-          <span className="absolute -inset-2 rounded-full border-2 border-rose-500/60 animate-ping pointer-events-none" />
+          <span className="absolute -inset-3 rounded-full border-2 border-rose-500/60 animate-ping pointer-events-none" />
         )}
 
-        <Mic className={`w-6 h-6 ${active ? 'animate-bounce' : ''}`} />
+        <Mic className={`w-9 h-9 ${active ? 'animate-bounce' : ''}`} />
       </div>
 
       {/* Hold hint, only while pressing so it never clutters the deck */}
