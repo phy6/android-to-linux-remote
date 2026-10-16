@@ -45,6 +45,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
         run: |
           bun run build -- --outDir dist-webroot --emptyOutDir
+          rm -f dist-webroot/version.json
           tar czf dist/taildeck-web.tar.gz -C dist-webroot .
 
       - name: Stamp the release manifest with the bundle checksum
