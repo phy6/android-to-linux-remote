@@ -3,8 +3,11 @@ import { ConnectionStatus, RemoteSettings, SessionType } from '../types';
 import { linuxClient } from '../services/linuxClient';
 import { LOCAL_HOST, IS_LOCAL_MODE, describeRoute } from '../services/localMode';
 import { useSavedLaptops } from '../services/savedLaptops';
+import { decodePairing } from '../services/pairing';
 import { useHaptics } from '../hooks/useHaptics';
 import { PWAInstallButton } from './PWAInstallButton';
+import { PairingCodeModal } from './PairingCodeModal';
+import { ScanPairingModal } from './ScanPairingModal';
 import {
   notificationSupport,
   requestNotificationPermission,
@@ -51,6 +54,8 @@ import {
   Rocket,
   Wrench,
   ExternalLink,
+  QrCode,
+  ScanLine,
 } from 'lucide-react';
 
 const ToggleRow: React.FC<{
@@ -129,6 +134,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
   const [alertPermission, setAlertPermission] = useState<AlertPermission>(notificationSupport());
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'tailscale' | 'keys' | 'settings' | 'help'>('keys');
+  const [pairMode, setPairMode] = useState<'show' | 'scan' | null>(null);
   const [quickInput, setQuickInput] = useState('');
   const quickInputRef = useRef<HTMLInputElement>(null);
   const [isFullscreen, setIsFullscreen] = useState<boolean>(
@@ -182,6 +188,18 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
   const handleDisconnect = () => {
     triggerClick();
     linuxClient.disconnect();
+  };
+
+  // A scanned pairing code connects straight away; returning false tells the
+  // scanner the code was not a TailDeck one so it keeps looking.
+  const handleScanResult = (raw: string): boolean => {
+    const payload = decodePairing(raw);
+    if (!payload) return false;
+    triggerClick();
+    setPairMode(null);
+    linuxClient.connect(payload.h);
+    onClose();
+    return true;
   };
 
   const copyToClipboard = (text: string, id: string) => {
@@ -630,6 +648,39 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                   </button>
                 )}
               </form>
+
+              {/* QR pairing: the phone scans a code shown on the laptop, so
+                  connecting never means typing an address. */}
+              <div className="space-y-2 pt-2 border-t border-slate-800">
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      triggerClick();
+                      setPairMode('show');
+                    }}
+                    className="py-2.5 px-3 rounded-xl font-medium text-xs bg-slate-900 border border-slate-800 text-slate-300 hover:bg-slate-800 flex items-center justify-center gap-2 transition"
+                  >
+                    <QrCode className="w-4 h-4 text-sky-400" />
+                    <span>Show a code</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      triggerClick();
+                      setPairMode('scan');
+                    }}
+                    className="py-2.5 px-3 rounded-xl font-medium text-xs bg-slate-900 border border-slate-800 text-slate-300 hover:bg-slate-800 flex items-center justify-center gap-2 transition"
+                  >
+                    <ScanLine className="w-4 h-4 text-emerald-400" />
+                    <span>Scan a code</span>
+                  </button>
+                </div>
+                <p className="text-[10px] text-slate-500 leading-relaxed">
+                  Show a code on the laptop, then scan it from the phone. Prefers the address that
+                  skips the certificate warning.
+                </p>
+              </div>
 
               {/* Prepare a machine that has never run TailDeck. Unlike the plain
                   one-liner below, this also sets up an input backend and a
@@ -1229,6 +1280,20 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Pairing modals sit outside the drawer so they can cover the whole screen. */}
+      <PairingCodeModal
+        isOpen={pairMode === 'show'}
+        onClose={() => setPairMode(null)}
+        status={connectionStatus}
+        hostname={connectionStatus.hostOsInfo?.hostname}
+        onCopied={triggerClick}
+      />
+      <ScanPairingModal
+        isOpen={pairMode === 'scan'}
+        onClose={() => setPairMode(null)}
+        onResult={handleScanResult}
+      />
     </>
   );
 };
