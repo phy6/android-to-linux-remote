@@ -351,8 +351,27 @@ export default function App() {
         settings={settings}
         onUpdateSettings={handleUpdateSettings}
         onToggleSimulator={() => setShowSimulator((prev) => !prev)}
+        onOpenDictation={() => setIsDictationOpen(true)}
         isSimulatorActive={showSimulator}
       />
+
+      {/* Full-screen listening state: the mic button sits under the thumb, so
+          the deck itself has to show what is happening. */}
+      {isPttActive && (
+        <div className="fixed inset-0 z-20 pointer-events-none flex flex-col items-center justify-center">
+          <div className="absolute inset-0 bg-rose-950/25" />
+          <div className="relative flex items-center gap-3 px-5 py-3 rounded-2xl bg-slate-950/85 border border-rose-500/50 shadow-lg shadow-black/60">
+            <span className="relative flex h-3 w-3">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-75" />
+              <span className="relative inline-flex rounded-full h-3 w-3 bg-rose-500" />
+            </span>
+            <span className="text-sm font-medium text-rose-100">Listening…</span>
+          </div>
+          <p className="relative mt-3 text-[11px] text-rose-200/70">
+            Release to send to your laptop
+          </p>
+        </div>
+      )}
 
       {/* Fallback banner when the system notification is unavailable */}
       {toast && (

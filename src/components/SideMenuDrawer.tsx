@@ -50,6 +50,7 @@ interface SideMenuDrawerProps {
   settings: RemoteSettings;
   onUpdateSettings: (newSettings: Partial<RemoteSettings>) => void;
   onToggleSimulator: () => void;
+  onOpenDictation: () => void;
   isSimulatorActive: boolean;
 }
 
@@ -61,6 +62,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
   settings,
   onUpdateSettings,
   onToggleSimulator,
+  onOpenDictation,
   isSimulatorActive,
 }) => {
   const { triggerClick } = useHaptics(settings.hapticFeedback, settings.soundFeedback);
@@ -392,6 +394,20 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
           {/* TAB 2: REMOTE KEYBOARD & HOTKEYS */}
           {activeTab === 'keys' && (
             <div className="space-y-3 text-xs">
+              {/* The floating mic is push-to-talk only, so the full dictation
+                  sheet is opened from here instead. */}
+              <button
+                type="button"
+                onClick={() => {
+                  onOpenDictation();
+                  onClose();
+                }}
+                className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl font-medium bg-rose-600/90 text-white hover:bg-rose-500 active:scale-95 transition"
+              >
+                <Mic className="w-4 h-4" />
+                <span>Open full dictation sheet</span>
+              </button>
+
               {/* Quick Text Type to Laptop */}
               <form onSubmit={handleSendText} className="flex gap-2">
                 <input

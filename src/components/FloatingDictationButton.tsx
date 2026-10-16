@@ -10,7 +10,7 @@ interface FloatingDictationButtonProps {
   soundEnabled: boolean;
   isListening?: boolean;
   isPushToTalkActive?: boolean;
-  /** true: hold to talk then release to send. false: tap to talk, release to send. */
+  /** Kept for compatibility; push-to-talk now always starts on touch-down. */
   holdToTalk?: boolean;
   onPushToTalkStart: () => void;
   onPushToTalkEnd: () => void;
@@ -42,7 +42,7 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
 
   const [isDragging, setIsDragging] = useState(false);
   const [isPressing, setIsPressing] = useState(false);
-  const isPttLabel = holdToTalk ? 'Hold to talk. Tap for full dictation.' : 'Tap to talk.';
+  const isPttLabel = 'Push to talk. Release to send.';
   const dragRef = useRef<{
     startX: number;
     startY: number;
@@ -75,20 +75,13 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
     setIsPressing(true);
     (e.target as HTMLElement).setPointerCapture(e.pointerId);
 
-    const engage = () => {
-      longPressTimerRef.current = null;
-      if (dragRef.current?.hasMoved) return;
+    // Start talking the instant a finger lands. Waiting for a hold threshold
+    // made a normal press fall through to the dictation sheet instead, which is
+    // exactly the behaviour this button is meant to avoid.
+    if (!dragRef.current.hasMoved) {
       pttEngagedRef.current = true;
       triggerDictationEngaged();
       onPushToTalkStart();
-    };
-
-    if (holdToTalk) {
-      // Hold to talk: engage push-to-talk once the hold threshold is reached.
-      longPressTimerRef.current = window.setTimeout(engage, LONG_PRESS_MS);
-    } else {
-      // Tap to talk: engage immediately on touch.
-      engage();
     }
   };
 
@@ -132,10 +125,6 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
       // Saved dragged position
       localStorage.setItem('taildeck_floating_mic_pos', JSON.stringify(pos));
       triggerClick();
-    } else if (holdToTalk) {
-      // Clean tap in hold-to-talk mode -> open the full dictation sheet
-      triggerDictationEngaged();
-      onTriggerDictation();
     }
 
     setIsPressing(false);
@@ -205,7 +194,7 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
       {/* Hold hint, only while pressing so it never clutters the deck */}
       {isPressing && (
         <span className="absolute left-1/2 top-full mt-2 -translate-x-1/2 whitespace-nowrap text-[10px] font-medium text-sky-200/90 bg-slate-900/90 border border-sky-500/30 rounded-full px-2 py-0.5 pointer-events-none">
-          {holdToTalk ? 'Hold to talk' : 'Tap to talk'}
+          Listening
         </span>
       )}
     </div>
