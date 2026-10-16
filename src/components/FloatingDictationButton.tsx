@@ -177,7 +177,7 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
         role="button"
         tabIndex={0}
         aria-label={isPttLabel}
-        className={`relative w-[84px] h-[84px] rounded-full flex items-center justify-center shadow-[0_6px_20px_rgba(0,0,0,0.6)] border transition-all ${
+        className={`relative w-[104px] h-[104px] rounded-full flex items-center justify-center shadow-[0_6px_20px_rgba(0,0,0,0.6)] border transition-all ${
           isPressing ? 'scale-95' : ''
         } ${
           active
@@ -190,7 +190,7 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
           <span className="absolute -inset-3 rounded-full border-2 border-rose-500/60 animate-ping pointer-events-none" />
         )}
 
-        <Mic className={`w-9 h-9 ${active ? 'animate-bounce' : ''}`} />
+        <Mic className={`w-11 h-11 ${active ? 'animate-bounce' : ''}`} />
       </div>
 
       {/* Hold hint, only while pressing so it never clutters the deck */}

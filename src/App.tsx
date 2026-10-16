@@ -14,6 +14,7 @@ import { FloatingDictationButton } from './components/FloatingDictationButton';
 import { DictationModal } from './components/DictationModal';
 import { SideMenuDrawer } from './components/SideMenuDrawer';
 import { LinuxSimulator } from './components/LinuxSimulator';
+import { DarkOut } from './components/DarkOut';
 import { useSpeechRecognition } from './hooks/useSpeechRecognition';
 import {
   notificationSupport,
@@ -64,6 +65,7 @@ export default function App() {
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
   const [isDictationOpen, setIsDictationOpen] = useState(false);
   const [showSimulator, setShowSimulator] = useState(false);
+  const [darkOut, setDarkOut] = useState(false);
   const [isPttActive, setIsPttActive] = useState(false);
   const [pttPhase, setPttPhase] = useState<'idle' | 'listening' | 'transcribing'>('idle');
   const [pttTranscript, setPttTranscript] = useState<string | null>(null);
@@ -360,6 +362,21 @@ export default function App() {
     });
   };
 
+  // Dark-out blacks the panel but keeps the app foregrounded and awake, so the
+  // websocket survives. Go fullscreen in the same tap that triggers this, or
+  // the browser chrome would sit bright above an otherwise black screen.
+  const enterDarkOut = useCallback(() => {
+    try {
+      if (!document.fullscreenElement) {
+        void document.documentElement.requestFullscreen().catch(() => {});
+      }
+    } catch {
+      // iOS Safari has no element fullscreen; installed copies already are.
+    }
+    setIsDrawerOpen(false);
+    setDarkOut(true);
+  }, []);
+
   return (
     <div className="flex flex-col h-[100dvh] w-full bg-slate-950 text-slate-100 font-sans select-none overflow-hidden touch-none relative">
       {/* Main Remote Deck (Clean, Unmarked, Edge-to-Edge) */}
@@ -409,6 +426,7 @@ export default function App() {
         onOpenDictation={() => setIsDictationOpen(true)}
         onOpenDiagnostics={() => setShowDiagnostics(true)}
         isSimulatorActive={showSimulator}
+        onEnterDarkOut={enterDarkOut}
       />
 
       {/* Full-screen push-to-talk state: the mic button sits under the thumb,
@@ -560,6 +578,10 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* Dark-out overlay: black the whole panel, exit with a swipe up from the
+          bottom edge. Rendered last so it covers every other layer. */}
+      <DarkOut active={darkOut} onExit={() => setDarkOut(false)} />
     </div>
   );
 }

@@ -23,6 +23,7 @@ import {
   Maximize,
   Keyboard,
   Monitor,
+  Moon,
   X,
   ChevronRight,
   ChevronLeft,
@@ -97,6 +98,7 @@ interface SideMenuDrawerProps {
   onOpenDictation: () => void;
   onOpenDiagnostics: () => void;
   isSimulatorActive: boolean;
+  onEnterDarkOut: () => void;
 }
 
 export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
@@ -110,6 +112,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
   onOpenDictation,
   onOpenDiagnostics,
   isSimulatorActive,
+  onEnterDarkOut,
 }) => {
   const { triggerClick } = useHaptics(settings.hapticFeedback, settings.soundFeedback);
   const [tailscaleIp, setTailscaleIp] = useState(connectionStatus.hostAddress || '');
@@ -117,6 +120,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'tailscale' | 'keys' | 'settings'>('keys');
   const [quickInput, setQuickInput] = useState('');
+  const quickInputRef = useRef<HTMLInputElement>(null);
   const [isFullscreen, setIsFullscreen] = useState<boolean>(
     () => typeof document !== 'undefined' && !!document.fullscreenElement,
   );
@@ -126,6 +130,15 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
     document.addEventListener('fullscreenchange', onChange);
     return () => document.removeEventListener('fullscreenchange', onChange);
   }, []);
+
+  // Opening the drawer on the Keyboard tab should summon the phone's own
+  // keyboard immediately, so the big buttons sit ready above it. The short
+  // delay lets the slide-in animation settle before focus rearranges the view.
+  useEffect(() => {
+    if (!isOpen || activeTab !== 'keys') return;
+    const t = window.setTimeout(() => quickInputRef.current?.focus(), 320);
+    return () => window.clearTimeout(t);
+  }, [isOpen, activeTab]);
 
   const toggleFullscreen = async () => {
     triggerClick();
@@ -596,24 +609,13 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
           {/* TAB 2: REMOTE KEYBOARD & HOTKEYS */}
           {activeTab === 'keys' && (
             <div className="space-y-3 text-xs">
-              {/* The floating mic is push-to-talk only, so the full dictation
-                  sheet is opened from here instead. */}
-              <button
-                type="button"
-                onClick={() => {
-                  onOpenDictation();
-                  onClose();
-                }}
-                className="w-full flex items-center justify-center gap-2 py-5 px-4 rounded-xl font-medium text-sm bg-rose-600/90 text-white hover:bg-rose-500 active:scale-95 transition"
-              >
-                <Mic className="w-4 h-4" />
-                <span>Open full dictation sheet</span>
-              </button>
-
-              {/* Live keyboard: every keystroke is typed on the laptop as you
-                  press it, and Enter presses Return there. */}
+              {/* Live keyboard first, focused on open, so the phone's own
+                  keyboard rises with the big buttons sitting ready above it.
+                  Every keystroke is typed on the laptop as you press it; Enter
+                  presses Return there. */}
               <div className="space-y-1">
                 <input
+                  ref={quickInputRef}
                   type="text"
                   value={quickInput}
                   onChange={handleQuickInput}
@@ -623,7 +625,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                   autoCapitalize="off"
                   spellCheck={false}
                   placeholder="Type here — it lands on the laptop live"
-                  className="w-full bg-slate-900 border border-slate-800 rounded-xl px-4 py-4 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-sky-500 font-mono"
+                  className="w-full bg-slate-900 border border-slate-800 rounded-xl px-4 py-4 text-base text-white placeholder-slate-500 focus:outline-none focus:border-sky-500 font-mono"
                 />
                 <p className="text-[10px] text-slate-500 px-1">
                   Sent as you type. Enter presses Return.
@@ -739,6 +741,31 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                   <span>ENTER</span>
                 </button>
               </div>
+
+              {/* Dark-out: paint the panel black so it reads as off, staying in
+                  the foreground and awake so the laptop link never drops. */}
+              <button
+                type="button"
+                onClick={onEnterDarkOut}
+                className="w-full flex items-center justify-center gap-2 py-4 px-4 rounded-xl font-medium text-xs bg-slate-900 border border-slate-800 text-slate-300 hover:bg-slate-800 active:scale-95 transition"
+              >
+                <Moon className="w-4 h-4 text-indigo-300" />
+                <span>Dark-out — screen looks off</span>
+              </button>
+
+              {/* The floating mic is push-to-talk only, so the full dictation
+                  sheet is opened from here instead. */}
+              <button
+                type="button"
+                onClick={() => {
+                  onOpenDictation();
+                  onClose();
+                }}
+                className="w-full flex items-center justify-center gap-2 py-5 px-4 rounded-xl font-medium text-sm bg-rose-600/90 text-white hover:bg-rose-500 active:scale-95 transition"
+              >
+                <Mic className="w-4 h-4" />
+                <span>Open full dictation sheet</span>
+              </button>
             </div>
           )}
 
