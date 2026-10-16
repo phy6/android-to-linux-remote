@@ -6,7 +6,7 @@ const HOSTED_HOSTS = ['phy6.github.io', 'localhost', '127.0.0.1'];
 
 // Tailscale hands out CGNAT addresses (100.64.0.0/10); those are not reachable
 // from a phone that is merely on the same hotspot.
-function isTailnetIp(ip: string): boolean {
+export function isTailnetIp(ip: string): boolean {
   const parts = ip.split('.').map(Number);
   return parts.length === 4 && parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127;
 }
@@ -70,6 +70,31 @@ export function pairingRoutes(status: ConnectionStatus, originHost?: string): Pa
   }
 
   return routes;
+}
+
+/**
+ * The hosts to try, best first, when the app reconnects on its own. With
+ * preferLocal the same-hotspot link comes first (fast, free of mobile data)
+ * and the tailnet name is the fallback, so a self-signed link the phone has
+ * not been taught still ends up on the working Tailscale route.
+ */
+export function autoconnectOrder(opts: {
+  localHost?: string;
+  saved?: { host?: string; alt?: string[]; tailnet?: string | null } | null;
+  fallbackHost?: string;
+  preferLocal: boolean;
+}): string[] {
+  const out: string[] = [];
+  const add = (h?: string | null) => {
+    const c = (h || '').trim();
+    if (c && !out.includes(c)) out.push(c);
+  };
+  add(opts.localHost);
+  if (opts.preferLocal) (opts.saved?.alt ?? []).forEach(add);
+  add(opts.saved?.tailnet);
+  add(opts.fallbackHost);
+  add(opts.saved?.host);
+  return out;
 }
 
 export function encodePairing(host: string, name?: string): string {

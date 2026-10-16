@@ -4,7 +4,8 @@ import { AlertCircle, Check, Wifi, WifiOff } from 'lucide-react';
 import { useRegisterSW } from 'virtual:pwa-register/react';
 import { linuxClient } from './services/linuxClient';
 import { LOCAL_HOST, IS_LOCAL_MODE, describeRoute, servedByLabel } from './services/localMode';
-import { rememberLaptop } from './services/savedLaptops';
+import { rememberLaptop, loadSavedLaptops } from './services/savedLaptops';
+import { autoconnectOrder, isTailnetIp } from './services/pairing';
 import { ConnectionStatus, RemoteSettings } from './types';
 import {
   HorizontalScrollWheel,
@@ -46,6 +47,7 @@ const DEFAULT_SETTINGS: RemoteSettings = {
   wheelSensitivity: DEFAULT_WHEEL_SPACING,
   tailscaleIp: '',
   autoConnect: true,
+  preferLocal: true,
   connectionAlerts: true,
   buttonScale: DEFAULT_BUTTON_SCALE,
 };
@@ -342,17 +344,88 @@ export default function App() {
     return unsub;
   }, []);
 
-  // Reconnect on launch so the deck is usable immediately. When the app was
-  // served by the laptop itself the local address wins: it is on the hotspot,
-  // so it is faster, free of mobile data, and needs no tailnet at all.
+  // Reconnect on launch so the deck is usable immediately. The phone tries the
+  // same-hotspot link first (fast, free of mobile data) and falls back to the
+  // tailnet name, so a self-signed link it has not been taught still lands on
+  // the working Tailscale route instead of just failing.
   const didAutoConnectRef = useRef(false);
+  const connectChainRef = useRef<{ hosts: string[]; index: number } | null>(null);
+  const connectTimerRef = useRef<number | null>(null);
+
+  const clearConnectTimer = () => {
+    if (connectTimerRef.current !== null) {
+      window.clearTimeout(connectTimerRef.current);
+      connectTimerRef.current = null;
+    }
+  };
+
+  const armConnectTimer = (host: string) => {
+    clearConnectTimer();
+    connectTimerRef.current = window.setTimeout(() => {
+      if (!linuxClient.getStatus().connected) advanceConnect(host);
+    }, 3500);
+  };
+
+  const advanceConnect = (failedHost: string) => {
+    const chain = connectChainRef.current;
+    // Stale signal (we already moved past this host): ignore it.
+    if (!chain || chain.hosts[chain.index] !== failedHost) return;
+    clearConnectTimer();
+    if (chain.index >= chain.hosts.length - 1) {
+      connectChainRef.current = null;
+      return;
+    }
+    chain.index += 1;
+    const host = chain.hosts[chain.index];
+    linuxClient.connect(host);
+    armConnectTimer(host);
+  };
+
+  const connectPreferred = (hosts: string[]) => {
+    const list = hosts.map((h) => h.trim()).filter(Boolean);
+    if (!list.length) return;
+    connectChainRef.current = { hosts: list, index: 0 };
+    linuxClient.connect(list[0]);
+    armConnectTimer(list[0]);
+  };
+
   useEffect(() => {
     if (didAutoConnectRef.current) return;
     didAutoConnectRef.current = true;
-    const host = LOCAL_HOST || settings.tailscaleIp?.trim();
-    if (!settings.autoConnect || !host) return;
-    linuxClient.connect(host);
-  }, [settings.autoConnect, settings.tailscaleIp]);
+    if (!settings.autoConnect) return;
+    const saved =
+      loadSavedLaptops().find((l) => l.host === settings.tailscaleIp) ??
+      loadSavedLaptops()[0] ??
+      null;
+    const hosts = autoconnectOrder({
+      localHost: LOCAL_HOST,
+      saved,
+      fallbackHost: settings.tailscaleIp,
+      preferLocal: settings.preferLocal,
+    });
+    if (hosts.length) connectPreferred(hosts);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings.autoConnect, settings.tailscaleIp, settings.preferLocal]);
+
+  // Let a failed attempt (or a hung one) hand off to the next candidate. A host
+  // we never asked for means the user connected by hand, so the chain stands down.
+  useEffect(() => {
+    const chain = connectChainRef.current;
+    if (!chain) return;
+    if (connectionStatus.connected) {
+      connectChainRef.current = null;
+      clearConnectTimer();
+      return;
+    }
+    if (connectionStatus.connecting) return;
+    if (!chain.hosts.includes(connectionStatus.hostAddress)) {
+      connectChainRef.current = null;
+      clearConnectTimer();
+      return;
+    }
+    advanceConnect(connectionStatus.hostAddress);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connectionStatus.connected, connectionStatus.connecting, connectionStatus.error, connectionStatus.hostAddress]);
 
   // Remember whichever host actually answered, so the address is never retyped.
   const persistedHostRef = useRef<string | null>(null);
@@ -436,10 +509,20 @@ export default function App() {
   }, [showToast]);
 
   // Remember every laptop we actually reach, so the drawer can offer it again
-  // with one tap instead of retyping an address or a tailnet name.
+  // with one tap instead of retyping an address or a tailnet name. The other
+  // routes it answered on are kept too, so the next launch can try the local
+  // link first and fall back to Tailscale.
   useEffect(() => {
     if (!connectionStatus.connected || !connectionStatus.hostAddress) return;
-    rememberLaptop(connectionStatus.hostAddress, connectionStatus.hostOsInfo?.hostname ?? '');
+    const info = connectionStatus.hostOsInfo;
+    const httpsPort = info?.ports?.https ?? 8443;
+    const alt = (info?.addresses ?? [])
+      .filter((ip) => !isTailnetIp(ip))
+      .map((ip) => `${ip}:${httpsPort}`);
+    rememberLaptop(connectionStatus.hostAddress, info?.hostname ?? '', {
+      alt,
+      tailnet: info?.tailnet ?? null,
+    });
   }, [
     connectionStatus.connected,
     connectionStatus.hostAddress,

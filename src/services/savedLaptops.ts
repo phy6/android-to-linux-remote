@@ -7,6 +7,10 @@ export interface SavedLaptop {
   name: string;
   /** Epoch ms of the last successful connection, for ordering. */
   last: number;
+  /** Other same-hotspot addresses this laptop answered on last time (ip:port). */
+  alt?: string[];
+  /** The laptop's tailnet name, when it reported one. */
+  tailnet?: string | null;
 }
 
 const STORAGE_KEY = 'taildeck_saved_laptops';
@@ -34,12 +38,20 @@ function persist(list: SavedLaptop[]): void {
 }
 
 /** Move this laptop to the front of the list, updating its name and timestamp. */
-export function rememberLaptop(host: string, name: string): SavedLaptop[] {
+export function rememberLaptop(
+  host: string,
+  name: string,
+  extra?: { alt?: string[]; tailnet?: string | null },
+): SavedLaptop[] {
   const clean = host.trim();
   if (!clean) return loadSavedLaptops();
   const label = name.trim() || clean;
   const rest = loadSavedLaptops().filter((l) => l.host !== clean);
-  const next = [{ host: clean, name: label, last: Date.now() }, ...rest].slice(0, MAX_LAPTOPS);
+  const alt = (extra?.alt ?? []).filter((a) => a && a !== clean);
+  const next = [
+    { host: clean, name: label, last: Date.now(), alt, tailnet: extra?.tailnet ?? null },
+    ...rest,
+  ].slice(0, MAX_LAPTOPS);
   persist(next);
   return next;
 }

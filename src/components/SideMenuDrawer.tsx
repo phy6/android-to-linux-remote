@@ -1142,6 +1142,13 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                   onChange={(v) => onUpdateSettings({ autoConnect: v })}
                 />
                 <ToggleRow
+                  icon={<Wifi className="w-4 h-4 text-emerald-400" />}
+                  label="Prefer hotspot link"
+                  hint="Try the same-Wi-Fi link first, then fall back to Tailscale. Local needs the laptop's certificate accepted once."
+                  checked={settings.preferLocal}
+                  onChange={(v) => onUpdateSettings({ preferLocal: v })}
+                />
+                <ToggleRow
                   icon={<Maximize className="w-4 h-4 text-sky-400" />}
                   label="Full screen"
                   hint="Hides the browser chrome. Installed copies already open full screen."

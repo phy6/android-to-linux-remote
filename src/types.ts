@@ -58,6 +58,7 @@ export interface RemoteSettings {
   wheelSensitivity: number; // pixels of travel per app switch
   tailscaleIp: string;
   autoConnect: boolean; // reconnect to the saved host when the app opens
+  preferLocal: boolean; // try the same-hotspot link first, fall back to Tailscale
   connectionAlerts: boolean; // post a system notification when the link comes up or drops
   buttonScale: number; // global size multiplier for the big thumb controls
 }
