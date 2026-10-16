@@ -40,7 +40,6 @@ import {
   ArrowDown,
   ArrowLeft,
   ArrowRight,
-  Send,
 } from 'lucide-react';
 
 interface SideMenuDrawerProps {
@@ -102,11 +101,31 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
     linuxClient.sendKeyCombo([key]);
   };
 
-  const handleSendText = (e: React.FormEvent) => {
+  // Keystrokes go to the laptop as they are typed. The diff against the last
+  // value we forwarded keeps backspace, autocorrect and paste all landing
+  // correctly; a keyboard that only delivers on Enter is not a keyboard.
+  const forwardedTextRef = useRef('');
+
+  const handleQuickInput = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const next = e.target.value;
+    const prev = forwardedTextRef.current;
+    let p = 0;
+    const max = Math.min(prev.length, next.length);
+    while (p < max && prev[p] === next[p]) p++;
+    for (let i = 0; i < prev.length - p; i++) {
+      linuxClient.sendKeyCombo(['BackSpace']);
+    }
+    const added = next.slice(p);
+    if (added) linuxClient.sendTypeText(added);
+    forwardedTextRef.current = next;
+    setQuickInput(next);
+  };
+
+  const handleQuickKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key !== 'Enter') return;
     e.preventDefault();
-    if (!quickInput) return;
-    triggerClick();
-    linuxClient.sendTypeText(quickInput);
+    linuxClient.sendKeyCombo(['Return']);
+    forwardedTextRef.current = '';
     setQuickInput('');
   };
 
@@ -440,23 +459,25 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                 <span>Open full dictation sheet</span>
               </button>
 
-              {/* Quick Text Type to Laptop */}
-              <form onSubmit={handleSendText} className="flex gap-2">
+              {/* Live keyboard: every keystroke is typed on the laptop as you
+                  press it, and Enter presses Return there. */}
+              <div className="space-y-1">
                 <input
                   type="text"
                   value={quickInput}
-                  onChange={(e) => setQuickInput(e.target.value)}
-                  placeholder="Type directly into laptop..."
-                  className="flex-1 bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-sky-500 font-mono"
+                  onChange={handleQuickInput}
+                  onKeyDown={handleQuickKeyDown}
+                  autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
+                  placeholder="Type here — it lands on the laptop live"
+                  className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-sky-500 font-mono"
                 />
-                <button
-                  type="submit"
-                  disabled={!quickInput}
-                  className="px-3 py-2 bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white rounded-xl text-xs font-medium flex items-center gap-1 transition"
-                >
-                  <Send className="w-3.5 h-3.5" />
-                </button>
-              </form>
+                <p className="text-[10px] text-slate-500 px-1">
+                  Sent as you type. Enter presses Return.
+                </p>
+              </div>
 
               {/* Linux Modifiers & Hotkeys */}
               <div className="grid grid-cols-3 gap-1.5 pt-1">

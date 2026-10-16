@@ -39,17 +39,26 @@ class DictationBridge:
         self.lock = threading.Lock()
         self.reader = None
         self.on_text = None
+        self._sent_frames = 0
+        # The websocket connection that started the session. Only it may feed
+        # or end it; a stray HTTP request or another tab closing must not cut
+        # someone off mid-sentence.
+        self.owner = None
 
-    def start(self):
+    def start(self, owner=None):
         self._reset()
+        self._sent_frames = 0
         try:
             sock = socket.create_connection((DICTATE_HOST, DICTATE_PORT), timeout=10)
             sock.settimeout(30)
+            print(f"[TailDeck] {_ts()} bridge -> OP_START", flush=True)
             sock.sendall(bytes([OP_START]))
             if sock.recv(1) != bytes([OP_OK]):
                 sock.close()
                 return False
             self.sock = sock
+            self.owner = owner
+            print(f"[TailDeck] {_ts()} bridge <- OP_OK", flush=True)
             self.reader = threading.Thread(target=self._read_loop, args=(sock,), daemon=True)
             self.reader.start()
             return True
@@ -99,27 +108,46 @@ class DictationBridge:
             buf += part
         return buf
 
-    def audio(self, pcm):
+    def audio(self, pcm, conn=None):
         if not self.sock or not pcm:
+            return
+        if conn is not None and self.owner is not None and self.owner is not conn:
             return
         try:
             with self.lock:
+                if self._sent_frames == 0:
+                    print(f"[TailDeck] {_ts()} bridge -> first OP_PCM", flush=True)
+                self._sent_frames += 1
                 self.sock.sendall(bytes([OP_PCM]) + struct.pack("!I", len(pcm)) + pcm)
         except Exception as e:
-            print(f"[TailDeck] dictation audio dropped: {e}")
+            print(f"[TailDeck] {_ts()} dictation audio dropped: {e}", flush=True)
             self._reset()
 
-    def stop(self):
-        """End the session but keep the socket alive for the trailing text."""
+    def stop(self, conn=None):
+        """End the session but keep the socket alive for the trailing text.
+
+        A connection that does not own the session is ignored, so serving a
+        page asset (or another client disconnecting) cannot silence a phone
+        that is mid-dictation.
+        """
+        if conn is not None and self.owner is not None and self.owner is not conn:
+            return
+        self.owner = None
         if not self.sock:
             return
         try:
+            print(f"[TailDeck] {_ts()} bridge -> OP_STOP after {self._sent_frames} PCM frames", flush=True)
             self.sock.sendall(bytes([OP_STOP]))
         except Exception:
             self._reset()
 
     def _reset(self):
         self.sock = None
+        self.owner = None
+
+
+def _ts():
+    return time.strftime("%H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d}"
 
 
 DICTATION = DictationBridge()
@@ -146,7 +174,17 @@ class LinuxInputBackend:
                     e.KEY_LEFTALT, e.KEY_TAB, e.KEY_LEFTSHIFT, e.KEY_LEFTCTRL,
                     e.KEY_ENTER, e.KEY_BACKSPACE, e.KEY_SPACE, e.KEY_ESC,
                     e.KEY_RIGHTCTRL, e.KEY_RIGHTALT, e.KEY_RIGHTSHIFT,
-                    e.KEY_LEFTMETA, e.KEY_VOLUMEUP, e.KEY_VOLUMEDOWN, e.KEY_MUTE
+                    e.KEY_LEFTMETA, e.KEY_VOLUMEUP, e.KEY_VOLUMEDOWN, e.KEY_MUTE,
+                    # A uinput device can only emit keys it declared, so typing
+                    # needs the full letter/digit/symbol set up front.
+                    *[getattr(e, "KEY_" + chr(ord("A") + i)) for i in range(26)],
+                    *[getattr(e, "KEY_" + str(i)) for i in range(10)],
+                    *[getattr(e, "KEY_" + n) for n in (
+                        "MINUS", "EQUAL", "LEFTBRACE", "RIGHTBRACE", "BACKSLASH",
+                        "SEMICOLON", "APOSTROPHE", "GRAVE", "COMMA", "DOT", "SLASH",
+                        "DELETE", "INSERT", "CAPSLOCK", "LEFT", "RIGHT", "UP", "DOWN",
+                        "HOME", "END", "PAGEUP", "PAGEDOWN",
+                    )],
                 ]
             }
             self.ui = UInput(capabilities, name="taildeck-virtual-device")
@@ -290,13 +328,80 @@ class LinuxInputBackend:
             else:
                 pyautogui.hotkey('alt', 'tab')
 
+    # US-layout mapping: character -> (ecodes name, needs_shift)
+    TYPE_KEY_NAMES = {
+        " ": ("KEY_SPACE", False), "\n": ("KEY_ENTER", False),
+        "\t": ("KEY_TAB", False), "\b": ("KEY_BACKSPACE", False),
+        "`": ("KEY_GRAVE", False), "~": ("KEY_GRAVE", True),
+        "-": ("KEY_MINUS", False), "_": ("KEY_MINUS", True),
+        "=": ("KEY_EQUAL", False), "+": ("KEY_EQUAL", True),
+        "[": ("KEY_LEFTBRACE", False), "{": ("KEY_LEFTBRACE", True),
+        "]": ("KEY_RIGHTBRACE", False), "}": ("KEY_RIGHTBRACE", True),
+        "\\": ("KEY_BACKSLASH", False), "|": ("KEY_BACKSLASH", True),
+        ";": ("KEY_SEMICOLON", False), ":": ("KEY_SEMICOLON", True),
+        "'": ("KEY_APOSTROPHE", False), '"': ("KEY_APOSTROPHE", True),
+        ",": ("KEY_COMMA", False), "<": ("KEY_COMMA", True),
+        ".": ("KEY_DOT", False), ">": ("KEY_DOT", True),
+        "/": ("KEY_SLASH", False), "?": ("KEY_SLASH", True),
+        "!": ("KEY_1", True), "@": ("KEY_2", True), "#": ("KEY_3", True),
+        "$": ("KEY_4", True), "%": ("KEY_5", True), "^": ("KEY_6", True),
+        "&": ("KEY_7", True), "*": ("KEY_8", True), "(": ("KEY_9", True),
+        ")": ("KEY_0", True),
+    }
+
+    def _key_spec(self, ch):
+        spec = self.TYPE_KEY_NAMES.get(ch)
+        if spec:
+            return spec
+        if "a" <= ch <= "z":
+            return ("KEY_" + ch.upper(), False)
+        if "A" <= ch <= "Z":
+            return ("KEY_" + ch, True)
+        if "0" <= ch <= "9":
+            return ("KEY_" + ch, False)
+        return None
+
+    def can_type(self, text: str):
+        return all(self._key_spec(c) for c in text)
+
+    def _type_char_uinput(self, ch):
+        from evdev import ecodes as e
+        spec = self._key_spec(ch)
+        if not spec:
+            return False
+        name, shift = spec
+        code = getattr(e, name, None)
+        if code is None:
+            return False
+        if shift:
+            self.ui.write(e.EV_KEY, e.KEY_LEFTSHIFT, 1)
+        self.ui.write(e.EV_KEY, code, 1)
+        self.ui.syn()
+        self.ui.write(e.EV_KEY, code, 0)
+        self.ui.syn()
+        if shift:
+            self.ui.write(e.EV_KEY, e.KEY_LEFTSHIFT, 0)
+            self.ui.syn()
+        return True
+
     def type_text(self, text: str):
-        """Types string input (e.g. from dictation). Handles Wayland and X11 clipboard/typing."""
+        """Types string input (e.g. from dictation or the live keyboard)."""
+        # Native kernel injection first: real key events, no clipboard churn.
+        # Matters most for live per-keystroke typing, where a clipboard paste
+        # would clobber the user's clipboard on every character.
+        if self.backend == "evdev_uinput" and self.can_type(text):
+            for ch in text:
+                self._type_char_uinput(ch)
+            return
+
         # Try clipboard paste first for fast, exact unicode insertion
         if SESSION_TYPE == "wayland" and self._command_exists("wl-copy"):
             try:
                 p = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE)
                 p.communicate(input=text.encode('utf-8'))
+                # Give the clipboard owner a moment to take the selection
+                # before pasting, otherwise Ctrl+V can race and paste nothing.
+                time.sleep(0.06)
                 # Simulate Ctrl+V / Shift+Insert
                 self.key_combo(["ctrl", "v"])
                 return
@@ -306,6 +411,7 @@ class LinuxInputBackend:
             try:
                 p = subprocess.Popen(["xclip", "-selection", "clipboard"], stdin=subprocess.PIPE)
                 p.communicate(input=text.encode('utf-8'))
+                time.sleep(0.06)
                 self.key_combo(["ctrl", "v"])
                 return
             except Exception:
@@ -483,11 +589,18 @@ def local_ipv4_addresses():
 
 def handle_websocket(conn):
     try:
+        peer = "{}:{}".format(*conn.getpeername()[:2])
+    except Exception:
+        peer = "?"
+    is_ws = False
+    try:
         data = conn.recv(4096).decode('utf-8', errors='ignore')
         if "Upgrade: websocket" not in data:
             serve_static(conn, data.split("\r\n", 1)[0] if data else "GET / HTTP/1.1")
             conn.close()
             return
+        is_ws = True
+        print(f"[TailDeck] ws open {peer}", flush=True)
 
         key = None
         for line in data.split("\r\n"):
@@ -521,10 +634,15 @@ def handle_websocket(conn):
         }
         send_ws_frame(conn, json.dumps(welcome))
 
+        # Per-connection dictation accounting, so a silent session is easy to
+        # tell apart from one that never carried any audio.
+        dictation_bytes = 0
+
         # Main message processing loop
         while True:
             payload = read_ws_frame(conn)
             if payload is None:
+                print(f"[TailDeck] ws closed {peer} bytes={dictation_bytes}", flush=True)
                 break
             try:
                 msg = json.loads(payload)
@@ -545,12 +663,17 @@ def handle_websocket(conn):
                     DICTATION.on_text = lambda t: send_ws_frame(
                         conn, json.dumps({"type": "dictation_text", "text": t})
                     )
-                    ok = DICTATION.start()
+                    ok = DICTATION.start(conn)
+                    dictation_bytes = 0
+                    print(f"[TailDeck] {peer} dictation_start ok={ok}", flush=True)
                     send_ws_frame(conn, json.dumps({"type": "dictation_ready", "ok": ok}))
                 elif mtype == "dictation_audio":
-                    DICTATION.audio(base64.b64decode(msg.get("data", "")))
+                    pcm = base64.b64decode(msg.get("data", ""))
+                    dictation_bytes += len(pcm)
+                    DICTATION.audio(pcm, conn)
                 elif mtype == "dictation_stop":
-                    DICTATION.stop()
+                    DICTATION.stop(conn)
+                    print(f"[TailDeck] {peer} dictation_stop bytes={dictation_bytes}", flush=True)
                     send_ws_frame(conn, json.dumps({"type": "dictation_stopped"}))
                 elif mtype == "ping":
                     pong = {"type": "pong", "timestamp": msg.get("timestamp", time.time() * 1000)}
@@ -560,7 +683,8 @@ def handle_websocket(conn):
     except Exception as e:
         pass
     finally:
-        DICTATION.stop()
+        if is_ws:
+            DICTATION.stop(conn)
         try:
             conn.close()
         except Exception:
