@@ -222,7 +222,10 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
 
   // The public URL is stable. Interpolating window.location.origin put the
   // phone's or the laptop's private hotspot IP into every copy of this command.
-  const DAEMON_URL = 'https://phy6.github.io/android-to-linux-remote/taildeck-daemon.py';
+  const REPO_URL = 'https://phy6.github.io/android-to-linux-remote';
+  const DAEMON_URL = `${REPO_URL}/taildeck-daemon.py`;
+  const INSTALL_URL = `${REPO_URL}/install.sh`;
+  const installCommand = `curl -fsSL "${INSTALL_URL}" | bash`;
   const oneLinerCommand = `curl -sSL "${DAEMON_URL}" -o taildeck-daemon.py && python3 taildeck-daemon.py`;
 
   // Edge drag detection on left side of screen
@@ -622,21 +625,49 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                 )}
               </form>
 
-              {/* Quick Run Command on Linux Laptop */}
+              {/* Prepare a machine that has never run TailDeck. Unlike the plain
+                  one-liner below, this also sets up an input backend and a
+                  service, so a friend's or spare laptop works on the first try
+                  instead of connecting and then silently doing nothing. */}
               <div className="space-y-2 pt-2 border-t border-slate-800">
                 <div className="flex items-center justify-between text-xs text-slate-400">
-                  <span className="font-semibold text-slate-300">Run on your Laptop:</span>
+                  <span className="font-semibold text-slate-300">Prepare a new laptop:</span>
                   <button
-                    onClick={() => copyToClipboard(oneLinerCommand, 'cmd')}
+                    onClick={() => copyToClipboard(installCommand, 'install')}
                     className="flex items-center gap-1 text-sky-400 hover:text-sky-300"
                   >
-                    {copiedCode === 'cmd' ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
-                    <span>{copiedCode === 'cmd' ? 'Copied' : 'Copy Command'}</span>
+                    {copiedCode === 'install' ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                    <span>{copiedCode === 'install' ? 'Copied' : 'Copy'}</span>
                   </button>
                 </div>
                 <div className="p-2.5 bg-slate-900 rounded-xl border border-slate-800 font-mono text-[11px] text-emerald-400 overflow-x-auto select-all">
-                  {oneLinerCommand}
+                  {installCommand}
                 </div>
+                <p className="text-[10px] text-slate-500 leading-relaxed">
+                  On any Linux laptop (a friend's, a spare): sets up input, downloads the daemon and
+                  starts it on boot. Asks for sudo once. Then open the address it prints.
+                </p>
+
+                <details className="group">
+                  <summary className="cursor-pointer text-[10px] text-slate-500 hover:text-slate-400 select-none">
+                    Or just run it once, without installing
+                  </summary>
+                  <div className="mt-2 space-y-1.5">
+                    <div className="flex items-center justify-between text-[10px] text-slate-500">
+                      <span>run in the foreground</span>
+                      <button
+                        onClick={() => copyToClipboard(oneLinerCommand, 'cmd')}
+                        className="flex items-center gap-1 text-sky-400 hover:text-sky-300"
+                      >
+                        {copiedCode === 'cmd' ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                        <span>{copiedCode === 'cmd' ? 'Copied' : 'Copy'}</span>
+                      </button>
+                    </div>
+                    <div className="p-2.5 bg-slate-900 rounded-xl border border-slate-800 font-mono text-[11px] text-slate-400 overflow-x-auto select-all">
+                      {oneLinerCommand}
+                    </div>
+                  </div>
+                </details>
               </div>
 
               {/* Download daemon link */}

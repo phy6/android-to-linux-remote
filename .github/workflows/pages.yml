@@ -37,6 +37,16 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
         run: bun run build
 
+      - name: Build the laptop web app bundle
+        env:
+          # install.sh serves this from the laptop root, so it must not carry
+          # the /<repo>/ base path the Pages copy is built with.
+          BASE_PATH: /
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          bun run build -- --outDir dist-webroot --emptyOutDir
+          tar czf dist/taildeck-web.tar.gz -C dist-webroot .
+
       - uses: actions/configure-pages@v5
 
       - uses: actions/upload-pages-artifact@v3
