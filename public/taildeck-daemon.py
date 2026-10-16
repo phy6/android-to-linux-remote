@@ -647,7 +647,7 @@ def _http(conn, status, ctype, body, cache="no-cache"):
         # laptop, so the scripts API is cross-origin. These are read-mostly text
         # endpoints with no credentials; a wildcard origin is deliberate.
         "Access-Control-Allow-Origin: *\r\n"
-        "Access-Control-Allow-Methods: GET, POST, PUT, OPTIONS\r\n"
+        "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n"
         "Access-Control-Allow-Headers: Content-Type\r\n"
         "Connection: close\r\n\r\n"
     )

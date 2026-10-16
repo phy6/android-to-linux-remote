@@ -33,6 +33,7 @@ import {
 } from './services/notifications';
 import { SpeechDiagnosticsPanel } from './components/SpeechDiagnosticsPanel';
 import { PcmCapture } from './services/audioCapture';
+import { respondToChallenge, webAuthnAvailable } from './services/authClient';
 
 const DEFAULT_SETTINGS: RemoteSettings = {
   sensitivity: 1.2,
@@ -408,6 +409,29 @@ export default function App() {
       void showMessageNotice({ title, body }).then((posted) => {
         if (!posted) showToast(body, 'ok');
       });
+    });
+  }, [showToast]);
+
+  // The laptop asking this phone to sign an unlock challenge: prompt for the
+  // fingerprint and hand the assertion straight back over the same socket.
+  const authInFlightRef = useRef(false);
+  useEffect(() => {
+    return linuxClient.onAuthChallenge((challenge) => {
+      if (authInFlightRef.current) return;
+      if (!webAuthnAvailable()) {
+        showToast('Open the app from its web address to unlock with your phone', 'warn');
+        return;
+      }
+      authInFlightRef.current = true;
+      void respondToChallenge(challenge)
+        .then((assertion) => {
+          if (!assertion) return;
+          linuxClient.sendAuthResponse(assertion);
+          showToast('Fingerprint sent to the laptop', 'ok');
+        })
+        .finally(() => {
+          authInFlightRef.current = false;
+        });
     });
   }, [showToast]);
 

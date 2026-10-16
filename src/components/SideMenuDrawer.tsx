@@ -9,6 +9,7 @@ import { PWAInstallButton } from './PWAInstallButton';
 import { PairingCodeModal } from './PairingCodeModal';
 import { ScanPairingModal } from './ScanPairingModal';
 import { UpdatesPanel } from './UpdatesPanel';
+import { UnlockPanel } from './UnlockPanel';
 import {
   notificationSupport,
   requestNotificationPermission,
@@ -778,6 +779,13 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                   )}
                 </span>
               </div>
+
+              {/* Fingerprint unlock: enrol this phone as a passkey so it can
+                  answer a challenge the laptop pushes. */}
+              <UnlockPanel
+                host={connectionStatus.hostAddress || tailscaleIp}
+                connected={connectionStatus.connected}
+              />
             </div>
           )}
 
