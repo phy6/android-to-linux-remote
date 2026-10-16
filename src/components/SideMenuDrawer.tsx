@@ -47,6 +47,10 @@ import {
   ArrowDown,
   ArrowLeft,
   ArrowRight,
+  HelpCircle,
+  Rocket,
+  Wrench,
+  ExternalLink,
 } from 'lucide-react';
 
 const ToggleRow: React.FC<{
@@ -124,7 +128,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
   const [tailscaleIp, setTailscaleIp] = useState(connectionStatus.hostAddress || '');
   const [alertPermission, setAlertPermission] = useState<AlertPermission>(notificationSupport());
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<'tailscale' | 'keys' | 'settings'>('keys');
+  const [activeTab, setActiveTab] = useState<'tailscale' | 'keys' | 'settings' | 'help'>('keys');
   const [quickInput, setQuickInput] = useState('');
   const quickInputRef = useRef<HTMLInputElement>(null);
   const [isFullscreen, setIsFullscreen] = useState<boolean>(
@@ -223,6 +227,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
   // The public URL is stable. Interpolating window.location.origin put the
   // phone's or the laptop's private hotspot IP into every copy of this command.
   const REPO_URL = 'https://phy6.github.io/android-to-linux-remote';
+  const GITHUB_URL = 'https://github.com/phy6/android-to-linux-remote';
   const DAEMON_URL = `${REPO_URL}/taildeck-daemon.py`;
   const INSTALL_URL = `${REPO_URL}/install.sh`;
   const installCommand = `curl -fsSL "${INSTALL_URL}" | bash`;
@@ -341,6 +346,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
               { id: 'keys', label: 'Keyboard', Icon: Keyboard },
               { id: 'tailscale', label: 'Connection', Icon: Wifi },
               { id: 'settings', label: 'Settings', Icon: Sliders },
+              { id: 'help', label: 'Help', Icon: HelpCircle },
             ] as const
           ).map(({ id, label, Icon }) => (
             <button
@@ -1035,6 +1041,178 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                   <Monitor className="w-4 h-4" />
                   <span>{isSimulatorActive ? 'Hide Desktop Simulator' : 'Show Desktop Simulator'}</span>
                 </button>
+              </section>
+            </div>
+          )}
+
+          {/* TAB 4: HELP & DOCS — one place for setup, gestures and the links */}
+          {activeTab === 'help' && (
+            <div className="space-y-4 text-xs">
+              {/* Quick start */}
+              <section className="space-y-3">
+                <div className="flex items-center gap-2">
+                  <Rocket className="w-4 h-4 text-sky-400" />
+                  <SectionTitle>Quick start</SectionTitle>
+                </div>
+                <ol className="space-y-2">
+                  {[
+                    'Install TailDeck on the laptop you want to control (command below).',
+                    'Put the phone and the laptop on the same Wi-Fi / hotspot, or both on Tailscale.',
+                    'Connect from the Connection tab. The laptop is remembered for next time.',
+                  ].map((step, i) => (
+                    <li key={i} className="flex gap-2.5 p-3 rounded-xl bg-slate-900 border border-slate-800">
+                      <span className="shrink-0 w-5 h-5 rounded-full bg-sky-500/20 border border-sky-500/40 text-sky-300 flex items-center justify-center text-[10px] font-semibold">
+                        {i + 1}
+                      </span>
+                      <span className="text-slate-300 leading-snug">{step}</span>
+                    </li>
+                  ))}
+                </ol>
+              </section>
+
+              {/* Set up a laptop */}
+              <section className="space-y-3 pt-4 border-t border-slate-800">
+                <SectionTitle>Set up a laptop</SectionTitle>
+                <p className="text-[11px] text-slate-400 leading-snug">
+                  One command installs the daemon, the input backend and a background service on
+                  any Linux laptop. Run it on each machine you want to control.
+                </p>
+                <div className="rounded-xl bg-slate-900 border border-slate-800 overflow-hidden">
+                  <div className="flex items-center justify-between px-3 py-2 border-b border-slate-800">
+                    <span className="text-[10px] uppercase tracking-wide text-slate-500">Laptop install</span>
+                    <button
+                      type="button"
+                      onClick={() => copyToClipboard(installCommand, 'help-install')}
+                      className="flex items-center gap-1 text-[11px] text-sky-400 hover:text-sky-300"
+                    >
+                      {copiedCode === 'help-install' ? (
+                        <Check className="w-3.5 h-3.5" />
+                      ) : (
+                        <Copy className="w-3.5 h-3.5" />
+                      )}
+                      <span>{copiedCode === 'help-install' ? 'Copied' : 'Copy'}</span>
+                    </button>
+                  </div>
+                  <pre className="px-3 py-2.5 overflow-x-auto text-[11px] text-emerald-300 font-mono whitespace-pre-wrap break-all">
+                    {installCommand}
+                  </pre>
+                </div>
+                <details className="rounded-xl bg-slate-900 border border-slate-800">
+                  <summary className="px-3 py-2.5 cursor-pointer text-slate-300 font-medium">
+                    Prefer to run the daemon yourself?
+                  </summary>
+                  <div className="px-3 pb-3 space-y-2">
+                    <p className="text-[11px] text-slate-400 leading-snug">
+                      Fetches just the daemon and runs it in the foreground. You provide the input
+                      backend yourself.
+                    </p>
+                    <div className="rounded-lg bg-slate-950 border border-slate-800 overflow-hidden">
+                      <div className="flex items-center justify-between px-3 py-2 border-b border-slate-800">
+                        <span className="text-[10px] uppercase tracking-wide text-slate-500">Manual</span>
+                        <button
+                          type="button"
+                          onClick={() => copyToClipboard(oneLinerCommand, 'help-oneliner')}
+                          className="flex items-center gap-1 text-[11px] text-sky-400 hover:text-sky-300"
+                        >
+                          {copiedCode === 'help-oneliner' ? (
+                            <Check className="w-3.5 h-3.5" />
+                          ) : (
+                            <Copy className="w-3.5 h-3.5" />
+                          )}
+                          <span>{copiedCode === 'help-oneliner' ? 'Copied' : 'Copy'}</span>
+                        </button>
+                      </div>
+                      <pre className="px-3 py-2.5 overflow-x-auto text-[11px] text-emerald-300 font-mono whitespace-pre-wrap break-all">
+                        {oneLinerCommand}
+                      </pre>
+                    </div>
+                  </div>
+                </details>
+              </section>
+
+              {/* Using the deck */}
+              <section className="space-y-2 pt-4 border-t border-slate-800">
+                <SectionTitle>Using the deck</SectionTitle>
+                <div className="space-y-1.5">
+                  {[
+                    ['Trackpad', 'Drag to move, tap to click, two fingers to scroll, two-finger tap to right-click.'],
+                    ['Top bar', 'Swipe left / right to switch apps (Shift+Tab / Tab).'],
+                    ['Bottom buttons', 'Left and right click. Hold the left button to start dictation.'],
+                    ['Mic button', 'Hold to talk, release to type it. Drag the mic to move it.'],
+                    ['Resize', 'Long-press the right button, then drag up / down to size the big buttons.'],
+                  ].map(([label, text]) => (
+                    <div key={label} className="p-3 rounded-xl bg-slate-900 border border-slate-800">
+                      <div className="font-medium text-slate-200">{label}</div>
+                      <div className="text-[11px] text-slate-400 leading-snug mt-0.5">{text}</div>
+                    </div>
+                  ))}
+                </div>
+              </section>
+
+              {/* Connecting */}
+              <section className="space-y-2 pt-4 border-t border-slate-800">
+                <SectionTitle>Connecting</SectionTitle>
+                <div className="space-y-1.5">
+                  {[
+                    ['Same hotspot', "Open the laptop's own https://<laptop>:8443/ once in the phone browser and accept the certificate warning, then connect here."],
+                    ['Tailscale', 'Works with real certificates, so there is no warning to clear. Best when both are on your tailnet.'],
+                    ['Control-only (http)', 'Keys and clicks work over http with no certificate. The screen stream needs https.'],
+                  ].map(([label, text]) => (
+                    <div key={label} className="p-3 rounded-xl bg-slate-900 border border-slate-800">
+                      <div className="font-medium text-slate-200">{label}</div>
+                      <div className="text-[11px] text-slate-400 leading-snug mt-0.5">{text}</div>
+                    </div>
+                  ))}
+                </div>
+              </section>
+
+              {/* Troubleshooting */}
+              <section className="space-y-2 pt-4 border-t border-slate-800">
+                <div className="flex items-center gap-2">
+                  <Wrench className="w-4 h-4 text-amber-400" />
+                  <SectionTitle>If something's off</SectionTitle>
+                </div>
+                <ul className="space-y-2">
+                  {[
+                    ["Connected but the laptop never reacts", "The input backend isn't running. Re-run the installer; on X11 it needs evdev / uinput, or a live ydotoold."],
+                    ["The certificate warning won't clear", "Open the laptop's https URL directly (see Connecting) and accept it there, then come back."],
+                    ['Dictation does nothing', 'The microphone needs an https page. Open the app from the hosted address or the laptop\'s https URL.'],
+                    ['Right click feels late', 'It now fires on release, so a hold can resize. A quick tap still right-clicks.'],
+                  ].map(([title, text]) => (
+                    <li key={title} className="p-3 rounded-xl bg-slate-900 border border-slate-800">
+                      <div className="font-medium text-slate-200">{title}</div>
+                      <div className="text-[11px] text-slate-400 leading-snug mt-0.5">{text}</div>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+
+              {/* Links */}
+              <section className="space-y-2 pt-4 border-t border-slate-800">
+                <SectionTitle>Links</SectionTitle>
+                <div className="space-y-1.5">
+                  {[
+                    ['Open the app', REPO_URL],
+                    ['Source & issues', GITHUB_URL],
+                    ['Daemon file', DAEMON_URL],
+                    ['Installer', INSTALL_URL],
+                  ].map(([label, url]) => (
+                    <a
+                      key={url}
+                      href={url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="flex items-center justify-between gap-2 p-3 rounded-xl bg-slate-900 border border-slate-800 hover:bg-slate-800 text-slate-300"
+                    >
+                      <span className="font-medium">{label}</span>
+                      <span className="flex items-center gap-1.5 text-[11px] text-slate-500">
+                        <span className="truncate max-w-[150px]">{url.replace(/^https?:\/\//, '')}</span>
+                        <ExternalLink className="w-3.5 h-3.5" />
+                      </span>
+                    </a>
+                  ))}
+                </div>
+                <p className="text-[10px] text-slate-500 px-1 pt-1">TailDeck {__BUILD_SHA__}</p>
               </section>
             </div>
           )}
