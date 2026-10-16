@@ -782,6 +782,14 @@ def run_ws_server(port=PORT, tls_context=None):
         except ssl.SSLError as e:
             print(f"[TailDeck] TLS handshake failed: {e}")
             continue
+        except OSError as e:
+            # A client that connects and then vanishes (or resets mid-handshake)
+            # surfaces here as ConnectionResetError. Catching only ssl.SSLError
+            # used to let that kill this thread and take the whole https
+            # listener down with it, which silently dropped the phone back to
+            # plain http on 8080 (no secure context: no dictation).
+            print(f"[TailDeck] accept() failed, staying up: {e}")
+            continue
         t = threading.Thread(target=handle_websocket, args=(conn,), daemon=True)
         t.start()
 
