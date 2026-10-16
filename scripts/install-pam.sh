@@ -20,7 +20,9 @@ HELPER_SRC="$SRC_DIR/taildeck-pam"
 BEEP_SRC="$SRC_DIR/taildeck-beep"
 UNLOCK_LINE="auth    sufficient  pam_exec.so quiet /usr/local/sbin/taildeck-pam"
 BEEP_LINE="auth    optional    pam_exec.so quiet /usr/local/sbin/taildeck-beep"
-WIRED_SERVICES="xfce4-screensaver lightdm"
+# Candidates are auto-detected: whichever exist get wired (an extra wired
+# service is harmless; it just means switching greeter/locker keeps working).
+WIRED_CANDIDATES="xfce4-screensaver gnome-screensaver lightdm gdm-password"
 
 USER_NAME="${SUDO_USER:-}"
 WIRE=0
@@ -44,7 +46,7 @@ if [ "$UNINSTALL" -eq 1 ]; then
           /etc/pam.d/taildeck-test /etc/taildeck/pam.key
     [ -n "$USER_NAME" ] && rm -f "/home/$USER_NAME/.config/taildeck/pam.key" || true
     rmdir /etc/taildeck 2>/dev/null || true
-    for svc in $WIRED_SERVICES; do
+    for svc in $WIRED_CANDIDATES; do
         [ -e "/etc/pam.d/$svc.taildeck.bak" ] && mv -f "/etc/pam.d/$svc.taildeck.bak" "/etc/pam.d/$svc"
     done
     if [ -e /etc/pam.d/polkit-1.taildeck.bak ]; then
@@ -69,7 +71,7 @@ echo "user:    $USER_NAME ($user_home)"
 echo "helper:  /usr/local/sbin/taildeck-pam"
 echo "beep:    /usr/local/sbin/taildeck-beep (fires on admin prompts)"
 echo "test:    /etc/pam.d/taildeck-test"
-[ "$WIRE" -eq 1 ] && echo "wire:    $WIRED_SERVICES + polkit-1 (with .taildeck.bak backups)"
+[ "$WIRE" -eq 1 ] && echo "wire:    auto-detected lock/greeter services + polkit-1"
 echo
 
 # 1. Shared secret ----------------------------------------------------------
@@ -109,15 +111,26 @@ insert_before() {  # file, line, needle
 }
 
 if [ "$WIRE" -eq 1 ]; then
-    for svc in $WIRED_SERVICES; do
+    wired=""
+    for svc in $WIRED_CANDIDATES; do
         f="/etc/pam.d/$svc"
-        [ -e "$f" ] || { echo "skip: $f not present"; continue; }
+        [ -e "$f" ] || continue
         cp -a "$f" "$f.taildeck.bak"
         insert_before "$f" "$UNLOCK_LINE" "common-auth"
+        wired="$wired $svc"
     done
-    if [ -e /etc/pam.d/polkit-1 ]; then cp -a /etc/pam.d/polkit-1 /etc/pam.d/polkit-1.taildeck.bak
-    else rm -f /etc/pam.d/polkit-1.taildeck.bak; fi
-    cat > /etc/pam.d/polkit-1 <<EOF
+    pk=/etc/pam.d/polkit-1
+    if [ -e "$pk" ]; then
+        # Preserve the existing stack (env/session lines); just prepend the cue
+        # and the phone-approval line before its common-auth include.
+        cp -a "$pk" "$pk.taildeck.bak"
+        awk -v B="$BEEP_LINE" -v U="$UNLOCK_LINE" \
+            'BEGIN{d=0} { if(!d && index($0,"common-auth")){ print B; print U; d=1 } print }' \
+            "$pk" > "$pk.new"
+        install -m 0644 -o root -g root "$pk.new" "$pk"
+        rm -f "$pk.new"
+    else
+        cat > "$pk" <<EOF
 # TailDeck: audible cue + phone approval for admin (polkit) prompts.
 # Created by scripts/install-pam.sh. Delete to restore /etc/pam.d/other.
 $BEEP_LINE
@@ -126,8 +139,9 @@ auth    include     common-auth
 account include     common-account
 session include     common-session
 EOF
-    chmod 0644 /etc/pam.d/polkit-1
-    echo "[4/4] wired $WIRED_SERVICES and created /etc/pam.d/polkit-1"
+        chmod 0644 "$pk"
+    fi
+    echo "[4/4] wired:$wired and polkit-1"
 else
     echo "[4/4] skipped wiring (pass --wire to enable lock screen, greeter, polkit)"
 fi
