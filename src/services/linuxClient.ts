@@ -7,11 +7,13 @@ const WS_OPEN = 1;
 
 type EventCallback = (event: InputEventPayload) => void;
 type StatusCallback = (status: ConnectionStatus) => void;
+type DictationTextCallback = (text: string) => void;
 
 class LinuxClientService {
   private socket: WebSocket | null = null;
   private listeners: Set<EventCallback> = new Set();
   private statusListeners: Set<StatusCallback> = new Set();
+  private dictationTextListeners: Set<DictationTextCallback> = new Set();
   private pendingDx = 0;
   private dictationReady = false;
   private dictationWaiter: ((ok: boolean) => void) | null = null;
@@ -33,6 +35,13 @@ class LinuxClientService {
 
   constructor() {
     this.scheduleFlush = this.scheduleFlush.bind(this);
+  }
+
+  public onDictationText(callback: DictationTextCallback): () => void {
+    this.dictationTextListeners.add(callback);
+    return () => {
+      this.dictationTextListeners.delete(callback);
+    };
   }
 
   public getStatus(): ConnectionStatus {
@@ -112,6 +121,18 @@ class LinuxClientService {
             resolve?.(this.dictationReady);
           } else if (data.type === 'dictation_stopped') {
             this.dictationReady = false;
+          } else if (data.type === 'dictation_text') {
+            // The laptop's recogniser finished; this is what it heard.
+            const heard = String(data.text ?? '');
+            if (heard) {
+              this.dictationTextListeners.forEach((cb) => {
+                try {
+                  cb(heard);
+                } catch {
+                  // A listener throwing must not break the socket handler.
+                }
+              });
+            }
           } else if (data.type === 'host_info') {
             this.status = {
               ...this.status,

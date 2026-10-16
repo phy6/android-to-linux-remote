@@ -21,54 +21,103 @@ PORT = int(os.environ.get("TAILDECK_PORT", 8080))
 DICTATE_HOST = os.environ.get("TAILDECK_DICTATE_HOST", "127.0.0.1")
 DICTATE_PORT = int(os.environ.get("TAILDECK_DICTATE_PORT", 8090))
 
-OP_START, OP_STOP, OP_PCM, OP_OK = 0x01, 0x02, 0x03, 0x01
+OP_START, OP_STOP, OP_PCM, OP_TEXT, OP_OK = 0x01, 0x02, 0x03, 0x04, 0x01
 
 
 class DictationBridge:
     """Relays phone PCM from this daemon's websocket to the local vosk
-    push-to-talk daemon, which recognises it and types the result itself."""
+    push-to-talk daemon, which recognises it and types the result itself.
+
+    The transcript comes back on the same socket a beat after release, once the
+    daemon finishes its offline re-decode, so the socket is deliberately left
+    open past the end of the session and a reader thread owns every read."""
 
     def __init__(self):
         self.sock = None
-
-    def _op(self, op, payload=b""):
-        self.sock.sendall(bytes([op]) + payload)
+        self.lock = threading.Lock()
+        self.reader = None
+        self.on_text = None
 
     def start(self):
-        self.stop()
+        self._reset()
         try:
-            self.sock = socket.create_connection((DICTATE_HOST, DICTATE_PORT), timeout=10)
-            self.sock.settimeout(30)
-            self._op(OP_START)
-            return self.sock.recv(1) == bytes([OP_OK])
+            sock = socket.create_connection((DICTATE_HOST, DICTATE_PORT), timeout=10)
+            sock.settimeout(30)
+            sock.sendall(bytes([OP_START]))
+            if sock.recv(1) != bytes([OP_OK]):
+                sock.close()
+                return False
+            self.sock = sock
+            self.reader = threading.Thread(target=self._read_loop, args=(sock,), daemon=True)
+            self.reader.start()
+            return True
         except Exception as e:
             print(f"[TailDeck] dictation bridge unavailable: {e}")
             self.sock = None
             return False
 
+    def _read_loop(self, sock):
+        """Owns every read on this socket. Status bytes are ignored; an OP_TEXT
+        frame carries the recognised text."""
+        try:
+            while True:
+                head = self._readn(sock, 1)
+                if not head:
+                    break
+                if head[0] != OP_TEXT:
+                    continue
+                raw = self._readn(sock, 4)
+                if not raw:
+                    break
+                size = struct.unpack("!I", raw)[0]
+                if size <= 0 or size > (1 << 20):
+                    break
+                payload = self._readn(sock, size)
+                if not payload:
+                    break
+                cb = self.on_text
+                if cb is not None:
+                    try:
+                        cb(payload.decode("utf-8", "replace"))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    @staticmethod
+    def _readn(sock, n):
+        buf = b""
+        while len(buf) < n:
+            try:
+                part = sock.recv(n - len(buf))
+            except Exception:
+                return None
+            if not part:
+                return None
+            buf += part
+        return buf
+
     def audio(self, pcm):
         if not self.sock or not pcm:
             return
         try:
-            self._op(OP_PCM, struct.pack("!I", len(pcm)) + pcm)
+            with self.lock:
+                self.sock.sendall(bytes([OP_PCM]) + struct.pack("!I", len(pcm)) + pcm)
         except Exception as e:
             print(f"[TailDeck] dictation audio dropped: {e}")
-            self.sock = None
+            self._reset()
 
     def stop(self):
+        """End the session but keep the socket alive for the trailing text."""
         if not self.sock:
             return
         try:
-            self._op(OP_STOP)
-            self.sock.recv(1)
+            self.sock.sendall(bytes([OP_STOP]))
         except Exception:
-            pass
-        finally:
-            try:
-                self.sock.close()
-            except Exception:
-                pass
-            self.sock = None
+            self._reset()
+
+    def _reset(self):
+        self.sock = None
 
 
 DICTATION = DictationBridge()
@@ -379,6 +428,9 @@ def handle_websocket(conn):
                 elif mtype == "key_combo":
                     INPUT_HANDLER.key_combo(msg.get("keys", []))
                 elif mtype == "dictation_start":
+                    DICTATION.on_text = lambda t: send_ws_frame(
+                        conn, json.dumps({"type": "dictation_text", "text": t})
+                    )
                     ok = DICTATION.start()
                     send_ws_frame(conn, json.dumps({"type": "dictation_ready", "ok": ok}))
                 elif mtype == "dictation_audio":
@@ -400,6 +452,11 @@ def handle_websocket(conn):
         except Exception:
             pass
 
+# The dictation transcript is pushed from a reader thread while the handler
+# thread may still be answering pings, so writes serialise through one lock.
+_WS_SEND_LOCK = threading.Lock()
+
+
 def send_ws_frame(conn, message):
     data = message.encode('utf-8')
     length = len(data)
@@ -412,7 +469,8 @@ def send_ws_frame(conn, message):
     else:
         header.append(127)
         header.extend(struct.pack("!Q", length))
-    conn.sendall(header + data)
+    with _WS_SEND_LOCK:
+        conn.sendall(header + data)
 
 def read_ws_frame(conn):
     try:

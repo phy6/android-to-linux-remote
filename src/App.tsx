@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { AlertCircle, Stethoscope, Wifi, WifiOff } from 'lucide-react';
+import { AlertCircle, Check, Stethoscope, Wifi, WifiOff } from 'lucide-react';
 import { linuxClient } from './services/linuxClient';
 import { ConnectionStatus, RemoteSettings } from './types';
 import {
@@ -67,6 +67,9 @@ export default function App() {
   const [isDictationOpen, setIsDictationOpen] = useState(false);
   const [showSimulator, setShowSimulator] = useState(false);
   const [isPttActive, setIsPttActive] = useState(false);
+  const [pttPhase, setPttPhase] = useState<'idle' | 'listening' | 'transcribing'>('idle');
+  const [pttTranscript, setPttTranscript] = useState<string | null>(null);
+  const pttTranscriptTimerRef = useRef<number | null>(null);
 
   const speech = useSpeechRecognition();
 
@@ -76,6 +79,28 @@ export default function App() {
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [toast, setToast] = useState<{ text: string; kind: 'ok' | 'warn' } | null>(null);
   const toastTimerRef = useRef<number | null>(null);
+
+  const clearTranscriptTimer = useCallback(() => {
+    if (pttTranscriptTimerRef.current !== null) {
+      window.clearTimeout(pttTranscriptTimerRef.current);
+      pttTranscriptTimerRef.current = null;
+    }
+  }, []);
+
+  // The laptop's recogniser is the authority on what was said; showing its
+  // text on the phone is the only confirmation available when the phone is
+  // being used away from the screen.
+  useEffect(() => {
+    return linuxClient.onDictationText((heard) => {
+      clearTranscriptTimer();
+      setPttTranscript(heard);
+      setPttPhase('idle');
+      pttTranscriptTimerRef.current = window.setTimeout(() => {
+        pttTranscriptTimerRef.current = null;
+        setPttTranscript(null);
+      }, 9000);
+    });
+  }, [clearTranscriptTimer]);
 
   const showToast = useCallback((text: string, kind: 'ok' | 'warn' = 'ok') => {
     setToast({ text, kind });
@@ -124,6 +149,9 @@ export default function App() {
   // Push-to-talk: hold the mic to listen, release to type the words into Linux.
   const handlePttStart = useCallback(() => {
     speech.resetTranscript();
+    clearTranscriptTimer();
+    setPttTranscript(null);
+    setPttPhase('listening');
     if (pttSendTimerRef.current !== null) {
       window.clearTimeout(pttSendTimerRef.current);
       pttSendTimerRef.current = null;
@@ -176,7 +204,7 @@ export default function App() {
         setIsPttActive(started);
       });
     });
-  }, [speech, showToast, showSpeechNotice]);
+  }, [speech, showToast, showSpeechNotice, clearTranscriptTimer]);
 
   const handlePttEnd = useCallback(() => {
     // Invalidate any start that is still awaiting permission.
@@ -194,6 +222,14 @@ export default function App() {
       daemonPttRef.current = false;
       const capture = captureRef.current;
       captureRef.current = null;
+      setPttPhase('transcribing');
+      // The offline re-decode runs after release, so give it a window to report
+      // back before concluding nothing was heard.
+      pttTranscriptTimerRef.current = window.setTimeout(() => {
+        pttTranscriptTimerRef.current = null;
+        setPttPhase('idle');
+        showToast('Nothing heard — hold the mic and speak', 'warn');
+      }, 7000);
       // Send a little trailing audio before closing the session.
       window.setTimeout(() => {
         capture?.stop();
@@ -214,11 +250,13 @@ export default function App() {
       linuxClient.sendKeyCombo(['Return']);
       speech.resetTranscript();
     }, 350);
-  }, [speech]);
+  }, [speech, showToast]);
 
   const handlePttCancel = useCallback(() => {
     pttTokenRef.current += 1;
     setIsPttActive(false);
+    clearTranscriptTimer();
+    setPttPhase('idle');
     if (pttSendTimerRef.current !== null) {
       window.clearTimeout(pttSendTimerRef.current);
       pttSendTimerRef.current = null;
@@ -232,7 +270,7 @@ export default function App() {
     }
     speech.abortListening();
     speech.resetTranscript();
-  }, [speech]);
+  }, [speech, clearTranscriptTimer]);
 
   useEffect(
     () => () => {
@@ -355,21 +393,56 @@ export default function App() {
         isSimulatorActive={showSimulator}
       />
 
-      {/* Full-screen listening state: the mic button sits under the thumb, so
-          the deck itself has to show what is happening. */}
-      {isPttActive && (
+      {/* Full-screen push-to-talk state: the mic button sits under the thumb,
+          so the deck itself has to show what is happening. The laptop types
+          into its own focused window, which the phone cannot see, so the
+          transcript is echoed back here as the only confirmation available. */}
+      {(isPttActive || pttPhase === 'transcribing') && (
         <div className="fixed inset-0 z-20 pointer-events-none flex flex-col items-center justify-center">
-          <div className="absolute inset-0 bg-rose-950/25" />
+          <div
+            className={`absolute inset-0 ${isPttActive ? 'bg-rose-950/25' : 'bg-slate-950/35'}`}
+          />
           <div className="relative flex items-center gap-3 px-5 py-3 rounded-2xl bg-slate-950/85 border border-rose-500/50 shadow-lg shadow-black/60">
-            <span className="relative flex h-3 w-3">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-75" />
-              <span className="relative inline-flex rounded-full h-3 w-3 bg-rose-500" />
-            </span>
-            <span className="text-sm font-medium text-rose-100">Listening…</span>
+            {isPttActive ? (
+              <>
+                <span className="relative flex h-3 w-3">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-75" />
+                  <span className="relative inline-flex rounded-full h-3 w-3 bg-rose-500" />
+                </span>
+                <span className="text-sm font-medium text-rose-100">Listening…</span>
+              </>
+            ) : (
+              <>
+                <span className="h-3 w-3 rounded-full border-2 border-sky-400 border-t-transparent animate-spin" />
+                <span className="text-sm font-medium text-sky-100">Transcribing…</span>
+              </>
+            )}
           </div>
           <p className="relative mt-3 text-[11px] text-rose-200/70">
-            Release to send to your laptop
+            {isPttActive ? 'Release to send to your laptop' : 'Typing on your laptop'}
           </p>
+        </div>
+      )}
+
+      {/* What the laptop actually heard, so a phone-only session is verifiable. */}
+      {pttTranscript && (
+        <div className="fixed inset-x-0 bottom-4 z-30 px-4 pointer-events-none flex justify-center">
+          <button
+            type="button"
+            onClick={() => {
+              clearTranscriptTimer();
+              setPttTranscript(null);
+            }}
+            className="pointer-events-auto max-w-md w-full text-left px-4 py-3 rounded-2xl bg-emerald-950/90 border border-emerald-500/40 shadow-lg shadow-black/60"
+          >
+            <div className="flex items-center gap-2 mb-1">
+              <Check className="w-3.5 h-3.5 text-emerald-400" />
+              <span className="text-[10px] font-semibold uppercase tracking-wide text-emerald-300">
+                Typed on your laptop
+              </span>
+            </div>
+            <p className="text-sm text-emerald-50 line-clamp-3">{pttTranscript}</p>
+          </button>
         </div>
       )}
 
