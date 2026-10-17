@@ -897,6 +897,7 @@ export default function App() {
           linuxClient.sendKeyCombo(['Return']);
         }}
         onBackspace={() => linuxClient.sendKeyCombo(['BackSpace'])}
+        onCommand={(cmd) => linuxClient.sendMedia(cmd)}
       />
 
       {/* Voice Dictation Input Sheet */}

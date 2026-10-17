@@ -1,0 +1,186 @@
+TAILDECK — PROMPT STARTERS
+==========================
+Copy a block, fill the <angle-bracket> bits, paste. Each starter states the
+goal, the constraints, and what "done" looks like, so the agent can act
+without a follow-up round-trip.
+
+-------------------------------------------------------------------------------
+SECTION A — THIS PROJECT: TailDeck / device workflow
+-------------------------------------------------------------------------------
+
+A1. PREFLIGHT (run before any device test)
+    Preflight the TailDeck test environment and report PASS/FAIL per line,
+    with the raw output as evidence:
+      - taildeck.service active (user unit)
+      - listening on 0.0.0.0:8080
+      - adb device present (serial ZY22GGDJ9F)
+      - adb reverse tcp:8080 and tcp:8443 registered
+      - app versionCode/versionName and debuggable=false
+      - RECORD_AUDIO granted=true
+    Do not change anything; read-only checks only.
+
+A2. CONNECT AND VERIFY (the reliable path)
+    Connect the app to the daemon over the loopback reverse tunnel and prove it:
+      1. adb reverse tcp:8080 tcp:8080 (and 8443)
+      2. App config: scheme HTTP, host 127.0.0.1, port 8080.
+         NOTE: do not disable the IME; verify each field via uiautomator dump
+         before tapping Connect, and retry rather than blind-tapping.
+      3. Success = daemon logs "ws open 127.0.0.1:<port>" + "connected ... local
+         http", and the deck renders the laptop hostname + caps chips.
+    Report the daemon log lines as evidence.
+
+A3. RUN TEST CASE T<n>
+    Execute test case T<n> from the runbook. Steps: state the preconditions,
+    perform the action, capture the observable result (screenshot + uiautomator
+    dump + daemon log slice), and give a verdict PASS/FAIL/BLOCKED with the
+    evidence and any UX findings (Fnn). Do not fix anything unless asked.
+
+A4. DIAGNOSE A BLANK / STUCK "Connecting..." SCREEN
+    The app shows a black WebView with a permanent "Connecting..." spinner.
+    Find the root cause. Check, in order: the URL the WebView actually tried
+    (logcat: "Refusing to load for invalid virtual URL"), port validity
+    (must be 1-65535), scheme vs port match, and whether the saved config is
+    correct. Report the offending value and the exact fix.
+
+A5. DIAGNOSE WEBSOCKET CHURN (bytes=0 open/close loop)
+    The daemon shows repeated "ws open" -> "ws closed ... bytes=0" within
+    seconds. Determine whether the client sends no frames (app-layer handshake
+    never starts) or the server sends nothing. Inspect the client JS handshake
+    path, check for a stale service-worker bundle, and report the root cause
+    with a minimal fix.
+
+A6. INSTALL THE LATEST CI RELEASE BUILD
+    Fetch the newest green android.yml run artifact, verify the signer
+    (CN=TailDeck Release, SHA-256 4f1508b7...da20), install over the existing
+    release (uninstall first only if keys differ), then confirm versionCode/
+    versionName and that the JS bridge + a media action still work.
+
+A7. VERIFY RELEASE SIGNING END-TO-END
+    Confirm the CI-built release APK is signed with the TailDeck keystore:
+    apksigner verify --print-certs; compare SHA-256 to the keystore fingerprint
+    4F:15:08:...:DA:20; confirm the workflow decoded the keystore from secrets
+    and that .gitignore excludes *.p12/*.pem/*.crt/password.txt.
+
+A8. CAPTURE EVIDENCE
+    Take a screenshot and a uiautomator dump of the current screen, save both
+    under /tmp/opencode with a descriptive name, and report the visible text,
+    clickable node centers, and any error text.
+
+A9. SET THE APP CONFIG WITHOUT TYPING ERRORS
+    Programmatically set scheme/host/port on the Connection Setup screen.
+    Retry-until-verified: after each action, re-dump and confirm the on-screen
+    Target reads exactly http://127.0.0.1:8080/ before proceeding. Never
+    blind-tap Connect while a text field has focus.
+
+A10. TAIL DAEMON ACTIVITY FOR ONE ACTION
+    Capture taildeck.service logs for the duration of one action, then print
+    only the "ws open / connected / ws closed / closed" lines with their
+    byte counts and durations.
+
+A11. LOG FINDING Fnn
+    Record a new UX/behaviour finding as "Fnn: <symptom> | repro | expected |
+    impact", using the next free number. Append it to the findings list and do
+    not fix it yet.
+
+A12. RESET TO A CLEAN CONNECTED STATE
+    force-stop + pm clear the app, pm grant RECORD_AUDIO BEFORE launching (so
+    no permission dialog), launch, configure HTTP 127.0.0.1:8080, connect, and
+    verify. Note that pm clear revokes runtime permissions — that is why it
+    re-prompts if you grant after launch.
+
+A13. REVIEW UNCOMMITTED CHANGES BEFORE TESTING
+    Show git status/diff, summarise what changed and why, flag anything that
+    looks like a stray edit, and ask before committing. Do not commit unless
+    explicitly told to.
+
+A14. PRODUCE A TEST RUNBOOK
+    Generate a runbook of test cases grouped by area (connection/setup, media,
+    dictation, files/clipboard/screen, system apps/power/brightness, scripts/
+    notifications, desktop VNC/RDP, resilience, regression). Each case: ID,
+    preconditions, steps, expected result, and how to capture evidence.
+
+-------------------------------------------------------------------------------
+SECTION B — GENERAL-PURPOSE ENGINEERING PROMPTS
+-------------------------------------------------------------------------------
+
+B1. DIAGNOSE, DON'T GUESS
+    <symptom>. Reproduce it, find the root cause (not the first plausible
+    cause), and propose the smallest fix. Show the failing evidence, then the
+    fix, then proof it works. No changes until I approve the diagnosis.
+
+B2. IMPLEMENT A FEATURE (spec-first)
+    Implement <feature>. First restate it as concrete acceptance criteria and
+    list the files you'll touch. Then implement in the smallest reviewable
+    steps, following existing conventions in this repo. Verify with the
+    project's own lint/typecheck/test commands and report the exact output.
+
+B3. BUG-FIX WITH A REGRESSION TEST
+    Fix <bug> test-first: write a failing test that captures it, make it pass
+    with the minimal change, then confirm the whole suite is green. Report the
+    new test name and the before/after behaviour.
+
+B4. REFACTOR WITH A SAFETY NET
+    Refactor <area> to <goal> without changing behaviour. Confirm tests are
+    green first, keep them green throughout, and list the structural changes
+    plus any risk you accepted.
+
+B5. CODE REVIEW (standards + spec)
+    Review the changes since <commit/branch>. Two passes: (1) do they follow
+    this repo's documented conventions; (2) do they match the originating
+    issue/spec. Report findings ranked by severity with file:line references
+    and a concrete suggested change for each.
+
+B6. EXPLAIN THIS CODE
+    Explain <file/function> for a new contributor: what it does, its inputs/
+    outputs, its side effects, and the 2-3 things most likely to trip someone
+    up. Use file:line references. Be concise.
+
+B7. RESEARCH WITH SOURCES
+    Research <question>. Prefer primary sources and current docs. Return a
+    short synthesis with the key facts, the trade-offs, and a recommendation,
+    each claim linked to its source. Say explicitly where evidence is thin.
+
+B8. PLAN A MULTI-STEP TASK
+    Turn "<objective>" into a step-by-step plan. For each step: the goal, the
+    files involved, how to verify it, and its dependencies. Flag steps that
+    can run in parallel and any that need my decision first. Do not start
+    implementing.
+
+B9. WRITE/UPGRADE DOCUMENTATION
+    Document <area> for the current code (not an idealised version). Cover
+    purpose, usage examples, gotchas, and where it fits in the architecture.
+    Match the existing docs' tone and structure; don't invent new files unless
+    necessary.
+
+B10. PERFORMANCE PASS
+    Profile <path/feature>, identify the real bottleneck with measurements
+    (not intuition), make the smallest change that improves it, and report
+    before/after numbers plus what you deliberately did not change.
+
+B11. SECURITY REVIEW
+    Review <code/area> for security issues: input handling, authz, secrets,
+    injection, unsafe defaults. Report exploitable issues first with a repro,
+    then hardening suggestions, then note what you checked and found safe.
+
+B12. UNBLOCK ME (state the blocker precisely)
+    I'm blocked on <problem>. Tell me: what you'd need to know to proceed,
+    your best hypothesis, and the one experiment that would confirm or kill it.
+    Ask me for only the minimum missing information.
+
+B13. COMMIT THIS WORK
+    Commit the current changes. Show git status/diff first, stage only the
+    intended files, and write a concise message in this repo's style. Do not
+    push. If anything looks like a stray edit, stop and ask.
+
+B14. DO LESS (scope control)
+    Take the smallest possible change that achieves <goal>. No refactors, no
+    new dependencies, no speculative abstractions. Show the diff and how you
+    verified it.
+
+-------------------------------------------------------------------------------
+TIPS
+----
+- Name the deliverable and the proof ("done = X, verified by Y").
+- State constraints (don't touch X, keep style, no new deps) up front.
+- Say whether you want action or just a plan/diagnosis.
+- Ask for file:line evidence so you can verify the answer yourself.
