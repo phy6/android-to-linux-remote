@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { CornerDownLeft, Delete, Mic, Play, SkipBack, SkipForward, Volume1, Volume2, VolumeX } from 'lucide-react';
+import { CornerDownLeft, Delete, Mic, Play, SkipBack, SkipForward, Volume1, Volume2, VolumeX, X } from 'lucide-react';
 import { useHaptics } from '../hooks/useHaptics';
 import type { MediaAction } from '../types';
 
@@ -10,20 +10,24 @@ const LONG_PRESS_MS = 320;
 // at the screen to land it. 22px is about a thumb's natural drift.
 const DRAG_CANCEL_PX = 22;
 
-// Hold, then slide up: the mic becomes a media remote. The up-slide must clear
-// a deliberate threshold so a stray roll never trips it, and there is hysteresis
-// on the way back down so brushing the line does not flicker between modes.
+// Hold, then slide up: the mic becomes a radial media fan. The up-slide must
+// clear a deliberate threshold so a stray roll never trips it, and there is
+// hysteresis on the way back down so brushing the line does not flicker between
+// modes. Sliding further out walks the fan from the innermost item outward.
 const COMMAND_SLIDE_PX = 56;
 const COMMAND_EXIT_PX = 42;
 const COMMAND_ITEM_PX = 46;
 
-const COMMANDS: { action: MediaAction; label: string; Icon: typeof Mic }[] = [
-  { action: 'mute', label: 'Mute', Icon: VolumeX },
-  { action: 'playpause', label: 'Play/Pause', Icon: Play },
-  { action: 'prev', label: 'Previous', Icon: SkipBack },
-  { action: 'next', label: 'Next', Icon: SkipForward },
-  { action: 'voldown', label: 'Volume down', Icon: Volume1 },
-  { action: 'volup', label: 'Volume up', Icon: Volume2 },
+// The fan's first item is Enter, so the shortest deliberate slide-and-release
+// doubles as a quick Enter key. The rest are the media remote.
+const FAN: { key: string; label: string; Icon: typeof Mic; action?: MediaAction }[] = [
+  { key: 'enter', label: 'Enter', Icon: CornerDownLeft },
+  { key: 'mute', label: 'Mute', Icon: VolumeX, action: 'mute' },
+  { key: 'playpause', label: 'Play/Pause', Icon: Play, action: 'playpause' },
+  { key: 'prev', label: 'Previous', Icon: SkipBack, action: 'prev' },
+  { key: 'next', label: 'Next', Icon: SkipForward, action: 'next' },
+  { key: 'voldown', label: 'Volume down', Icon: Volume1, action: 'voldown' },
+  { key: 'volup', label: 'Volume up', Icon: Volume2, action: 'volup' },
 ];
 
 interface FloatingDictationButtonProps {
@@ -40,6 +44,8 @@ interface FloatingDictationButtonProps {
   onEnterKey?: () => void;
   /** Sends Backspace to the laptop while Return mode is showing. */
   onBackspace?: () => void;
+  /** Leaves Return mode early without waiting for the timeout. */
+  onExitEnterMode?: () => void;
   /** Fires a media command chosen by holding the mic and sliding up. */
   onCommand?: (cmd: MediaAction) => void;
 }
@@ -56,6 +62,7 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
   enterMode = false,
   onEnterKey,
   onBackspace,
+  onExitEnterMode,
   onCommand,
 }) => {
   const { triggerClick, triggerDictationEngaged } = useHaptics(hapticsEnabled, soundEnabled);
@@ -146,7 +153,7 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
       }
       const depth = -dy - COMMAND_SLIDE_PX;
       const idx = Math.min(
-        COMMANDS.length - 1,
+        FAN.length - 1,
         Math.max(0, Math.floor(depth / COMMAND_ITEM_PX)),
       );
       if (idx !== commandIdxRef.current) {
@@ -204,11 +211,12 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
     clearLongPressTimer();
 
     if (commandModeRef.current) {
-      // Release fires the highlighted command; the dictation session was
+      // Release fires the highlighted fan item; the dictation session was
       // already cancelled when command mode was entered.
-      const cmd = COMMANDS[commandIdxRef.current];
+      const item = FAN[commandIdxRef.current];
       triggerClick();
-      onCommand?.(cmd.action);
+      if (item.action) onCommand?.(item.action);
+      else onEnterKey?.();
       commandModeRef.current = false;
       commandIdxRef.current = 0;
       setCommandMode(false);
@@ -272,34 +280,46 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
 
   return (
     <>
-      {/* Slide-up media remote, centred on screen so the thumb sitting on the
-          mic never covers the list the user is choosing from. */}
-      {commandMode && (
-        <div className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-40 flex flex-col items-center gap-2 pointer-events-none">
-          <div className="flex flex-col-reverse items-center gap-1.5">
-            {COMMANDS.map((cmd, i) => {
+      {/* Radial command fan, laid out around the mic and opening toward the
+          screen centre, so the items never end up under the thumb or off the
+          edge wherever the mic has been parked. */}
+      {commandMode && (() => {
+        const vw = typeof window !== 'undefined' ? window.innerWidth : 360;
+        const vh = typeof window !== 'undefined' ? window.innerHeight : 640;
+        const cx = (pos.x / 100) * vw;
+        const cy = (pos.y / 100) * vh;
+        const base = Math.atan2(vh / 2 - cy, vw / 2 - cx);
+        const n = FAN.length;
+        const step = (24 * Math.PI) / 180;
+        const radius = Math.max(96, Math.min(vw, vh) * 0.34);
+        const margin = 62;
+        const clamp = (v: number, lo: number, hi: number) =>
+          Math.max(lo, Math.min(hi, v));
+        return (
+          <div className="fixed inset-0 z-40 pointer-events-none">
+            {FAN.map((item, i) => {
+              const angle = base + (i - (n - 1) / 2) * step;
+              const x = clamp(cx + radius * Math.cos(angle), margin, vw - margin);
+              const y = clamp(cy + radius * Math.sin(angle), margin, vh - margin);
               const selected = i === commandIdx;
               return (
                 <div
-                  key={cmd.action}
-                  style={{ minWidth: 'calc(132px * var(--td-scale, 1))' }}
-                  className={`flex items-center gap-2 rounded-full px-3 py-1.5 border text-xs font-medium transition-all ${
+                  key={item.key}
+                  style={{ left: `${x}px`, top: `${y}px`, transform: 'translate(-50%, -50%)' }}
+                  className={`absolute flex items-center gap-1.5 rounded-full px-3 py-1.5 border text-xs font-medium transition-all ${
                     selected
-                      ? 'bg-indigo-500 border-indigo-300 text-white scale-105 shadow-[0_4px_16px_rgba(79,70,229,0.6)]'
+                      ? 'bg-indigo-500 border-indigo-300 text-white scale-110 shadow-[0_4px_16px_rgba(79,70,229,0.6)]'
                       : 'bg-slate-900/85 border-slate-700/70 text-slate-300'
                   }`}
                 >
-                  <cmd.Icon className="w-4 h-4 shrink-0" />
-                  <span>{cmd.label}</span>
+                  <item.Icon className="w-4 h-4 shrink-0" />
+                  <span>{item.label}</span>
                 </div>
               );
             })}
           </div>
-          <span className="whitespace-nowrap text-[10px] font-semibold text-indigo-100 bg-indigo-950/90 border border-indigo-400/40 rounded-full px-2 py-0.5">
-            Command · slide to choose
-          </span>
-        </div>
-      )}
+        );
+      })()}
 
       <div
         style={{
@@ -312,21 +332,34 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
         }`}
       >
         {enterMode && (
-          <button
-            type="button"
-            onClick={() => {
-              triggerClick();
-              onBackspace?.();
-            }}
-            aria-label="Send Backspace"
-            style={{
-              width: 'calc(68px * var(--td-scale, 1))',
-              height: 'calc(68px * var(--td-scale, 1))',
-            }}
-            className="absolute right-full top-1/2 -translate-y-1/2 mr-3 rounded-full flex items-center justify-center bg-gradient-to-b from-slate-900 to-slate-950 border border-slate-700/80 text-sky-300 shadow-[0_6px_20px_rgba(0,0,0,0.6)] hover:border-slate-600 hover:text-sky-200 active:scale-95 transition"
-          >
-            <Delete className="w-7 h-7" />
-          </button>
+          <>
+            <button
+              type="button"
+              onClick={() => {
+                triggerClick();
+                onBackspace?.();
+              }}
+              aria-label="Send Backspace"
+              style={{
+                width: 'calc(68px * var(--td-scale, 1))',
+                height: 'calc(68px * var(--td-scale, 1))',
+              }}
+              className="absolute right-full top-1/2 -translate-y-1/2 mr-3 rounded-full flex items-center justify-center bg-gradient-to-b from-slate-900 to-slate-950 border border-slate-700/80 text-sky-300 shadow-[0_6px_20px_rgba(0,0,0,0.6)] hover:border-slate-600 hover:text-sky-200 active:scale-95 transition"
+            >
+              <Delete className="w-7 h-7" />
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                triggerClick();
+                onExitEnterMode?.();
+              }}
+              aria-label="Exit Return mode"
+              className="absolute left-1/2 bottom-full mb-3 -translate-x-1/2 rounded-full w-8 h-8 flex items-center justify-center bg-slate-900/90 border border-slate-700/80 text-slate-300 shadow-[0_4px_14px_rgba(0,0,0,0.6)] hover:border-slate-600 hover:text-white active:scale-95 transition"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </>
         )}
 
         {/* Simple floating circular button with microphone icon */}
@@ -375,7 +408,12 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
         )}
         {enterMode && (
           <span className="absolute left-1/2 top-full mt-2 -translate-x-1/2 whitespace-nowrap text-[10px] font-semibold text-emerald-100 bg-emerald-950/90 border border-emerald-400/40 rounded-full px-2 py-0.5 pointer-events-none">
-            Tap: Return
+            Tap: Return · × to exit
+          </span>
+        )}
+        {commandMode && (
+          <span className="absolute left-1/2 top-full mt-2 -translate-x-1/2 whitespace-nowrap text-[10px] font-semibold text-indigo-100 bg-indigo-950/90 border border-indigo-400/40 rounded-full px-2 py-0.5 pointer-events-none">
+            Slide out to choose · release to fire
           </span>
         )}
       </div>

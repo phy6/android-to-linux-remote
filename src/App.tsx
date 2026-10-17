@@ -147,6 +147,27 @@ export default function App() {
     }
   }, []);
 
+  // Return/Delete mode stays up for 12s, and every Return/Delete tap re-arms it,
+  // so it never times out mid-use (the 5s window used to vanish under the thumb).
+  const armEnterPrompt = useCallback((holdMs = 12000) => {
+    if (enterPromptTimerRef.current !== null) {
+      window.clearTimeout(enterPromptTimerRef.current);
+    }
+    setEnterPrompt(true);
+    enterPromptTimerRef.current = window.setTimeout(() => {
+      enterPromptTimerRef.current = null;
+      setEnterPrompt(false);
+    }, holdMs);
+  }, []);
+
+  const exitEnterPrompt = useCallback(() => {
+    if (enterPromptTimerRef.current !== null) {
+      window.clearTimeout(enterPromptTimerRef.current);
+      enterPromptTimerRef.current = null;
+    }
+    setEnterPrompt(false);
+  }, []);
+
   // The laptop's recogniser is the authority on what was said; showing its
   // text on the phone is the only confirmation available when the phone is
   // being used away from the screen.
@@ -169,17 +190,10 @@ export default function App() {
       // Live per-phrase text arrives mid-hold, and offering Return then flipped
       // the mic (and its Delete key) out from under the user's thumb.
       if (heard.trim() && !pttActiveRef.current) {
-        if (enterPromptTimerRef.current !== null) {
-          window.clearTimeout(enterPromptTimerRef.current);
-        }
-        setEnterPrompt(true);
-        enterPromptTimerRef.current = window.setTimeout(() => {
-          enterPromptTimerRef.current = null;
-          setEnterPrompt(false);
-        }, 5000);
+        armEnterPrompt();
       }
     });
-  }, [clearTranscriptTimer]);
+  }, [clearTranscriptTimer, armEnterPrompt]);
 
   // Live hypotheses streamed back while still holding the mic. Preview only:
   // the final text replaces them once the laptop finishes its re-decode.
@@ -898,14 +912,14 @@ export default function App() {
         onPushToTalkCancel={handlePttCancel}
         enterMode={enterPrompt}
         onEnterKey={() => {
-          if (enterPromptTimerRef.current !== null) {
-            window.clearTimeout(enterPromptTimerRef.current);
-            enterPromptTimerRef.current = null;
-          }
-          setEnterPrompt(false);
+          armEnterPrompt();
           linuxClient.sendKeyCombo(['Return']);
         }}
-        onBackspace={() => linuxClient.sendKeyCombo(['BackSpace'])}
+        onBackspace={() => {
+          armEnterPrompt();
+          linuxClient.sendKeyCombo(['BackSpace']);
+        }}
+        onExitEnterMode={exitEnterPrompt}
         onCommand={(cmd) => linuxClient.sendMedia(cmd)}
       />
 
