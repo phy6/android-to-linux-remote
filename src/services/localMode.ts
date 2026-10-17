@@ -9,11 +9,30 @@
 const LOOPBACK = /^(localhost|127\.\d+\.\d+\.\d+|\[::1\])$/i;
 const HOSTED = /(^|\.)github\.io$/i;
 
+// The native Android shell loads the deck from the daemon itself. Over a USB
+// `adb reverse` tunnel the daemon answers on 127.0.0.1, so a loopback origin is
+// the laptop there — not the hosted copy. The shell marks the page with this
+// query flag and injects window.TailDeckNative.
+export const NATIVE_MARKER = 'td_native';
+
+/** True when the page is running inside the native Android shell. */
+export function isNativeShell(): boolean {
+  if (typeof window === 'undefined') return false;
+  if ((window as unknown as { TailDeckNative?: unknown }).TailDeckNative) return true;
+  if (typeof location === 'undefined') return false;
+  try {
+    return new URLSearchParams(location.search).has(NATIVE_MARKER);
+  } catch {
+    return false;
+  }
+}
+
 export function localHost(): string {
   if (typeof location === 'undefined') return '';
   const { protocol, hostname, host } = location;
   if (protocol !== 'http:' && protocol !== 'https:') return '';
-  if (HOSTED.test(hostname) || LOOPBACK.test(hostname)) return '';
+  if (HOSTED.test(hostname)) return '';
+  if (LOOPBACK.test(hostname) && !isNativeShell()) return '';
   return host;
 }
 

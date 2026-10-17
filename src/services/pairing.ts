@@ -1,8 +1,18 @@
 import { ConnectionStatus } from '../types';
+import { isNativeShell } from './localMode';
 
 // Hosts that only serve the app itself; scanning/encoding them would pair the
 // phone back to the hosted page instead of to a laptop.
-const HOSTED_HOSTS = ['phy6.github.io', 'localhost', '127.0.0.1'];
+const HOSTED_HOSTS = ['phy6.github.io'];
+// Loopback is the app's own origin on a dev server, but it is the laptop when
+// the native shell reaches it over a USB `adb reverse` tunnel.
+const LOOPBACK_HOSTS = ['localhost', '127.0.0.1'];
+
+function originIsLaptop(originHost: string): boolean {
+  if (HOSTED_HOSTS.some((h) => originHost.includes(h))) return false;
+  if (LOOPBACK_HOSTS.some((h) => originHost.includes(h))) return isNativeShell();
+  return true;
+}
 
 // Tailscale hands out CGNAT addresses (100.64.0.0/10); those are not reachable
 // from a phone that is merely on the same hotspot.
@@ -95,7 +105,7 @@ export function pairingRoutes(status: ConnectionStatus, originHost?: string): Pa
   // Last resort when the daemon has not reported its addresses yet: the address
   // this page is itself being viewed on, as long as that is a laptop and not
   // the hosted copy.
-  if (originHost && !HOSTED_HOSTS.some((h) => originHost.includes(h))) {
+  if (originHost && originIsLaptop(originHost)) {
     add('origin', 'This address', 'The address you are viewing this page on.', originHost);
   }
 
