@@ -9,3 +9,6 @@ coverage/
 !.env.example
 __pycache__/
 *.pyc
+
+# Generated pairing-QR pages; embed the live LAN IP and tailnet hostname.
+qrs/

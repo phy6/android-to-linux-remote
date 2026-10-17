@@ -22,6 +22,7 @@ import {
 import { FloatingDictationButton } from './components/FloatingDictationButton';
 import { DictationModal } from './components/DictationModal';
 import { SideMenuDrawer } from './components/SideMenuDrawer';
+import { SetupQrScreen } from './components/SetupQrScreen';
 import { LinuxSimulator } from './components/LinuxSimulator';
 import { DarkOut } from './components/DarkOut';
 import { useSpeechRecognition } from './hooks/useSpeechRecognition';
@@ -86,11 +87,17 @@ export default function App() {
 
   // Side Drawer & Modals
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
+  const [drawerTab, setDrawerTab] = useState<'tailscale' | 'keys' | 'media' | 'settings' | 'help' | undefined>();
+  const [showSetup, setShowSetup] = useState(false);
   const [isDictationOpen, setIsDictationOpen] = useState(false);
   const [showSimulator, setShowSimulator] = useState(false);
   const [darkOut, setDarkOut] = useState(false);
   const [isPttActive, setIsPttActive] = useState(false);
   const [pttPhase, setPttPhase] = useState<'idle' | 'listening' | 'transcribing'>('idle');
+  // True from the instant the mic is pressed until capture actually begins, so
+  // the "Listening…" indicator appears immediately instead of waiting on the
+  // mic open (getUserMedia), which is the slow part on Android.
+  const [pttWarming, setPttWarming] = useState(false);
   const [pttTranscript, setPttTranscript] = useState<string | null>(null);
   const pttTranscriptTimerRef = useRef<number | null>(null);
 
@@ -120,6 +127,10 @@ export default function App() {
   // Surface speech failures on the deck itself, otherwise a blocked microphone
   // makes push-to-talk fail with no visible reason.
   const [speechNotice, setSpeechNotice] = useState<string | null>(null);
+  // The daemon types a dictation into the focused window but never submits it,
+  // so for a few seconds after a session the mic doubles as a Return key.
+  const [enterPrompt, setEnterPrompt] = useState(false);
+  const enterPromptTimerRef = useRef<number | null>(null);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [toast, setToast] = useState<{ text: string; kind: 'ok' | 'warn' } | null>(null);
   const toastTimerRef = useRef<number | null>(null);
@@ -143,6 +154,18 @@ export default function App() {
         pttTranscriptTimerRef.current = null;
         setPttTranscript(null);
       }, 9000);
+      // Offer Return only when words actually landed, and only for as long as
+      // the confirmation is on screen-ish; the mic reverts to the mic after.
+      if (heard.trim()) {
+        if (enterPromptTimerRef.current !== null) {
+          window.clearTimeout(enterPromptTimerRef.current);
+        }
+        setEnterPrompt(true);
+        enterPromptTimerRef.current = window.setTimeout(() => {
+          enterPromptTimerRef.current = null;
+          setEnterPrompt(false);
+        }, 5000);
+      }
     });
   }, [clearTranscriptTimer]);
 
@@ -181,6 +204,9 @@ export default function App() {
       if (noticeTimerRef.current !== null) {
         window.clearTimeout(noticeTimerRef.current);
       }
+      if (enterPromptTimerRef.current !== null) {
+        window.clearTimeout(enterPromptTimerRef.current);
+      }
     },
     []
   );
@@ -196,6 +222,12 @@ export default function App() {
     clearTranscriptTimer();
     setPttTranscript(null);
     setPttPhase('listening');
+    setPttWarming(true);
+    if (enterPromptTimerRef.current !== null) {
+      window.clearTimeout(enterPromptTimerRef.current);
+      enterPromptTimerRef.current = null;
+    }
+    setEnterPrompt(false);
     if (pttSendTimerRef.current !== null) {
       window.clearTimeout(pttSendTimerRef.current);
       pttSendTimerRef.current = null;
@@ -203,57 +235,84 @@ export default function App() {
 
     const token = ++pttTokenRef.current;
 
-    // Prefer the laptop's own offline recogniser: it is already warm, works
-    // offline and does not depend on the browser speech engine. Fall back to
-    // the browser only when the daemon cannot take the session.
-    void linuxClient.startDictation().then(async (ok) => {
+    // Open the mic and open the laptop session at the same time. The websocket
+    // round-trip is short, so overlapping it under getUserMedia — the slow part
+    // on Android — keeps the handshake off the critical path. The stream is
+    // warm from the previous press, so this is usually just a graph re-wire.
+    const capture = new PcmCapture({
+      onChunk: (pcm) => linuxClient.sendDictationAudio(pcm),
+      onError: () => showToast('Microphone unavailable', 'warn'),
+    });
+    let micError: unknown = null;
+    const micReady = capture.start().catch((err) => {
+      micError = err;
+    });
+    const sessionReady = linuxClient.startDictation();
+
+    void (async () => {
+      // Prefer the laptop's own offline recogniser: it is already warm, works
+      // offline and does not depend on the browser speech engine. Fall back to
+      // the browser only when the daemon cannot take the session.
+      const ok = await sessionReady;
+
       if (pttTokenRef.current !== token) {
         if (ok) linuxClient.stopDictation();
-        return;
-      }
-      if (ok) {
-        daemonPttRef.current = true;
-        const capture = new PcmCapture({
-          onChunk: (pcm) => linuxClient.sendDictationAudio(pcm),
-          onError: () => showToast('Microphone unavailable', 'warn'),
-        });
-        captureRef.current = capture;
-        try {
-          await capture.start();
-        } catch {
-          linuxClient.stopDictation();
-          daemonPttRef.current = false;
-          showSpeechNotice(
-            'Microphone blocked. Allow it for this site in your browser settings.'
-          );
-          setIsPttActive(false);
-          return;
-        }
-        if (pttTokenRef.current !== token) {
-          capture.stop();
-          linuxClient.stopDictation();
-          daemonPttRef.current = false;
-          return;
-        }
-        setIsPttActive(true);
+        capture.stop();
         return;
       }
 
-      daemonPttRef.current = false;
-      void speech.startListening().then((started) => {
-        if (pttTokenRef.current !== token) {
-          if (started) speech.abortListening();
-          return;
-        }
-        setIsPttActive(started);
-      });
-    });
+      if (!ok) {
+        // No laptop session: drop the mic we speculatively opened and use the
+        // browser's own recogniser instead.
+        capture.stop();
+        daemonPttRef.current = false;
+        void speech.startListening().then((started) => {
+          if (pttTokenRef.current !== token) {
+            if (started) speech.abortListening();
+            return;
+          }
+          setIsPttActive(started);
+          setPttWarming(false);
+          if (!started) setPttPhase('idle');
+        });
+        return;
+      }
+
+      daemonPttRef.current = true;
+      captureRef.current = capture;
+      await micReady;
+
+      if (micError) {
+        captureRef.current = null;
+        linuxClient.stopDictation();
+        daemonPttRef.current = false;
+        setPttWarming(false);
+        setPttPhase('idle');
+        showSpeechNotice(
+          'Microphone blocked. Allow it for this site in your browser settings.'
+        );
+        setIsPttActive(false);
+        return;
+      }
+      if (pttTokenRef.current !== token) {
+        captureRef.current = null;
+        capture.stop();
+        linuxClient.stopDictation();
+        daemonPttRef.current = false;
+        setPttWarming(false);
+        setPttPhase('idle');
+        return;
+      }
+      setPttWarming(false);
+      setIsPttActive(true);
+    })();
   }, [speech, showToast, showSpeechNotice, clearTranscriptTimer]);
 
   const handlePttEnd = useCallback(() => {
     // Invalidate any start that is still awaiting permission.
     pttTokenRef.current += 1;
     setIsPttActive(false);
+    setPttWarming(false);
 
     if (pttSendTimerRef.current !== null) {
       window.clearTimeout(pttSendTimerRef.current);
@@ -299,6 +358,7 @@ export default function App() {
   const handlePttCancel = useCallback(() => {
     pttTokenRef.current += 1;
     setIsPttActive(false);
+    setPttWarming(false);
     clearTranscriptTimer();
     setPttPhase('idle');
     if (pttSendTimerRef.current !== null) {
@@ -427,6 +487,26 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connectionStatus.connected, connectionStatus.connecting, connectionStatus.error, connectionStatus.hostAddress]);
 
+  // A dead link should hand the user a way back in, not a dead end. When the
+  // app has settled into "not connected", surface the setup QR screen once, so
+  // the address and codes are already on screen instead of buried in a menu.
+  const setupAutoShownRef = useRef(false);
+  useEffect(() => {
+    if (connectionStatus.connected) {
+      if (setupAutoShownRef.current) setShowSetup(false);
+      setupAutoShownRef.current = false;
+      return;
+    }
+    if (connectionStatus.connecting) return;
+    if (setupAutoShownRef.current) return;
+    const timer = window.setTimeout(() => {
+      if (setupAutoShownRef.current) return;
+      setupAutoShownRef.current = true;
+      setShowSetup(true);
+    }, 4500);
+    return () => window.clearTimeout(timer);
+  }, [connectionStatus.connected, connectionStatus.connecting, connectionStatus.hostAddress]);
+
   // Remember whichever host actually answered, so the address is never retyped.
   const persistedHostRef = useRef<string | null>(null);
   useEffect(() => {
@@ -550,6 +630,10 @@ export default function App() {
     setDarkOut(true);
   }, []);
 
+  // Either the mic is live, or we are still opening it right after the press.
+  // Both read as "Listening…" so the feedback is instant.
+  const pttListening = isPttActive || pttWarming;
+
   return (
     <div
       className="flex flex-col h-[100dvh] w-full bg-slate-950 text-slate-100 font-sans select-none overflow-hidden touch-none relative"
@@ -600,30 +684,51 @@ export default function App() {
       <SideMenuDrawer
         isOpen={isDrawerOpen}
         onOpen={() => setIsDrawerOpen(true)}
-        onClose={() => setIsDrawerOpen(false)}
+        onClose={() => {
+          setIsDrawerOpen(false);
+          setDrawerTab(undefined);
+        }}
+        openTab={drawerTab}
         connectionStatus={connectionStatus}
         settings={settings}
         onUpdateSettings={handleUpdateSettings}
         onToggleSimulator={() => setShowSimulator((prev) => !prev)}
         onOpenDictation={() => setIsDictationOpen(true)}
         onOpenDiagnostics={() => setShowDiagnostics(true)}
+        onOpenSetup={() => {
+          setIsDrawerOpen(false);
+          setShowSetup(true);
+        }}
         isSimulatorActive={showSimulator}
         onEnterDarkOut={enterDarkOut}
         appUpdateReady={appUpdateReady}
         onApplyAppUpdate={applyAppUpdate}
       />
 
+      {/* Setup / QR: the whole way in, on one screen. Opens itself when the app
+          has no connection so a phone can be pointed at it and paired. */}
+      <SetupQrScreen
+        isOpen={showSetup}
+        onClose={() => setShowSetup(false)}
+        status={connectionStatus}
+        onScan={() => {
+          setShowSetup(false);
+          setDrawerTab('tailscale');
+          setIsDrawerOpen(true);
+        }}
+      />
+
       {/* Full-screen push-to-talk state: the mic button sits under the thumb,
           so the deck itself has to show what is happening. The laptop types
           into its own focused window, which the phone cannot see, so the
           transcript is echoed back here as the only confirmation available. */}
-      {(isPttActive || pttPhase === 'transcribing') && (
+      {(pttListening || pttPhase === 'transcribing') && (
         <div className="fixed inset-0 z-20 pointer-events-none flex flex-col items-center justify-center">
           <div
-            className={`absolute inset-0 ${isPttActive ? 'bg-rose-950/25' : 'bg-slate-950/35'}`}
+            className={`absolute inset-0 ${pttListening ? 'bg-rose-950/25' : 'bg-slate-950/35'}`}
           />
           <div className="relative flex items-center gap-3 px-5 py-3 rounded-2xl bg-slate-950/85 border border-rose-500/50 shadow-lg shadow-black/60">
-            {isPttActive ? (
+            {pttListening ? (
               <>
                 <span className="relative flex h-3 w-3">
                   <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-75" />
@@ -639,7 +744,7 @@ export default function App() {
             )}
           </div>
           <p className="relative mt-3 text-[11px] text-rose-200/70">
-            {isPttActive ? 'Release to send to your laptop' : 'Typing on your laptop'}
+            {pttListening ? 'Release to send to your laptop' : 'Typing on your laptop'}
           </p>
         </div>
       )}
@@ -728,6 +833,15 @@ export default function App() {
         onPushToTalkStart={handlePttStart}
         onPushToTalkEnd={handlePttEnd}
         onPushToTalkCancel={handlePttCancel}
+        enterMode={enterPrompt}
+        onEnterKey={() => {
+          if (enterPromptTimerRef.current !== null) {
+            window.clearTimeout(enterPromptTimerRef.current);
+            enterPromptTimerRef.current = null;
+          }
+          setEnterPrompt(false);
+          linuxClient.sendKeyCombo(['Return']);
+        }}
       />
 
       {/* Voice Dictation Input Sheet */}

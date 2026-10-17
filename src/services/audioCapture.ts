@@ -4,6 +4,11 @@
  *
  * Chrome hands us audio at the AudioContext rate (44.1 or 48 kHz), so the
  * stream is linearly resampled down to 16 kHz before it leaves the phone.
+ *
+ * Opening the mic costs hundreds of milliseconds on Android and closing it
+ * makes the *next* press pay that again, so the stream and the AudioContext are
+ * held warm between presses and dropped only after a short idle. A press just
+ * (re)wires the graph, which is what makes push-to-talk start feel instant.
  */
 
 export const TARGET_RATE = 16000;
@@ -15,6 +20,89 @@ interface Options {
   /** Milliseconds of audio buffered before the first chunk is emitted. */
   flushMs?: number;
   onError?: (err: Error) => void;
+}
+
+/** How long the mic is kept warm after the last press before it is released. */
+const IDLE_RELEASE_MS = 20000;
+
+const AUDIO_CONSTRAINTS: MediaStreamConstraints = {
+  audio: {
+    channelCount: 1,
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+  },
+};
+
+// --- warm microphone shared across presses -----------------------------------
+
+let sharedStream: MediaStream | null = null;
+let sharedCtx: AudioContext | null = null;
+let workletReady = false;
+let workletSupported = true;
+let idleTimer: number | null = null;
+let activeSessions = 0;
+
+function cancelIdleRelease() {
+  if (idleTimer !== null) {
+    window.clearTimeout(idleTimer);
+    idleTimer = null;
+  }
+}
+
+/** Drop the warm mic. No-op while a session is still using it. */
+function releaseMic() {
+  cancelIdleRelease();
+  if (activeSessions > 0) return;
+  if (sharedStream) {
+    sharedStream.getTracks().forEach((track) => track.stop());
+    sharedStream = null;
+  }
+  if (sharedCtx) {
+    void sharedCtx.close().catch(() => undefined);
+    sharedCtx = null;
+  }
+  workletReady = false;
+  workletSupported = true;
+}
+
+function scheduleIdleRelease() {
+  cancelIdleRelease();
+  idleTimer = window.setTimeout(() => {
+    idleTimer = null;
+    releaseMic();
+  }, IDLE_RELEASE_MS);
+}
+
+async function acquireMic(): Promise<{ stream: MediaStream; ctx: AudioContext }> {
+  cancelIdleRelease();
+
+  const live =
+    sharedStream !== null &&
+    sharedStream.getAudioTracks().some((track) => track.readyState === 'live');
+  if (!live) {
+    sharedStream = await navigator.mediaDevices.getUserMedia(AUDIO_CONSTRAINTS);
+  }
+
+  if (!sharedCtx || sharedCtx.state === 'closed') {
+    const Ctx: typeof AudioContext =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext })
+        .webkitAudioContext;
+    sharedCtx = new Ctx();
+    workletReady = false;
+    workletSupported = true;
+  }
+  if (sharedCtx.state === 'suspended') await sharedCtx.resume();
+
+  return { stream: sharedStream as MediaStream, ctx: sharedCtx };
+}
+
+// Never leave the mic hot while the app is in the background.
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') releaseMic();
+  });
 }
 
 /**
@@ -43,8 +131,6 @@ export function resampleToTarget(
 }
 
 export class PcmCapture {
-  private stream: MediaStream | null = null;
-  private ctx: AudioContext | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
   private node: AudioWorkletNode | ScriptProcessorNode | null = null;
   private sink: GainNode | null = null;
@@ -54,67 +140,84 @@ export class PcmCapture {
   private pending: Float32Array = new Float32Array(0);
   private ratio = 1;
   private stopped = false;
+  private sessionOpen = false;
 
-  constructor({ onChunk, flushMs = 100, onError }: Options) {
+  constructor({ onChunk, flushMs = 64, onError }: Options) {
     this.onChunk = onChunk;
     this.flushSamples = Math.max(1, Math.round((TARGET_RATE * flushMs) / 1000));
     this.onError = onError;
   }
 
+  private openSession() {
+    if (this.sessionOpen) return;
+    this.sessionOpen = true;
+    activeSessions += 1;
+    cancelIdleRelease();
+  }
+
+  private closeSession() {
+    if (!this.sessionOpen) return;
+    this.sessionOpen = false;
+    activeSessions = Math.max(0, activeSessions - 1);
+    scheduleIdleRelease();
+  }
+
   async start(): Promise<void> {
-    this.stopped = false;
-    this.stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
-    });
-
-    const Ctx: typeof AudioContext =
-      window.AudioContext ||
-      (window as unknown as { webkitAudioContext: typeof AudioContext })
-        .webkitAudioContext;
-    this.ctx = new Ctx();
-    if (this.ctx.state === 'suspended') await this.ctx.resume();
-
-    this.source = this.ctx.createMediaStreamSource(this.stream);
-    this.ratio = this.ctx.sampleRate / TARGET_RATE;
-
+    if (this.stopped) return;
+    this.openSession();
+    let wired = false;
     try {
-      await this.attachWorklet();
-    } catch {
-      this.attachScriptProcessor();
+      const { stream, ctx } = await acquireMic();
+      // A stop() may have landed while the mic was opening; leave nothing wired.
+      if (this.stopped) return;
+
+      this.ratio = ctx.sampleRate / TARGET_RATE;
+      this.source = ctx.createMediaStreamSource(stream);
+
+      try {
+        await this.attachWorklet(ctx);
+      } catch {
+        // ScriptProcessor is deprecated but is the reliable path on older
+        // Android Chrome and in non-secure contexts where AudioWorklet is off.
+        workletSupported = false;
+        this.attachScriptProcessor(ctx);
+      }
+      wired = true;
+    } finally {
+      if (!wired) this.closeSession();
     }
   }
 
-  private async attachWorklet() {
-    if (!this.ctx || !this.source) throw new Error('no audio graph');
+  private async attachWorklet(ctx: AudioContext) {
+    if (!this.source) throw new Error('no audio graph');
+    if (!workletSupported) throw new Error('audio worklet unavailable');
 
-    const workletCode = `
-      class PcmTap extends AudioWorkletProcessor {
-        process(inputs) {
-          const input = inputs[0];
-          if (input && input[0]) {
-            // Copy, the input buffer is reused between callbacks.
-            this.port.postMessage(new Float32Array(input[0]));
+    if (!workletReady) {
+      const workletCode = `
+        class PcmTap extends AudioWorkletProcessor {
+          process(inputs) {
+            const input = inputs[0];
+            if (input && input[0]) {
+              // Copy, the input buffer is reused between callbacks.
+              this.port.postMessage(new Float32Array(input[0]));
+            }
+            return true;
           }
-          return true;
         }
+        registerProcessor('pcm-tap', PcmTap);
+      `;
+      const url = URL.createObjectURL(
+        new Blob([workletCode], { type: 'application/javascript' })
+      );
+      try {
+        await ctx.audioWorklet.addModule(url);
+      } finally {
+        URL.revokeObjectURL(url);
       }
-      registerProcessor('pcm-tap', PcmTap);
-    `;
-    const url = URL.createObjectURL(
-      new Blob([workletCode], { type: 'application/javascript' })
-    );
-    try {
-      await this.ctx.audioWorklet.addModule(url);
-    } finally {
-      URL.revokeObjectURL(url);
+      workletReady = true;
     }
 
-    const node = new AudioWorkletNode(this.ctx, 'pcm-tap');
+    const node = new AudioWorkletNode(ctx, 'pcm-tap');
     node.port.onmessage = (event: MessageEvent<Float32Array>) => {
       this.push(event.data);
     };
@@ -124,17 +227,17 @@ export class PcmCapture {
     this.source.connect(node);
     // A muted sink keeps the graph pulled on machines with no output device,
     // where connecting straight to destination can leave the node idle.
-    this.sink = this.ctx.createGain();
+    this.sink = ctx.createGain();
     this.sink.gain.value = 0;
     node.connect(this.sink);
-    this.sink.connect(this.ctx.destination);
+    this.sink.connect(ctx.destination);
     this.node = node;
   }
 
-  private attachScriptProcessor() {
-    if (!this.ctx || !this.source) return;
+  private attachScriptProcessor(ctx: AudioContext) {
+    if (!this.source) return;
     // Deprecated but still the most reliable path on older Android Chrome.
-    const node = this.ctx.createScriptProcessor(2048, 1, 1);
+    const node = ctx.createScriptProcessor(2048, 1, 1);
     node.onaudioprocess = (event) => {
       this.push(new Float32Array(event.inputBuffer.getChannelData(0)));
     };
@@ -143,10 +246,10 @@ export class PcmCapture {
     this.source.connect(node);
     // A muted sink keeps the graph pulled on machines with no output device,
     // where connecting straight to destination can leave the node idle.
-    this.sink = this.ctx.createGain();
+    this.sink = ctx.createGain();
     this.sink.gain.value = 0;
     node.connect(this.sink);
-    this.sink.connect(this.ctx.destination);
+    this.sink.connect(ctx.destination);
     this.node = node;
   }
 
@@ -185,10 +288,8 @@ export class PcmCapture {
     this.sink = null;
     this.source?.disconnect();
     this.source = null;
-    this.stream?.getTracks().forEach((track) => track.stop());
-    this.stream = null;
-    void this.ctx?.close().catch(() => undefined);
-    this.ctx = null;
     this.pending = new Float32Array(0);
+    // The stream and context stay warm for the next press.
+    this.closeSession();
   }
 }

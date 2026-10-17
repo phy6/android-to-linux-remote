@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Mic } from 'lucide-react';
+import { CornerDownLeft, Mic } from 'lucide-react';
 import { useHaptics } from '../hooks/useHaptics';
 
 const LONG_PRESS_MS = 320;
@@ -18,6 +18,9 @@ interface FloatingDictationButtonProps {
   onPushToTalkStart: () => void;
   onPushToTalkEnd: () => void;
   onPushToTalkCancel?: () => void;
+  /** Briefly turns the mic into a Return key after a dictation lands. */
+  enterMode?: boolean;
+  onEnterKey?: () => void;
 }
 
 export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = ({
@@ -29,6 +32,8 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
   onPushToTalkStart,
   onPushToTalkEnd,
   onPushToTalkCancel,
+  enterMode = false,
+  onEnterKey,
 }) => {
   const { triggerClick, triggerDictationEngaged } = useHaptics(hapticsEnabled, soundEnabled);
 
@@ -79,8 +84,9 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
 
     // Start talking the instant a finger lands. Waiting for a hold threshold
     // made a normal press fall through to the dictation sheet instead, which is
-    // exactly the behaviour this button is meant to avoid.
-    if (!dragRef.current.hasMoved) {
+    // exactly the behaviour this button is meant to avoid. In Return mode the
+    // press is a tap, so it must not open a dictation session.
+    if (!enterMode && !dragRef.current.hasMoved) {
       pttEngagedRef.current = true;
       triggerDictationEngaged();
       onPushToTalkStart();
@@ -120,13 +126,17 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
     if (!dragRef.current) return;
     clearLongPressTimer();
 
-    if (pttEngagedRef.current) {
-      // Release ends the push-to-talk session and types what was spoken.
-      onPushToTalkEnd();
-    } else if (dragRef.current.hasMoved) {
+    if (dragRef.current.hasMoved) {
       // Saved dragged position
       localStorage.setItem('taildeck_floating_mic_pos', JSON.stringify(pos));
       triggerClick();
+    } else if (enterMode) {
+      // A tap on the Return key submits, then the mic comes straight back.
+      triggerClick();
+      onEnterKey?.();
+    } else if (pttEngagedRef.current) {
+      // Release ends the push-to-talk session and types what was spoken.
+      onPushToTalkEnd();
     }
 
     setIsPressing(false);
@@ -176,28 +186,39 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
         onPointerCancel={handlePointerCancel}
         role="button"
         tabIndex={0}
-        aria-label={isPttLabel}
+        aria-label={enterMode ? 'Send Return key' : isPttLabel}
         style={{ width: 'calc(104px * var(--td-scale, 1))', height: 'calc(104px * var(--td-scale, 1))' }}
         className={`relative rounded-full flex items-center justify-center shadow-[0_6px_20px_rgba(0,0,0,0.6)] border transition-all ${
           isPressing ? 'scale-95' : ''
         } ${
-          active
-            ? 'bg-rose-600 border-rose-400 text-white shadow-rose-600/50'
-            : 'bg-gradient-to-tr from-sky-600 to-blue-500 border-sky-400/60 text-white shadow-sky-600/30 hover:from-sky-500 hover:to-blue-400'
+          enterMode
+            ? 'bg-gradient-to-tr from-emerald-600 to-teal-500 border-emerald-300 text-white shadow-emerald-500/50 animate-pulse'
+            : active
+              ? 'bg-rose-600 border-rose-400 text-white shadow-rose-600/50'
+              : 'bg-gradient-to-tr from-sky-600 to-blue-500 border-sky-400/60 text-white shadow-sky-600/30 hover:from-sky-500 hover:to-blue-400'
         }`}
       >
         {/* Pulsing halo while the push-to-talk session is live */}
-        {active && (
+        {active && !enterMode && (
           <span className="absolute -inset-3 rounded-full border-2 border-rose-500/60 animate-ping pointer-events-none" />
         )}
 
-        <Mic className={`w-11 h-11 ${active ? 'animate-bounce' : ''}`} />
+        {enterMode ? (
+          <CornerDownLeft className="w-11 h-11" />
+        ) : (
+          <Mic className={`w-11 h-11 ${active ? 'animate-bounce' : ''}`} />
+        )}
       </div>
 
-      {/* Hold hint, only while pressing so it never clutters the deck */}
-      {isPressing && (
+      {/* Hold hint while pressing; in Return mode it explains the swap */}
+      {isPressing && !enterMode && (
         <span className="absolute left-1/2 top-full mt-2 -translate-x-1/2 whitespace-nowrap text-[10px] font-medium text-sky-200/90 bg-slate-900/90 border border-sky-500/30 rounded-full px-2 py-0.5 pointer-events-none">
           Listening
+        </span>
+      )}
+      {enterMode && (
+        <span className="absolute left-1/2 top-full mt-2 -translate-x-1/2 whitespace-nowrap text-[10px] font-semibold text-emerald-100 bg-emerald-950/90 border border-emerald-400/40 rounded-full px-2 py-0.5 pointer-events-none">
+          Tap: Return
         </span>
       )}
     </div>

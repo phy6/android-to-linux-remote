@@ -13,6 +13,7 @@ import time
 import socket
 import ssl
 import struct
+import atexit
 import tarfile
 import urllib.parse
 import urllib.request
@@ -22,10 +23,13 @@ import base64
 import threading
 import subprocess
 import tempfile
+import shlex
+import shutil
+import re
 import pwd
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-DAEMON_VERSION = "1.4.0"
+DAEMON_VERSION = "1.7.0"
 
 PORT = int(os.environ.get("TAILDECK_PORT", 8080))
 DICTATE_HOST = os.environ.get("TAILDECK_DICTATE_HOST", "127.0.0.1")
@@ -193,6 +197,11 @@ class LinuxInputBackend:
                     e.KEY_ENTER, e.KEY_BACKSPACE, e.KEY_SPACE, e.KEY_ESC,
                     e.KEY_RIGHTCTRL, e.KEY_RIGHTALT, e.KEY_RIGHTSHIFT,
                     e.KEY_LEFTMETA, e.KEY_VOLUMEUP, e.KEY_VOLUMEDOWN, e.KEY_MUTE,
+                    # Media transport keys for the phone's media row. A uinput
+                    # device only advertises the keys it declared, so without
+                    # these the play/next/prev/stop events are delivered but X
+                    # has no keycode for them and the player never reacts.
+                    e.KEY_PLAYPAUSE, e.KEY_NEXTSONG, e.KEY_PREVIOUSSONG, e.KEY_STOPCD,
                     # A uinput device can only emit keys it declared, so typing
                     # needs the full letter/digit/symbol set up front.
                     *[getattr(e, "KEY_" + chr(ord("A") + i)) for i in range(26)],
@@ -634,6 +643,30 @@ SCRIPTS_DIR = os.environ.get(
 )
 SCRIPT_EXT = (".txt", ".md", ".markdown")
 
+# Phase 2: a sandboxed folder the phone may browse, download from and upload
+# into. It is the only tree the files API can reach; nothing outside it is
+# served. Uploads are raw request bodies (filename in the query string) so the
+# daemon stays stdlib-only -- no multipart parser needed.
+SHARE_DIR = os.environ.get(
+    "TAILDECK_SHARE_DIR", os.path.join(os.path.expanduser("~"), "taildeck-share")
+)
+MAX_UPLOAD = int(os.environ.get("TAILDECK_MAX_UPLOAD", str(64 * 1024 * 1024)))
+
+# Phase 2: clipboard bridge. Reading and setting the desktop clipboard is always
+# available; watching it and pushing changes to phones is opt-in, because a
+# synced clipboard can ferry secrets between devices without the user noticing.
+CLIPBOARD_WATCH = os.environ.get("TAILDECK_CLIPBOARD_WATCH", "0") == "1"
+CLIPBOARD_POLL = float(os.environ.get("TAILDECK_CLIPBOARD_POLL", "1.5"))
+CLIPBOARD_MAX = int(os.environ.get("TAILDECK_CLIPBOARD_MAX", str(64 * 1024)))
+
+# Phase 3: screen view. Frames come from ffmpeg's x11grab (the whole X screen,
+# which spans every monitor) re-encoded to JPEG. The live feed is a
+# multipart/x-mixed-replace MJPEG stream a WebView can render in a plain <img>.
+SCREEN_MAX_WIDTH = int(os.environ.get("TAILDECK_SCREEN_MAX_WIDTH", "1920"))
+SCREEN_DEFAULT_WIDTH = int(os.environ.get("TAILDECK_SCREEN_DEFAULT_WIDTH", "1280"))
+SCREEN_QUALITY = int(os.environ.get("TAILDECK_SCREEN_QUALITY", "6"))  # ffmpeg -q:v, 2 best .. 31 worst
+SCREEN_STREAM_FPS = float(os.environ.get("TAILDECK_SCREEN_STREAM_FPS", "5"))
+
 # WebAuthn unlock material (phase 1: registration + assertion verification, no
 # PAM yet). The phone registers a biometric-gated passkey; only its public half
 # is stored here, and assertions are verified with the openssl CLI so the daemon
@@ -674,10 +707,27 @@ MIME_TYPES = {
     ".woff2": "font/woff2",
     ".map": "application/json",
     ".txt": "text/plain; charset=utf-8",
+    ".md": "text/markdown; charset=utf-8",
+    ".markdown": "text/markdown; charset=utf-8",
+    ".csv": "text/csv; charset=utf-8",
+    ".xml": "application/xml",
+    ".pdf": "application/pdf",
+    ".zip": "application/zip",
+    ".gz": "application/gzip",
+    ".tar": "application/x-tar",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".ogg": "audio/ogg",
+    ".wav": "audio/wav",
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".mov": "video/quicktime",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
 }
 
 
-def _http(conn, status, ctype, body, cache="no-cache"):
+def _http(conn, status, ctype, body, cache="no-cache", extra=""):
     head = (
         f"HTTP/1.1 {status}\r\n"
         f"Content-Type: {ctype}\r\n"
@@ -689,6 +739,7 @@ def _http(conn, status, ctype, body, cache="no-cache"):
         "Access-Control-Allow-Origin: *\r\n"
         "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n"
         "Access-Control-Allow-Headers: Content-Type\r\n"
+        f"{extra}"
         "Connection: close\r\n\r\n"
     )
     try:
@@ -805,6 +856,809 @@ def _list_scripts():
             continue
         items.append({"name": name, "size": st.st_size, "modified": int(st.st_mtime)})
     return items
+
+
+# --- APPS / POWER / DISPLAYS API --------------------------------------------
+#
+# Read-mostly endpoints that let the phone act as a fuller remote: list and
+# launch installed GUI apps, lock/suspend the session, drive the backlight, and
+# list/switch display modes. Every external call is by argv (never a shell) and
+# every input is validated against a freshly enumerated set.
+
+
+def _run(cmd, timeout=5, env=None, data=None):
+    """Run argv and capture text output. Never raises; (rc, out, err) always.
+    Pass `data` (str) to feed stdin -- used to set the clipboard without a
+    shell pipeline."""
+    try:
+        kwargs = dict(capture_output=True, text=True, timeout=timeout, env=env)
+        if data is None:
+            kwargs["stdin"] = subprocess.DEVNULL
+        res = subprocess.run(cmd, input=data, **kwargs)
+        return res.returncode, res.stdout or "", res.stderr or ""
+    except Exception as e:
+        return 127, "", str(e)
+
+
+def _has_command(cmd):
+    return shutil.which(cmd) is not None
+
+
+def _session_env():
+    """Env for desktop commands. The daemon runs as a user service, so it
+    already carries DISPLAY/DBUS; fill DISPLAY only if it is somehow missing."""
+    env = dict(os.environ)
+    if "x11" in SESSION_TYPE and not env.get("DISPLAY"):
+        env["DISPLAY"] = ":0"
+    return env
+
+
+# Where .desktop entries live, in precedence order (user overrides system).
+APP_DIRS = [
+    os.path.expanduser("~/.local/share/applications"),
+    "/usr/local/share/applications",
+    "/usr/share/applications",
+    "/var/lib/flatpak/exports/share/applications",
+    os.path.expanduser("~/.local/share/flatpak/exports/share/applications"),
+]
+
+
+def _desktop_entry(path):
+    """Parse the [Desktop Entry] group of a .desktop file into a dict."""
+    fields = {}
+    in_section = False
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.rstrip("\n")
+                if line.startswith("["):
+                    in_section = line.strip() == "[Desktop Entry]"
+                    continue
+                if not in_section or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                if "[" in key:  # skip localized keys such as Name[de]
+                    continue
+                fields[key] = value.strip()
+    except Exception:
+        return None
+    return fields or None
+
+
+def _list_apps():
+    """Installed GUI applications, de-duplicated by desktop-file id."""
+    found = {}
+    for directory in APP_DIRS:
+        try:
+            names = sorted(os.listdir(directory))
+        except Exception:
+            continue
+        for name in names:
+            if not name.endswith(".desktop"):
+                continue
+            app_id = name[: -len(".desktop")]
+            if app_id in found:
+                continue
+            fields = _desktop_entry(os.path.join(directory, name))
+            if not fields:
+                continue
+            if fields.get("Type", "Application") != "Application":
+                continue
+            if fields.get("NoDisplay", "").lower() == "true":
+                continue
+            if fields.get("Hidden", "").lower() == "true":
+                continue
+            if not fields.get("Name") or not fields.get("Exec"):
+                continue
+            found[app_id] = {
+                "id": app_id,
+                "name": fields["Name"],
+                "comment": fields.get("Comment", ""),
+                "categories": [c for c in fields.get("Categories", "").split(";") if c],
+                "icon": fields.get("Icon", ""),
+                "path": os.path.join(directory, name),
+            }
+    return sorted(found.values(), key=lambda a: a["name"].lower())
+
+
+def _find_app(app_id):
+    """Resolve an id to (desktop_path, fields) only if it is a real entry."""
+    if not app_id or "/" in app_id or "\\" in app_id or app_id.startswith(".") or len(app_id) > 128:
+        return None
+    for directory in APP_DIRS:
+        full = os.path.join(directory, app_id + ".desktop")
+        if os.path.isfile(full):
+            fields = _desktop_entry(full)
+            if fields and fields.get("Type", "Application") == "Application":
+                return full, fields
+    return None
+
+
+def _strip_exec_field_codes(exec_line):
+    """Drop %f/%u/%F/%U/%i/%c/%k placeholders from a .desktop Exec line."""
+    out = []
+    i, n = 0, len(exec_line)
+    while i < n:
+        if exec_line[i] == "%" and i + 1 < n:
+            if exec_line[i + 1] == "%":
+                out.append("%")
+            i += 2
+            continue
+        out.append(exec_line[i])
+        i += 1
+    return "".join(out).strip()
+
+
+def _launch_app(app_id):
+    """Launch a discovered .desktop app. Returns (ok, detail)."""
+    hit = _find_app(app_id)
+    if not hit:
+        return False, "unknown app"
+    _path, fields = hit
+    env = _session_env()
+    if _has_command("gtk-launch"):
+        rc, _out, _err = _run(["gtk-launch", app_id], timeout=5, env=env)
+        if rc == 0:
+            return True, "gtk-launch"
+    argv = []
+    try:
+        argv = shlex.split(_strip_exec_field_codes(fields.get("Exec", "")))
+    except Exception:
+        argv = _strip_exec_field_codes(fields.get("Exec", "")).split()
+    if not argv:
+        return False, "no exec line"
+    try:
+        subprocess.Popen(
+            argv, env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as e:
+        return False, str(e)
+    return True, "spawn"
+
+
+def _focus_window(match):
+    """Raise a window by title substring. X11 only, and only if xdotool exists."""
+    if "x11" not in SESSION_TYPE or not _has_command("xdotool"):
+        return False, "unsupported"
+    rc, out, _err = _run(["xdotool", "search", "--name", match], timeout=5, env=_session_env())
+    ids = [ln.strip() for ln in out.splitlines() if ln.strip().isdigit()]
+    if not ids:
+        return False, "no match"
+    rc, _out, err = _run(["xdotool", "windowactivate", "--sync", ids[-1]], timeout=5, env=_session_env())
+    return (rc == 0), ("ok" if rc == 0 else err)
+
+
+def _backlight_device():
+    """(name, max, current) for the first backlight device, or None."""
+    root = "/sys/class/backlight"
+    try:
+        for name in sorted(os.listdir(root)):
+            d = os.path.join(root, name)
+            bpath = os.path.join(d, "brightness")
+            mpath = os.path.join(d, "max_brightness")
+            if not (os.path.isfile(bpath) and os.path.isfile(mpath)):
+                continue
+            with open(mpath) as fh:
+                mx = int(fh.read().strip() or "0")
+            with open(bpath) as fh:
+                cur = int(fh.read().strip() or "0")
+            if mx > 0:
+                return name, mx, cur
+    except Exception:
+        return None
+    return None
+
+
+def _brightness_pct():
+    dev = _backlight_device()
+    if not dev:
+        return None
+    _name, mx, cur = dev
+    return round(cur * 100 / mx)
+
+
+def _logind_session_path():
+    """Object path of the user's graphical session, for logind SetBrightness.
+
+    A systemd --user service belongs to no session, so `/session/self` does not
+    resolve for it and the call is refused. Resolve the session id with
+    loginctl and encode it the way logind addresses objects (each character
+    becomes '_' + two hex digits).
+    """
+    rc, out, _err = _run(
+        ["loginctl", "show-user", _default_user(), "-p", "Display", "--value"], timeout=5
+    )
+    sid = (out or "").strip()
+    if rc != 0 or not sid:
+        return None
+    return "/org/freedesktop/login1/session/" + "".join(
+        "_" + format(ord(ch), "02x") for ch in sid
+    )
+
+
+def _set_brightness_pct(pct):
+    """Set backlight to 1..100%. Prefers brightnessctl, then logind's
+    Session.SetBrightness (the session owner may call it with no extra device
+    permission), then a direct sysfs write."""
+    try:
+        pct = max(1, min(100, int(pct)))
+    except Exception:
+        return False, "bad value"
+    dev = _backlight_device()
+    if not dev:
+        return False, "no backlight"
+    name, mx, _cur = dev
+    target = max(1, round(mx * pct / 100))
+    if _has_command("brightnessctl"):
+        rc, _out, _err = _run(["brightnessctl", "set", f"{pct}%"], timeout=5)
+        if rc == 0:
+            return True, "brightnessctl"
+    session_path = _logind_session_path()
+    if _has_command("busctl") and session_path:
+        rc, _out, _err = _run([
+            "busctl", "call", "org.freedesktop.login1",
+            session_path,
+            "org.freedesktop.login1.Session", "SetBrightness",
+            "ssu", "backlight", name, str(target),
+        ], timeout=5)
+        if rc == 0:
+            return True, "logind"
+    try:
+        with open(os.path.join("/sys/class/backlight", name, "brightness"), "w") as fh:
+            fh.write(str(target))
+        return True, "sysfs"
+    except Exception as e:
+        return False, str(e)
+
+
+def _power_action(action, value=None):
+    env = _session_env()
+    if action == "lock":
+        if not _has_command("loginctl"):
+            return False, "unsupported"
+        rc, _out, err = _run(["loginctl", "lock-session"], timeout=5, env=env)
+        return (rc == 0), ("locked" if rc == 0 else err)
+    if action == "suspend":
+        if not _has_command("systemctl"):
+            return False, "unsupported"
+        rc, _out, err = _run(["systemctl", "suspend"], timeout=5, env=env)
+        return (rc == 0), ("suspending" if rc == 0 else err)
+    if action in ("brightness_up", "brightness_down"):
+        cur = _brightness_pct()
+        step = 5 if action == "brightness_up" else -5
+        return _set_brightness_pct((cur if cur is not None else 50) + step)
+    if action == "brightness_set":
+        if value is None:
+            return False, "value required"
+        return _set_brightness_pct(value)
+    return False, "unknown action"
+
+
+def _displays():
+    """Parse `xrandr --query` into outputs with their modes. X11 only."""
+    if not _has_command("xrandr"):
+        return []
+    rc, out, _err = _run(["xrandr", "--query"], timeout=5, env=_session_env())
+    if rc != 0:
+        return []
+    displays = []
+    current = None
+    for line in out.splitlines():
+        if line and not line[0].isspace():
+            m = re.match(r"^(\S+)\s+(connected|disconnected)", line)
+            if not m:
+                continue
+            geometry = re.search(r"(\d+x\d+)\+(\d+)\+(\d+)", line)
+            current = {
+                "output": m.group(1),
+                "connected": m.group(2) == "connected",
+                "current": geometry.group(1) if geometry else None,
+                "modes": [],
+            }
+            displays.append(current)
+        elif current is not None:
+            m = re.match(r"^\s+(\d+x\d+)\s", line)
+            if m and m.group(1) not in current["modes"]:
+                current["modes"].append(m.group(1))
+    return displays
+
+
+def _set_display_mode(output, mode):
+    if not _has_command("xrandr"):
+        return False, "unsupported"
+    known = {d["output"] for d in _displays()}
+    if output not in known:
+        return False, "unknown output"
+    if not re.match(r"^\d+x\d+$", mode or ""):
+        return False, "bad mode"
+    rc, _out, err = _run(["xrandr", "--output", output, "--mode", mode], timeout=8, env=_session_env())
+    return (rc == 0), ("ok" if rc == 0 else err)
+
+
+# --- CLIPBOARD / FILES API --------------------------------------------------
+#
+# Clipboard: read/write the desktop selection as text. Files: a sandboxed view
+# of SHARE_DIR for listing, download and upload. Both stay within the existing
+# safety model -- argv-only calls (no shell) and paths confined to one root.
+
+
+def _clipboard_read():
+    """Read the desktop clipboard as text. (ok, text_or_reason)."""
+    env = _session_env()
+    if SESSION_TYPE == "wayland" and _has_command("wl-paste"):
+        rc, out, _err = _run(["wl-paste", "--no-newline"], timeout=5, env=env)
+    elif _has_command("xclip"):
+        rc, out, _err = _run(["xclip", "-selection", "clipboard", "-o"], timeout=5, env=env)
+    else:
+        return False, "unsupported"
+    # Both tools exit non-zero when the selection is empty; that is not an error.
+    if rc != 0:
+        return True, ""
+    return True, out[:CLIPBOARD_MAX]
+
+
+def _clipboard_write(text):
+    """Set the desktop clipboard. (ok, reason)."""
+    env = _session_env()
+    if SESSION_TYPE == "wayland" and _has_command("wl-copy"):
+        cmd = ["wl-copy"]
+    elif _has_command("xclip"):
+        cmd = ["xclip", "-selection", "clipboard"]
+    else:
+        return False, "unsupported"
+    # Capture nothing: xclip/wl-copy fork a helper to own the selection, and
+    # holding their inherited pipes open would block run() until it is replaced.
+    try:
+        p = subprocess.run(
+            cmd, input=text.encode("utf-8"), stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=5, env=env,
+        )
+        return p.returncode == 0, ("ok" if p.returncode == 0 else "failed")
+    except Exception as e:
+        return False, str(e)
+
+
+_CLIP_LAST = {"value": None}
+
+
+def _clipboard_watcher():
+    """Poll the clipboard and push changes to phones. Off unless enabled; the
+    phone chooses whether to apply them, so a synced clipboard never silently
+    overwrites what is on the other end."""
+    while True:
+        ok, text = _clipboard_read()
+        if ok and text != _CLIP_LAST["value"]:
+            _CLIP_LAST["value"] = text
+            broadcast_json({"type": "clipboard", "text": text})
+        time.sleep(CLIPBOARD_POLL)
+
+
+def _query(target):
+    """First value of each query-string parameter, e.g. {'path': 'a/b.png'}."""
+    parsed = urllib.parse.parse_qs(urllib.parse.urlparse(target).query)
+    return {k: v[0] for k, v in parsed.items() if v}
+
+
+def _safe_rel_path(rel):
+    """Validate a share-relative path. Rejects absolute paths, '..' segments and
+    dotfiles; returns the normalized 'a/b/c' or None."""
+    parts = urllib.parse.unquote(rel or "").strip().strip("/").split("/")
+    out = []
+    for part in parts:
+        if part in ("", "."):
+            continue
+        if part == ".." or part.startswith("."):
+            return None
+        out.append(part)
+    return "/".join(out) if out else None
+
+
+def _share_path(rel):
+    """Absolute path inside SHARE_DIR for a relative path, or None if unsafe."""
+    safe = _safe_rel_path(rel)
+    if safe is None:
+        return None
+    root = os.path.abspath(SHARE_DIR)
+    full = os.path.abspath(os.path.join(root, safe))
+    if full != root and not full.startswith(root + os.sep):
+        return None
+    return full
+
+
+def _list_files(rel_dir=""):
+    """List one directory in the share. Dir entries first, then files. None on
+    an unsafe or missing path."""
+    root = os.path.abspath(SHARE_DIR)
+    if rel_dir:
+        base = _share_path(rel_dir)
+        if base is None or not os.path.isdir(base):
+            return None
+    else:
+        base = root
+        if not os.path.isdir(base):
+            return []  # share not created yet -- nothing uploaded
+    try:
+        names = os.listdir(base)
+    except Exception:
+        return None
+    entries = []
+    for name in names:
+        if name.startswith("."):
+            continue
+        full = os.path.join(base, name)
+        try:
+            st = os.stat(full)
+        except Exception:
+            continue
+        entries.append({
+            "name": name,
+            "path": os.path.relpath(full, root).replace(os.sep, "/"),
+            "dir": os.path.isdir(full),
+            "size": st.st_size,
+            "modified": int(st.st_mtime),
+        })
+    entries.sort(key=lambda e: (not e["dir"], e["name"].lower()))
+    return entries
+
+
+# --- SCREEN VIEW API --------------------------------------------------------
+#
+# Read-only view of the X screen: a one-shot JPEG for a thumbnail/refresh, and a
+# live MJPEG stream for a continuous feed. Capture is argv-only (ffmpeg x11grab,
+# no shell) and size/quality/fps are clamped, so a client cannot ask for an
+# absurd frame or an unbounded frame rate.
+
+
+def _x11_display():
+    """The X display ffmpeg should grab, e.g. ':0.0'."""
+    disp = os.environ.get("DISPLAY") or _session_env().get("DISPLAY") or ":0"
+    if "." not in disp.split(":", 1)[-1]:
+        disp += ".0"
+    return disp
+
+
+def _screen_size():
+    """Whole-X-screen size (union of all monitors) from xrandr, or None."""
+    rc, out, _err = _run(["xrandr", "--query"], timeout=5, env=_session_env())
+    if rc != 0:
+        return None
+    m = re.search(r"current\s+(\d+)\s*x\s*(\d+)", out)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _screen_info():
+    size = _screen_size()
+    if not size:
+        return None
+    info = {"width": size[0], "height": size[1]}
+    if _rdp_supported():
+        info["rdpWsPath"] = "/api/rdp/ws"
+    return info
+
+
+def _clamp_width(width):
+    if width not in (None, "", 0):
+        try:
+            w = int(width)
+        except Exception:
+            w = SCREEN_DEFAULT_WIDTH
+    else:
+        w = SCREEN_DEFAULT_WIDTH
+    w = max(160, min(SCREEN_MAX_WIDTH, w))
+    return w - (w % 2)  # ffmpeg scale needs an even width
+
+
+def _clamp_quality(quality):
+    try:
+        q = int(quality)
+    except Exception:
+        return SCREEN_QUALITY
+    return max(2, min(31, q))
+
+
+def _capture_frame(width=None, quality=None):
+    """Grab one JPEG of the whole X screen. (ok, bytes_or_reason)."""
+    if "x11" not in SESSION_TYPE or not _has_command("ffmpeg"):
+        return False, "unsupported"
+    cmd = [
+        "ffmpeg", "-loglevel", "error", "-f", "x11grab",
+        "-i", _x11_display(), "-frames:v", "1",
+        "-vf", f"scale={_clamp_width(width)}:-2",
+        "-q:v", str(_clamp_quality(quality)), "-f", "mjpeg", "-",
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, timeout=10, env=_session_env())
+    except Exception as e:
+        return False, str(e)
+    if res.returncode != 0 or not res.stdout:
+        return False, (res.stderr.decode("utf-8", "replace").strip() or "capture failed")[:200]
+    return True, res.stdout
+
+
+def _mjpeg_stream(conn, width=None, fps=None, quality=None):
+    """Stream the screen as multipart/x-mixed-replace until the client leaves.
+
+    One long-lived ffmpeg emits concatenated JPEGs on a pipe; we split them on
+    the SOI/EOI markers and wrap each in a part. The connection is closed (and
+    ffmpeg killed) when the client stops reading.
+    """
+    if "x11" not in SESSION_TYPE or not _has_command("ffmpeg"):
+        _json(conn, {"ok": False, "error": "unsupported"}, "501 Not Implemented")
+        return
+    try:
+        # A peer that stops reading (phone sleeps, Wi-Fi drops) must not pin
+        # ffmpeg forever: give up the send and let the finally below reap it.
+        conn.settimeout(15)
+    except Exception:
+        pass
+    try:
+        fps = float(fps)
+    except Exception:
+        fps = SCREEN_STREAM_FPS
+    fps = max(0.5, min(15.0, fps))
+    boundary = "taildeckframe"
+    head = (
+        f"HTTP/1.1 200 OK\r\n"
+        f"Content-Type: multipart/x-mixed-replace; boundary={boundary}\r\n"
+        f"Cache-Control: no-cache\r\n"
+        f"Access-Control-Allow-Origin: *\r\n"
+        f"Connection: close\r\n\r\n"
+    )
+    cmd = [
+        "ffmpeg", "-loglevel", "error", "-f", "x11grab",
+        "-framerate", str(fps), "-i", _x11_display(),
+        "-vf", f"scale={_clamp_width(width)}:-2",
+        "-q:v", str(_clamp_quality(quality)), "-c:v", "mjpeg", "-f", "image2pipe", "-",
+    ]
+    proc = None
+    try:
+        conn.sendall(head.encode("utf-8"))
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, env=_session_env())
+        sep = b"--" + boundary.encode("utf-8")
+        buf = b""
+        while True:
+            # read1 returns as soon as bytes are available; a plain read(n)
+            # would block until n bytes pile up (~40s at low frame rates).
+            chunk = proc.stdout.read1(65536)
+            if not chunk:
+                break
+            buf += chunk
+            while True:
+                start = buf.find(b"\xff\xd8")
+                if start < 0:
+                    buf = b""
+                    break
+                end = buf.find(b"\xff\xd9", start + 2)
+                if end < 0:
+                    buf = buf[start:]
+                    break
+                frame = buf[start:end + 2]
+                buf = buf[end + 2:]
+                conn.sendall(
+                    sep + b"\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                    + str(len(frame)).encode("utf-8") + b"\r\n\r\n" + frame + b"\r\n"
+                )
+    except Exception:
+        pass
+    finally:
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+
+# --- REMOTE DESKTOP (RFB over WebSocket) ------------------------------------
+#
+# A managed x11vnc bound to loopback, bridged to the phone through the daemon's
+# own WebSocket listener. Riding the existing TLS listener means no extra port
+# and no mixed-content problem, and access lands on the same trust boundary the
+# daemon already has (it injects input for anyone who can reach it). It does
+# expose the whole desktop, though, so it starts explicitly and can be stopped.
+
+VNC_PORT = int(os.environ.get("TAILDECK_VNC_PORT", "5900"))
+VNC_DISPLAY = os.environ.get("TAILDECK_VNC_DISPLAY", "")
+_VNC = {"proc": None}
+_VNC_LOCK = threading.Lock()
+
+
+def _rdp_supported():
+    return "x11" in SESSION_TYPE and _has_command("x11vnc")
+
+
+def _vnc_running():
+    proc = _VNC["proc"]
+    return bool(proc and proc.poll() is None)
+
+
+def _port_open(host, port):
+    try:
+        with socket.create_connection((host, port), timeout=1):
+            return True
+    except Exception:
+        return False
+
+
+def _vnc_start():
+    """Start x11vnc on loopback if it is not already up. (ok, detail)."""
+    if not _rdp_supported():
+        return False, "unsupported"
+    with _VNC_LOCK:
+        if _vnc_running():
+            return True, "already running"
+        cmd = [
+            "x11vnc", "-display", VNC_DISPLAY or _x11_display(),
+            "-rfbport", str(VNC_PORT), "-localhost",
+            "-forever", "-shared", "-nopw", "-quiet",
+        ]
+        try:
+            _VNC["proc"] = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env=_session_env(),
+            )
+        except Exception as e:
+            return False, str(e)
+        # x11vnc forks/settles before it binds; wait for the port to answer.
+        for _ in range(25):
+            if not _vnc_running():
+                return False, "x11vnc exited"
+            if _port_open("127.0.0.1", VNC_PORT):
+                print(f"[TailDeck] x11vnc listening on 127.0.0.1:{VNC_PORT}", flush=True)
+                return True, "started"
+            time.sleep(0.15)
+        return _vnc_running(), ("started" if _vnc_running() else "x11vnc exited")
+
+
+def _vnc_stop():
+    """Stop the managed x11vnc, if any. (ok, detail)."""
+    with _VNC_LOCK:
+        proc = _VNC["proc"]
+        _VNC["proc"] = None
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+    print("[TailDeck] x11vnc stopped", flush=True)
+    return True, "stopped"
+
+
+def _recv_exact(conn, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = conn.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("eof")
+        buf += chunk
+    return buf
+
+
+def send_ws_binary(conn, data, opcode=0x2):
+    """Send a binary (or given-opcode) WebSocket frame. RFB bytes are opaque."""
+    length = len(data)
+    header = bytearray([0x80 | opcode])
+    if length <= 125:
+        header.append(length)
+    elif length <= 65535:
+        header.append(126)
+        header.extend(struct.pack("!H", length))
+    else:
+        header.append(127)
+        header.extend(struct.pack("!Q", length))
+    with _WS_SEND_LOCK:
+        conn.sendall(bytes(header) + data)
+
+
+def read_ws_raw(conn):
+    """Read one WebSocket frame as (opcode, bytes), or None on close/error."""
+    try:
+        header = _recv_exact(conn, 2)
+        opcode = header[0] & 0x0F
+        masked = (header[1] & 0x80) != 0
+        length = header[1] & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", _recv_exact(conn, 2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", _recv_exact(conn, 8))[0]
+        mask = _recv_exact(conn, 4) if masked else None
+        data = _recv_exact(conn, length) if length else b""
+        if masked and data:
+            data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        return opcode, data
+    except Exception:
+        return None
+
+
+def _rdp_proxy(conn):
+    """Bridge this WebSocket to a local x11vnc RFB stream until either side
+    closes. Client frames are forwarded to VNC; VNC output is framed back."""
+    if not _rdp_supported():
+        try:
+            send_ws_frame(conn, json.dumps({"type": "error", "message": "rdp unsupported"}))
+        except Exception:
+            pass
+        return
+    ok, detail = _vnc_start()
+    if not ok:
+        try:
+            send_ws_frame(conn, json.dumps({"type": "error", "message": f"x11vnc: {detail}"}))
+        except Exception:
+            pass
+        return
+    try:
+        tcp = socket.create_connection(("127.0.0.1", VNC_PORT), timeout=5)
+        tcp.settimeout(None)
+    except Exception as e:
+        print(f"[TailDeck] rdp: cannot reach x11vnc: {e}", flush=True)
+        return
+    stop = threading.Event()
+
+    def client_to_vnc():
+        try:
+            while not stop.is_set():
+                frame = read_ws_raw(conn)
+                if frame is None:
+                    break
+                opcode, payload = frame
+                if opcode == 0x8:                 # close
+                    break
+                if opcode == 0x9:                 # ping -> pong
+                    send_ws_binary(conn, payload, opcode=0xA)
+                    continue
+                if opcode == 0xA:                 # pong
+                    continue
+                if opcode in (0x0, 0x1, 0x2):     # continuation/text/binary
+                    tcp.sendall(payload)
+        except Exception:
+            pass
+        finally:
+            stop.set()
+
+    threading.Thread(target=client_to_vnc, daemon=True).start()
+    try:
+        while not stop.is_set():
+            chunk = tcp.recv(65536)
+            if not chunk:
+                break
+            send_ws_binary(conn, chunk)
+    except Exception:
+        pass
+    finally:
+        stop.set()
+        try:
+            tcp.close()
+        except Exception:
+            pass
+    print("[TailDeck] rdp session closed", flush=True)
+
+
+def _capabilities():
+    """Feature flags reported in host_info so clients can adapt."""
+    caps = ["media", "dictation", "scripts", "notify", "apps", "power"]
+    if _has_command("xrandr"):
+        caps.append("displays")
+    if _backlight_device():
+        caps.append("brightness")
+    if _has_command("xclip") or (SESSION_TYPE == "wayland" and _has_command("wl-paste")):
+        caps.append("clipboard")
+    caps.append("files")
+    if "x11" in SESSION_TYPE and _has_command("ffmpeg") and _screen_size():
+        caps.append("screen")
+    if _rdp_supported():
+        caps.append("rdp")
+    return caps
 
 
 # --- WebAuthn: registration storage and assertion verification ---------------
@@ -1563,6 +2417,183 @@ def handle_api(conn, raw, request_line):
         _json(conn, {"ok": ok, **report}, "200 OK" if ok else "502 Bad Gateway")
         return True
 
+    if path == "/api/apps" and method == "GET":
+        apps = _list_apps()
+        _json(conn, {"ok": True, "count": len(apps), "apps": [
+            {k: a[k] for k in ("id", "name", "comment", "categories", "icon")}
+            for a in apps
+        ]})
+        return True
+
+    if path == "/api/apps/launch" and method in ("POST", "PUT"):
+        body = _read_http_body(conn, raw, headers)
+        try:
+            data = json.loads(body.decode("utf-8", errors="replace") or "{}")
+        except Exception:
+            data = {}
+        ok, detail = _launch_app(str(data.get("id") or ""))
+        if ok:
+            print(f"[TailDeck] launched app: {data.get('id')} ({detail})", flush=True)
+        _json(conn, {"ok": ok, "detail": detail}, "200 OK" if ok else "400 Bad Request")
+        return True
+
+    if path == "/api/windows/focus" and method in ("POST", "PUT"):
+        body = _read_http_body(conn, raw, headers)
+        try:
+            data = json.loads(body.decode("utf-8", errors="replace") or "{}")
+        except Exception:
+            data = {}
+        match = str(data.get("match") or "").strip()
+        if not match:
+            _json(conn, {"ok": False, "error": "match required"}, "400 Bad Request")
+            return True
+        ok, detail = _focus_window(match)
+        _json(conn, {"ok": ok, "detail": detail}, "200 OK" if ok else "409 Conflict")
+        return True
+
+    if path == "/api/power" and method in ("POST", "PUT"):
+        body = _read_http_body(conn, raw, headers)
+        try:
+            data = json.loads(body.decode("utf-8", errors="replace") or "{}")
+        except Exception:
+            data = {}
+        action = str(data.get("action") or "")
+        ok, detail = _power_action(action, data.get("value"))
+        print(f"[TailDeck] power {action}: ok={ok} ({detail})", flush=True)
+        _json(conn, {"ok": ok, "action": action, "detail": detail,
+                     "brightness": _brightness_pct()},
+              "200 OK" if ok else "400 Bad Request")
+        return True
+
+    if path == "/api/displays" and method == "GET":
+        _json(conn, {"ok": True, "displays": _displays()})
+        return True
+
+    if path == "/api/displays" and method in ("POST", "PUT"):
+        body = _read_http_body(conn, raw, headers)
+        try:
+            data = json.loads(body.decode("utf-8", errors="replace") or "{}")
+        except Exception:
+            data = {}
+        ok, detail = _set_display_mode(str(data.get("output") or ""), str(data.get("mode") or ""))
+        _json(conn, {"ok": ok, "detail": detail}, "200 OK" if ok else "400 Bad Request")
+        return True
+
+    if path == "/api/clipboard" and method == "GET":
+        ok, text = _clipboard_read()
+        if not ok:
+            _json(conn, {"ok": False, "error": text}, "501 Not Implemented")
+            return True
+        _json(conn, {"ok": True, "text": text})
+        return True
+
+    if path == "/api/clipboard" and method in ("POST", "PUT"):
+        body = _read_http_body(conn, raw, headers)
+        try:
+            data = json.loads(body.decode("utf-8", errors="replace") or "{}")
+        except Exception:
+            data = {}
+        text = str(data.get("text") or "")
+        if len(text.encode("utf-8")) > CLIPBOARD_MAX:
+            _json(conn, {"ok": False, "error": "too large"}, "413 Payload Too Large")
+            return True
+        ok, detail = _clipboard_write(text)
+        _json(conn, {"ok": ok, "detail": detail},
+              "200 OK" if ok else "500 Internal Server Error")
+        return True
+
+    if path == "/api/files" and method == "GET":
+        rel = _query(target).get("dir", "")
+        entries = _list_files(rel)
+        if entries is None:
+            _json(conn, {"ok": False, "error": "bad path"}, "400 Bad Request")
+            return True
+        _json(conn, {"ok": True, "dir": rel.strip("/"), "entries": entries})
+        return True
+
+    if path == "/api/files/download" and method == "GET":
+        full = _share_path(_query(target).get("path", ""))
+        if full is None or not os.path.isfile(full):
+            _json(conn, {"ok": False, "error": "not found"}, "404 Not Found")
+            return True
+        try:
+            with open(full, "rb") as fh:
+                data = fh.read()
+        except Exception:
+            _json(conn, {"ok": False, "error": "unreadable"}, "500 Internal Server Error")
+            return True
+        ctype = MIME_TYPES.get(os.path.splitext(full)[1].lower(), "application/octet-stream")
+        filename = os.path.basename(full).replace('"', "").replace("\\", "")
+        _http(conn, "200 OK", ctype, data, "no-cache",
+              extra=f'Content-Disposition: attachment; filename="{filename}"\r\n')
+        return True
+
+    if path == "/api/files/upload" and method in ("POST", "PUT"):
+        rel = _query(target).get("path", "")
+        full = _share_path(rel)
+        if full is None:
+            _json(conn, {"ok": False, "error": "bad path"}, "400 Bad Request")
+            return True
+        try:
+            declared = int(headers.get("content-length", "0") or "0")
+        except Exception:
+            declared = 0
+        if declared > MAX_UPLOAD:
+            _json(conn, {"ok": False, "error": "too large"}, "413 Payload Too Large")
+            return True
+        data = _read_http_body(conn, raw, headers)
+        if len(data) > MAX_UPLOAD:
+            _json(conn, {"ok": False, "error": "too large"}, "413 Payload Too Large")
+            return True
+        try:
+            parent = os.path.dirname(full)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(full, "wb") as fh:
+                fh.write(data)
+        except Exception:
+            _json(conn, {"ok": False, "error": "unwritable"}, "500 Internal Server Error")
+            return True
+        print(f"[TailDeck] file saved: {rel} ({len(data)} bytes)", flush=True)
+        _json(conn, {"ok": True, "path": rel.strip("/"), "size": len(data)})
+        return True
+
+    if path == "/api/screen/frame" and method == "GET":
+        q = _query(target)
+        ok, data = _capture_frame(q.get("scale") or q.get("width"), q.get("quality"))
+        if not ok:
+            code = "501 Not Implemented" if data == "unsupported" else "500 Internal Server Error"
+            _json(conn, {"ok": False, "error": data}, code)
+            return True
+        _http(conn, "200 OK", "image/jpeg", data, "no-cache")
+        return True
+
+    if path == "/api/screen/stream" and method == "GET":
+        q = _query(target)
+        _mjpeg_stream(conn, q.get("scale") or q.get("width"), q.get("fps"), q.get("quality"))
+        return True
+
+    if path == "/api/rdp/status" and method == "GET":
+        _json(conn, {
+            "ok": True,
+            "supported": _rdp_supported(),
+            "running": _vnc_running(),
+            "wsPath": "/api/rdp/ws",
+        })
+        return True
+
+    if path == "/api/rdp/start" and method in ("POST", "PUT"):
+        ok, detail = _vnc_start()
+        code = "200 OK" if ok else ("501 Not Implemented" if detail == "unsupported" else "500 Internal Server Error")
+        _json(conn, {"ok": ok, "detail": detail, "running": _vnc_running(),
+                     "wsPath": "/api/rdp/ws"}, code)
+        return True
+
+    if path == "/api/rdp/stop" and method in ("POST", "PUT"):
+        ok, detail = _vnc_stop()
+        _json(conn, {"ok": ok, "detail": detail, "running": _vnc_running()})
+        return True
+
     _json(conn, {"ok": False, "error": "unknown endpoint"}, "404 Not Found")
     return True
 
@@ -1764,6 +2795,17 @@ def handle_websocket(conn):
         )
         conn.sendall(handshake_resp.encode('utf-8'))
 
+        # Remote-desktop sessions ride the same listener but bypass the command
+        # protocol: the WebSocket *is* the RFB stream from here on.
+        request_target = data.split(" ", 2)[1] if " " in data else ""
+        if request_target.split("?")[0] == "/api/rdp/ws":
+            print(f"[TailDeck] rdp open {logged_peer}", flush=True)
+            record_connection("connected", logged_peer, scheme, route, "rdp")
+            _rdp_proxy(conn)
+            record_connection("closed", logged_peer, scheme, route, "rdp")
+            conn.close()
+            return
+
         # Send initial host handshake message
         welcome = {
             "type": "host_info",
@@ -1776,6 +2818,12 @@ def handle_websocket(conn):
             "addresses": local_ipv4_addresses(),
             "tailnet": tailnet_dns_name(),
             "ports": {"http": PORT, "https": TLS_PORT},
+            # Which optional endpoint groups this daemon answers, so a client
+            # can hide controls instead of probing.
+            "capabilities": _capabilities(),
+            # Whole-screen size, so a client can pick a sane scale before it asks
+            # for the first frame.
+            "screen": _screen_info(),
         }
         send_ws_frame(conn, json.dumps(welcome))
 
@@ -1987,6 +3035,7 @@ if __name__ == "__main__":
         sys.exit(_cli_notify(sys.argv[2:]))
     try:
         tls_context = build_tls_context()
+        atexit.register(_vnc_stop)
 
         print(f"[TailDeck] Daemon listening on 0.0.0.0:{PORT} (Tailscale IP compatible)")
         print(f"[TailDeck] Session: {SESSION_TYPE.upper()} | Backend: {BACKEND_NAME}")
@@ -1997,6 +3046,12 @@ if __name__ == "__main__":
               f"({'found' if os.path.isfile(os.path.join(WEBROOT, 'index.html')) else 'not published'})")
         print(f"[TailDeck] Scripts folder: {SCRIPTS_DIR} "
               f"({'found' if os.path.isdir(SCRIPTS_DIR) else 'created on first save'})")
+        print(f"[TailDeck] Share folder: {SHARE_DIR} "
+              f"({'found' if os.path.isdir(SHARE_DIR) else 'created on first upload'})")
+        print(f"[TailDeck] Clipboard watch: {'on' if CLIPBOARD_WATCH else 'off'} "
+              f"(set TAILDECK_CLIPBOARD_WATCH=1 to sync to phones)")
+        print(f"[TailDeck] Remote desktop: "
+              f"{'ready (x11vnc + /api/rdp/start)' if _rdp_supported() else 'unavailable (needs X11 + x11vnc)'}")
         print(f"[TailDeck] Notify a phone: python3 {os.path.basename(sys.argv[0])} notify \"message\"")
         print(f"[TailDeck] Passkey unlock: "
               f"{'rpId=' + auth_rpid() if auth_rpid() else 'no tailnet domain yet (WebAuthn needs one)'} "
@@ -2017,6 +3072,10 @@ if __name__ == "__main__":
             )
             t.start()
 
+        if CLIPBOARD_WATCH:
+            threading.Thread(target=_clipboard_watcher, daemon=True).start()
+
         run_ws_server()
     except KeyboardInterrupt:
+        _vnc_stop()
         print("\n[TailDeck] Daemon stopped.")

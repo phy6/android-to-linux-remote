@@ -27,6 +27,25 @@ export interface PairingPayload {
 }
 
 /**
+ * The mDNS name a laptop publishes on its own network (Avahi), e.g.
+ * `martin-hp-probook-6360b.local`. A DHCP change moves the ip but not the name,
+ * so this is the cheapest way to survive a moved LAN address without Tailscale.
+ * Null when the hostname is missing or is already something we should not append
+ * `.local` to — an ip literal, a tailnet name, or a real domain.
+ */
+export function mdnsHost(hostname: string | null | undefined, httpsPort = 8443): string | null {
+  const raw = (hostname || '').trim().toLowerCase();
+  if (!raw) return null;
+  const isIpLiteral = /^\d{1,3}(\.\d{1,3}){3}$/.test(raw);
+  const isRealDomain = raw.includes('.') && !raw.endsWith('.local');
+  if (isIpLiteral || isRealDomain) return null;
+  const label = raw.endsWith('.local')
+    ? raw
+    : `${raw.replace(/[\s_]+/g, '-').replace(/[^a-z0-9-]/g, '')}.local`;
+  return `${label}:${httpsPort}`;
+}
+
+/**
  * Every address the phone could use to reach this laptop, best first. Tailscale
  * comes first because it carries a real certificate, so there is no warning to
  * clear; the LAN/hotspot addresses need the phone to accept the warning once.
@@ -62,6 +81,17 @@ export function pairingRoutes(status: ConnectionStatus, originHost?: string): Pa
     );
   }
 
+  // By name, so it keeps working when the laptop's ip moves under it.
+  const byName = mdnsHost(info?.hostname, httpsPort);
+  if (byName) {
+    add(
+      'lan-name',
+      'Same Wi-Fi, by name',
+      'Follows the laptop when its ip changes (needs .local / mDNS resolution).',
+      byName,
+    );
+  }
+
   // Last resort when the daemon has not reported its addresses yet: the address
   // this page is itself being viewed on, as long as that is a laptop and not
   // the hosted copy.
@@ -80,9 +110,11 @@ export function pairingRoutes(status: ConnectionStatus, originHost?: string): Pa
  */
 export function autoconnectOrder(opts: {
   localHost?: string;
-  saved?: { host?: string; alt?: string[]; tailnet?: string | null } | null;
+  saved?: { host?: string; alt?: string[]; tailnet?: string | null; name?: string } | null;
   fallbackHost?: string;
   preferLocal: boolean;
+  /** HTTPS port for the remembered `.local` name; defaults to 8443. */
+  httpsPort?: number;
 }): string[] {
   const out: string[] = [];
   const add = (h?: string | null) => {
@@ -90,7 +122,10 @@ export function autoconnectOrder(opts: {
     if (c && !out.includes(c)) out.push(c);
   };
   add(opts.localHost);
-  if (opts.preferLocal) (opts.saved?.alt ?? []).forEach(add);
+  if (opts.preferLocal) {
+    (opts.saved?.alt ?? []).forEach(add);
+    add(mdnsHost(opts.saved?.name, opts.httpsPort ?? 8443));
+  }
   add(opts.saved?.tailnet);
   add(opts.fallbackHost);
   add(opts.saved?.host);

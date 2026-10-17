@@ -104,16 +104,21 @@ const SectionTitle: React.FC<{ children: React.ReactNode }> = ({ children }) => 
   <h4 className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">{children}</h4>
 );
 
+export type SideMenuTab = 'tailscale' | 'keys' | 'media' | 'settings' | 'help';
+
 interface SideMenuDrawerProps {
   isOpen: boolean;
   onClose: () => void;
   onOpen: () => void;
+  /** Tab to bring forward the next time the drawer opens. */
+  openTab?: SideMenuTab;
   connectionStatus: ConnectionStatus;
   settings: RemoteSettings;
   onUpdateSettings: (newSettings: Partial<RemoteSettings>) => void;
   onToggleSimulator: () => void;
   onOpenDictation: () => void;
   onOpenDiagnostics: () => void;
+  onOpenSetup: () => void;
   isSimulatorActive: boolean;
   onEnterDarkOut: () => void;
   appUpdateReady: boolean;
@@ -124,12 +129,14 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
   isOpen,
   onClose,
   onOpen,
+  openTab,
   connectionStatus,
   settings,
   onUpdateSettings,
   onToggleSimulator,
   onOpenDictation,
   onOpenDiagnostics,
+  onOpenSetup,
   isSimulatorActive,
   onEnterDarkOut,
   appUpdateReady,
@@ -149,6 +156,14 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
   const [alertPermission, setAlertPermission] = useState<AlertPermission>(notificationSupport());
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'tailscale' | 'keys' | 'media' | 'settings' | 'help'>('keys');
+
+  // Honour a requested tab on the closed→open edge, without fighting the user's
+  // own tab choice while the drawer stays open.
+  const lastOpenRef = useRef(false);
+  useEffect(() => {
+    if (isOpen && !lastOpenRef.current && openTab) setActiveTab(openTab);
+    lastOpenRef.current = isOpen;
+  }, [isOpen, openTab]);
   const [pairMode, setPairMode] = useState<'show' | 'scan' | null>(null);
   const [quickInput, setQuickInput] = useState('');
   const quickInputRef = useRef<HTMLInputElement>(null);
@@ -695,6 +710,25 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                 <p className="text-[10px] text-slate-500 leading-relaxed">
                   Show a code on the laptop, then scan it from the phone. Prefers the address that
                   skips the certificate warning.
+                </p>
+              </div>
+
+              {/* The whole way in, on one screen: numbered codes for every route. */}
+              <div className="space-y-2 pt-2 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => {
+                    triggerClick();
+                    onOpenSetup();
+                  }}
+                  className="w-full py-2.5 px-3 rounded-xl font-medium text-xs bg-sky-500/10 border border-sky-500/40 text-sky-200 hover:bg-sky-500/20 flex items-center justify-center gap-2 transition"
+                >
+                  <QrCode className="w-4 h-4 text-sky-300" />
+                  <span>Setup &amp; QR codes</span>
+                </button>
+                <p className="text-[10px] text-slate-500 leading-relaxed">
+                  Every address this laptop answers on, as numbered codes. Opens by itself when the
+                  app has no connection.
                 </p>
               </div>
 

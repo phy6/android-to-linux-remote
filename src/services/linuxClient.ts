@@ -30,6 +30,9 @@ class LinuxClientService {
   private rafId: number | null = null;
   private pingInterval: number | null = null;
   private pingStart = 0;
+  // The daemon's TLS port, learned from `host_info`. Used to pick wss:// vs
+  // ws:// from the port we're dialing rather than the page's own scheme.
+  private knownHttpsPort = 8443;
 
   private status: ConnectionStatus = {
     connected: false,
@@ -42,6 +45,23 @@ class LinuxClientService {
 
   constructor() {
     this.scheduleFlush = this.scheduleFlush.bind(this);
+    this.installNativeShim();
+  }
+
+  /**
+   * Expose a tiny, stable bridge for a native shell (the Android app wraps this
+   * page in a WebView and has no socket of its own):
+   *   window.taildeck.sendMedia('volup' | 'voldown' | ...)  -> hardware keys
+   *   window.taildeck.hostInfo                              -> last host_info
+   * Purely additive; the browser build ignores it.
+   */
+  private installNativeShim() {
+    if (typeof window === 'undefined') return;
+    window.taildeck = {
+      ...window.taildeck,
+      sendMedia: (action: string) => this.sendMedia(action as MediaAction),
+      log: (message: unknown) => console.log('[taildeck-native]', message),
+    };
   }
 
   public onDictationText(callback: DictationTextCallback): () => void {
@@ -97,13 +117,27 @@ class LinuxClientService {
     const raw = host.trim();
     const pageIsSecure =
       typeof location !== 'undefined' && location.protocol === 'https:';
-    const explicitSecure = /^wss:\/\//i.test(raw);
+    const explicitSecureScheme = /^(https|wss):\/\//i.test(raw);
+    const explicitPlainScheme = /^(http|ws):\/\//i.test(raw);
     const cleanHost = raw
-      .replace(/^https:\/\//i, '')
-      .replace(/^wss:\/\//i, '')
-      .replace(/^ws:\/\//i, '')
-      .replace(/^http:\/\//i, '');
-    const wsUrl = `${pageIsSecure || explicitSecure ? 'wss' : 'ws'}://${cleanHost}`;
+      .replace(/^https?:\/\//i, '')
+      .replace(/^wss?:\/\//i, '');
+
+    // Choose the transport from the port we're dialing, not the page's scheme.
+    // The daemon serves plain HTTP on its http port and TLS on its https port,
+    // so an https page must reach the http port over ws:// and an http page
+    // must reach the https port over wss://. Using the page scheme broke
+    // `<host>:8443` (LAN/`.local` https) from an http page and `<host>:8080`
+    // from an https page.
+    const portMatch = cleanHost.match(/:(\d+)$/);
+    const port = portMatch ? Number(portMatch[1]) : null;
+    const secure =
+      explicitSecureScheme ||
+      (!explicitPlainScheme &&
+        (port === 443 ||
+          port === this.knownHttpsPort ||
+          (port === null && pageIsSecure)));
+    const wsUrl = `${secure ? 'wss' : 'ws'}://${cleanHost}`;
 
     this.status = {
       ...this.status,
@@ -186,7 +220,11 @@ class LinuxClientService {
                 // A listener throwing must not break the socket handler.
               }
             });
-          } else if (data.type === 'host_info') {            this.status = {
+          } else if (data.type === 'host_info') {
+            if (typeof data.ports?.https === 'number') {
+              this.knownHttpsPort = data.ports.https;
+            }
+            this.status = {
               ...this.status,
               hostOsInfo: {
                 hostname: data.hostname || 'linux-laptop',
@@ -199,6 +237,24 @@ class LinuxClientService {
               },
             };
             this.notifyStatus();
+
+            // Feed a native shell (Android WebView) if one is present, so it can
+            // show hostname/session/capabilities without sniffing the socket.
+            if (typeof window !== 'undefined') {
+              if (window.taildeck) window.taildeck.hostInfo = data;
+              try {
+                window.TailDeckNative?.onHostInfo(
+                  JSON.stringify({
+                    hostname: data.hostname || 'linux-laptop',
+                    session: data.session || 'Wayland',
+                    capabilities: Array.isArray(data.capabilities) ? data.capabilities : [],
+                    screen: data.screen ?? null,
+                  })
+                );
+              } catch {
+                // A broken bridge must never break the socket handler.
+              }
+            }
           }
         } catch {
           // Ignore parse errors
