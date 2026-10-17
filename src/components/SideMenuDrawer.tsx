@@ -1029,6 +1029,28 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                 <span>Stop</span>
               </button>
 
+              {/* YouTube ignores the media keys for the page player on some
+                  setups; these send the site's own shortcuts (k / 0). */}
+              <SectionTitle>YouTube</SectionTitle>
+              <div className="grid grid-cols-2 gap-3">
+                {(
+                  [
+                    { action: 'yt_replay', label: 'Replay', Icon: Repeat2 },
+                    { action: 'yt_playpause', label: 'Play / Pause', Icon: Play },
+                  ] as const
+                ).map(({ action, label, Icon }) => (
+                  <button
+                    key={action}
+                    type="button"
+                    onClick={() => pressMedia(action)}
+                    className="flex flex-col items-center justify-center gap-2 py-5 rounded-2xl font-medium text-xs bg-slate-900 border border-slate-800 text-slate-200 hover:bg-slate-800 active:scale-95 transition"
+                  >
+                    <Icon className="w-6 h-6" />
+                    <span>{label}</span>
+                  </button>
+                ))}
+              </div>
+
               <SectionTitle>Volume</SectionTitle>
               <div className="grid grid-cols-3 gap-3">
                 {(

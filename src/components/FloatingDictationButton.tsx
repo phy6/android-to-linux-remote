@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { CornerDownLeft, Delete, Mic, Play, SkipBack, SkipForward, Volume1, Volume2, VolumeX, X } from 'lucide-react';
+import { CornerDownLeft, Delete, Mic, Play, Repeat2, SkipBack, SkipForward, Volume1, Volume2, VolumeX, X } from 'lucide-react';
 import { useHaptics } from '../hooks/useHaptics';
 import type { MediaAction } from '../types';
 
@@ -24,6 +24,8 @@ const FAN: { key: string; label: string; Icon: typeof Mic; action?: MediaAction 
   { key: 'next', label: 'Next', Icon: SkipForward, action: 'next' },
   { key: 'voldown', label: 'Volume down', Icon: Volume1, action: 'voldown' },
   { key: 'volup', label: 'Volume up', Icon: Volume2, action: 'volup' },
+  { key: 'yt_replay', label: 'Replay', Icon: Repeat2, action: 'yt_replay' },
+  { key: 'yt_playpause', label: 'YT Play', Icon: Play, action: 'yt_playpause' },
 ];
 
 interface FloatingDictationButtonProps {
@@ -268,7 +270,8 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
         const rowH = 56;
         const headerH = 28;
         const panelW = Math.min(vw - 2 * pad, 340);
-        const panelH = pad * 2 + headerH + gap + rowH + gap + 3 * rowH + 2 * gap;
+        const mediaRows = Math.ceil((FAN.length - 1) / 2);
+        const panelH = pad * 2 + headerH + gap + rowH + gap + mediaRows * rowH + (mediaRows - 1) * gap;
         const left = Math.max(pad, Math.min(vw - panelW - pad, cx - panelW / 2));
         let top = cy - 52 - 12 - panelH;
         if (top < pad) top = Math.min(vh - panelH - pad, cy + 52 + 12);

@@ -623,6 +623,11 @@ MEDIA_KEYS = {
     "volup": {"evdev": "KEY_VOLUMEUP", "xdotool": "XF86AudioRaiseVolume", "pyautogui": "volumeup", "code": 115},
     "voldown": {"evdev": "KEY_VOLUMEDOWN", "xdotool": "XF86AudioLowerVolume", "pyautogui": "volumedown", "code": 114},
     "mute": {"evdev": "KEY_MUTE", "xdotool": "XF86AudioMute", "pyautogui": "volumemute", "code": 113},
+    # YouTube's own shortcuts, sent as the literal keys. The media keys above
+    # depend on the browser binding XF86AudioPlay to the page's media session,
+    # which is not always wired; 'k' and '0' are handled by the player itself.
+    "yt_playpause": {"evdev": "KEY_K", "xdotool": "k", "pyautogui": "k", "code": 37},
+    "yt_replay": {"evdev": "KEY_0", "xdotool": "0", "pyautogui": "0", "code": 11},
 }
 
 

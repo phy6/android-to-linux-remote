@@ -7,7 +7,9 @@ export type MediaAction =
   | 'stop'
   | 'volup'
   | 'voldown'
-  | 'mute';
+  | 'mute'
+  | 'yt_playpause'
+  | 'yt_replay';
 
 export type InputEventPayload =
   | { type: 'move'; dx: number; dy: number }
