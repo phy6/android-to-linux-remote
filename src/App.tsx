@@ -34,7 +34,7 @@ import {
   AlertPermission,
 } from './services/notifications';
 import { SpeechDiagnosticsPanel } from './components/SpeechDiagnosticsPanel';
-import { PcmCapture } from './services/audioCapture';
+import { PcmCapture, warmMic } from './services/audioCapture';
 import { respondToChallenge, webAuthnAvailable } from './services/authClient';
 
 const DEFAULT_SETTINGS: RemoteSettings = {
@@ -99,6 +99,7 @@ export default function App() {
   // mic open (getUserMedia), which is the slow part on Android.
   const [pttWarming, setPttWarming] = useState(false);
   const [pttTranscript, setPttTranscript] = useState<string | null>(null);
+  const [pttPartial, setPttPartial] = useState<string | null>(null);
   const pttTranscriptTimerRef = useRef<number | null>(null);
 
   const speech = useSpeechRecognition();
@@ -148,7 +149,13 @@ export default function App() {
   useEffect(() => {
     return linuxClient.onDictationText((heard) => {
       clearTranscriptTimer();
-      setPttTranscript(heard);
+      setPttPartial(null);
+      const piece = heard.trim();
+      const merged = piece
+        ? (pttCommittedRef.current ? `${pttCommittedRef.current} ${piece}` : piece)
+        : pttCommittedRef.current;
+      pttCommittedRef.current = merged;
+      setPttTranscript(merged || null);
       setPttPhase('idle');
       pttTranscriptTimerRef.current = window.setTimeout(() => {
         pttTranscriptTimerRef.current = null;
@@ -168,6 +175,14 @@ export default function App() {
       }
     });
   }, [clearTranscriptTimer]);
+
+  // Live hypotheses streamed back while still holding the mic. Preview only:
+  // the final text replaces them once the laptop finishes its re-decode.
+  useEffect(() => {
+    return linuxClient.onDictationPartial((text) => {
+      setPttPartial(text);
+    });
+  }, []);
 
   const showToast = useCallback((text: string, kind: 'ok' | 'warn' = 'ok') => {
     setToast({ text, kind });
@@ -213,6 +228,7 @@ export default function App() {
 
   const pttSendTimerRef = useRef<number | null>(null);
   const pttTokenRef = useRef(0);
+  const pttCommittedRef = useRef('');
   const captureRef = useRef<PcmCapture | null>(null);
   const daemonPttRef = useRef(false);
 
@@ -221,6 +237,8 @@ export default function App() {
     speech.resetTranscript();
     clearTranscriptTimer();
     setPttTranscript(null);
+    setPttPartial(null);
+    pttCommittedRef.current = '';
     setPttPhase('listening');
     setPttWarming(true);
     if (enterPromptTimerRef.current !== null) {
@@ -360,6 +378,8 @@ export default function App() {
     setIsPttActive(false);
     setPttWarming(false);
     clearTranscriptTimer();
+    setPttPartial(null);
+    pttCommittedRef.current = '';
     setPttPhase('idle');
     if (pttSendTimerRef.current !== null) {
       window.clearTimeout(pttSendTimerRef.current);
@@ -384,6 +404,25 @@ export default function App() {
     },
     []
   );
+
+  // Warm the microphone before the user reaches for the button and keep it warm
+  // while the app is in the foreground, so push-to-talk starts on the first
+  // syllable instead of losing it to capture start-up. The mic is released the
+  // moment the app is backgrounded (see audioCapture's visibility handler).
+  useEffect(() => {
+    void warmMic();
+    const keepWarm = () => {
+      if (document.visibilityState === 'visible') void warmMic();
+    };
+    const id = window.setInterval(keepWarm, 15000);
+    document.addEventListener('visibilitychange', keepWarm);
+    window.addEventListener('pointerdown', keepWarm, true);
+    return () => {
+      window.clearInterval(id);
+      document.removeEventListener('visibilitychange', keepWarm);
+      window.removeEventListener('pointerdown', keepWarm, true);
+    };
+  }, []);
 
   const handleUpdateSettings = (newSettings: Partial<RemoteSettings>) => {
     setSettings((prev) => {
@@ -749,6 +788,21 @@ export default function App() {
         </div>
       )}
 
+      {/* Streaming preview while the phone is still holding the mic. */}
+      {pttPartial && !pttTranscript && (
+        <div className="fixed inset-x-0 bottom-4 z-30 px-4 pointer-events-none flex justify-center">
+          <div className="max-w-md w-full px-4 py-3 rounded-2xl bg-slate-900/90 border border-sky-500/40 shadow-lg shadow-black/60">
+            <div className="flex items-center gap-2 mb-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-sky-400 animate-pulse" />
+              <span className="text-[10px] font-semibold uppercase tracking-wide text-sky-300">
+                Hearing…
+              </span>
+            </div>
+            <p className="text-sm text-slate-100 line-clamp-3">{pttPartial}</p>
+          </div>
+        </div>
+      )}
+
       {/* What the laptop actually heard, so a phone-only session is verifiable. */}
       {pttTranscript && (
         <div className="fixed inset-x-0 bottom-4 z-30 px-4 pointer-events-none flex justify-center">
@@ -842,6 +896,7 @@ export default function App() {
           setEnterPrompt(false);
           linuxClient.sendKeyCombo(['Return']);
         }}
+        onBackspace={() => linuxClient.sendKeyCombo(['BackSpace'])}
       />
 
       {/* Voice Dictation Input Sheet */}

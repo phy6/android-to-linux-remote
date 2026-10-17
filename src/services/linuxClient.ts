@@ -8,9 +8,14 @@ export type { MediaAction };
 // numeric readyState value from the spec instead.
 const WS_OPEN = 1;
 
+// Audio captured before the laptop confirms the session must be held, not
+// dropped, or the first word is lost. At 16 kHz mono s16le this is 3 seconds.
+const MAX_DICTATION_QUEUE_BYTES = 16000 * 2 * 3;
+
 type EventCallback = (event: InputEventPayload) => void;
 type StatusCallback = (status: ConnectionStatus) => void;
 type DictationTextCallback = (text: string) => void;
+type DictationPartialCallback = (text: string) => void;
 type NotifyCallback = (notice: { title: string; body: string }) => void;
 type AuthChallengeCallback = (challenge: AuthChallenge) => void;
 
@@ -19,11 +24,14 @@ class LinuxClientService {
   private listeners: Set<EventCallback> = new Set();
   private statusListeners: Set<StatusCallback> = new Set();
   private dictationTextListeners: Set<DictationTextCallback> = new Set();
+  private dictationPartialListeners: Set<DictationPartialCallback> = new Set();
   private notifyListeners: Set<NotifyCallback> = new Set();
   private authChallengeListeners: Set<AuthChallengeCallback> = new Set();
   private pendingDx = 0;
   private dictationReady = false;
   private dictationWaiter: ((ok: boolean) => void) | null = null;
+  private dictationQueue: ArrayBuffer[] = [];
+  private dictationQueueBytes = 0;
   private pendingDy = 0;
   private pendingScrollX = 0;
   private pendingScrollY = 0;
@@ -68,6 +76,14 @@ class LinuxClientService {
     this.dictationTextListeners.add(callback);
     return () => {
       this.dictationTextListeners.delete(callback);
+    };
+  }
+
+  /** Live hypotheses while the phone is still streaming, for preview only. */
+  public onDictationPartial(callback: DictationPartialCallback): () => void {
+    this.dictationPartialListeners.add(callback);
+    return () => {
+      this.dictationPartialListeners.delete(callback);
     };
   }
 
@@ -173,11 +189,28 @@ class LinuxClientService {
             this.notifyStatus();
           } else if (data.type === 'dictation_ready') {
             this.dictationReady = !!data.ok;
+            if (this.dictationReady) {
+              this.flushDictationQueue();
+            } else {
+              this.dropDictationQueue();
+            }
             const resolve = this.dictationWaiter;
             this.dictationWaiter = null;
             resolve?.(this.dictationReady);
           } else if (data.type === 'dictation_stopped') {
             this.dictationReady = false;
+            this.dropDictationQueue();
+          } else if (data.type === 'dictation_partial') {
+            const partial = String(data.text ?? '');
+            if (partial) {
+              this.dictationPartialListeners.forEach((cb) => {
+                try {
+                  cb(partial);
+                } catch {
+                  // A listener throwing must not break the socket handler.
+                }
+              });
+            }
           } else if (data.type === 'dictation_text') {
             // The laptop's recogniser finished; this is what it heard.
             const heard = String(data.text ?? '');
@@ -246,7 +279,12 @@ class LinuxClientService {
                 window.TailDeckNative?.onHostInfo(
                   JSON.stringify({
                     hostname: data.hostname || 'linux-laptop',
+                    os: data.os || '',
                     session: data.session || 'Wayland',
+                    backend: data.backend || '',
+                    addresses: Array.isArray(data.addresses) ? data.addresses : [],
+                    tailnet: data.tailnet ?? '',
+                    ports: data.ports ?? null,
                     capabilities: Array.isArray(data.capabilities) ? data.capabilities : [],
                     screen: data.screen ?? null,
                   })
@@ -393,6 +431,7 @@ class LinuxClientService {
     if (!this.socket || this.socket.readyState !== WS_OPEN) {
       return Promise.resolve(false);
     }
+    this.dropDictationQueue();
     const socket = this.socket;
     return new Promise<boolean>((resolve) => {
       const timer = window.setTimeout(() => {
@@ -411,7 +450,21 @@ class LinuxClientService {
   /** Stream one chunk of 16 kHz mono s16le PCM to the laptop. */
   public sendDictationAudio(pcm: ArrayBuffer) {
     if (!this.socket || this.socket.readyState !== WS_OPEN) return;
-    if (!this.dictationReady) return;
+    if (!this.dictationReady) {
+      // Hold audio captured during the handshake and flush it once the laptop
+      // reports the session is ready, so the first word is not lost.
+      if (this.dictationQueueBytes + pcm.byteLength > MAX_DICTATION_QUEUE_BYTES) {
+        return;
+      }
+      this.dictationQueue.push(pcm);
+      this.dictationQueueBytes += pcm.byteLength;
+      return;
+    }
+    this.sendDictationChunk(pcm);
+  }
+
+  private sendDictationChunk(pcm: ArrayBuffer) {
+    if (!this.socket || this.socket.readyState !== WS_OPEN) return;
     const bytes = new Uint8Array(pcm);
     let binary = '';
     const CHUNK = 0x8000;
@@ -423,10 +476,23 @@ class LinuxClientService {
     );
   }
 
+  private flushDictationQueue() {
+    const queued = this.dictationQueue;
+    this.dictationQueue = [];
+    this.dictationQueueBytes = 0;
+    for (const pcm of queued) this.sendDictationChunk(pcm);
+  }
+
+  private dropDictationQueue() {
+    this.dictationQueue = [];
+    this.dictationQueueBytes = 0;
+  }
+
   public stopDictation() {
     if (!this.socket || this.socket.readyState !== WS_OPEN) return;
     this.socket.send(JSON.stringify({ type: 'dictation_stop' }));
     this.dictationReady = false;
+    this.dropDictationQueue();
   }
 
   public get isDictationReady(): boolean {

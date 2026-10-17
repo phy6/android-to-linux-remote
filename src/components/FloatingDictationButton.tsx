@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { CornerDownLeft, Mic } from 'lucide-react';
+import { CornerDownLeft, Delete, Mic } from 'lucide-react';
 import { useHaptics } from '../hooks/useHaptics';
 
 const LONG_PRESS_MS = 320;
@@ -21,6 +21,8 @@ interface FloatingDictationButtonProps {
   /** Briefly turns the mic into a Return key after a dictation lands. */
   enterMode?: boolean;
   onEnterKey?: () => void;
+  /** Sends Backspace to the laptop while Return mode is showing. */
+  onBackspace?: () => void;
 }
 
 export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = ({
@@ -34,6 +36,7 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
   onPushToTalkCancel,
   enterMode = false,
   onEnterKey,
+  onBackspace,
 }) => {
   const { triggerClick, triggerDictationEngaged } = useHaptics(hapticsEnabled, soundEnabled);
 
@@ -178,6 +181,24 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
         isDragging ? 'scale-110 cursor-grabbing' : 'scale-100 cursor-grab'
       }`}
     >
+      {enterMode && (
+        <button
+          type="button"
+          onClick={() => {
+            triggerClick();
+            onBackspace?.();
+          }}
+          aria-label="Send Backspace"
+          style={{
+            width: 'calc(68px * var(--td-scale, 1))',
+            height: 'calc(68px * var(--td-scale, 1))',
+          }}
+          className="absolute right-full top-1/2 -translate-y-1/2 mr-3 rounded-full flex items-center justify-center bg-gradient-to-b from-slate-900 to-slate-950 border border-slate-700/80 text-sky-300 shadow-[0_6px_20px_rgba(0,0,0,0.6)] hover:border-slate-600 hover:text-sky-200 active:scale-95 transition"
+        >
+          <Delete className="w-7 h-7" />
+        </button>
+      )}
+
       {/* Simple floating circular button with microphone icon */}
       <div
         onPointerDown={handlePointerDown}
@@ -195,7 +216,7 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
             ? 'bg-gradient-to-tr from-emerald-600 to-teal-500 border-emerald-300 text-white shadow-emerald-500/50 animate-pulse'
             : active
               ? 'bg-rose-600 border-rose-400 text-white shadow-rose-600/50'
-              : 'bg-gradient-to-tr from-sky-600 to-blue-500 border-sky-400/60 text-white shadow-sky-600/30 hover:from-sky-500 hover:to-blue-400'
+              : 'bg-gradient-to-b from-slate-900 to-slate-950 border-slate-700/80 text-sky-300 shadow-black/60 hover:border-slate-600 hover:text-sky-200'
         }`}
       >
         {/* Pulsing halo while the push-to-talk session is live */}

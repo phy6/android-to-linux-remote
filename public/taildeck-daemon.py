@@ -45,7 +45,7 @@ CONNECTION_LOG = os.environ.get(
 )
 NOTIFY_CONNECTIONS = os.environ.get("TAILDECK_NOTIFY", "1").lower() not in ("0", "false", "no")
 
-OP_START, OP_STOP, OP_PCM, OP_TEXT, OP_OK = 0x01, 0x02, 0x03, 0x04, 0x01
+OP_START, OP_STOP, OP_PCM, OP_TEXT, OP_PARTIAL, OP_OK = 0x01, 0x02, 0x03, 0x04, 0x05, 0x01
 
 
 class DictationBridge:
@@ -61,6 +61,7 @@ class DictationBridge:
         self.lock = threading.Lock()
         self.reader = None
         self.on_text = None
+        self.on_partial = None
         self._sent_frames = 0
         # The websocket connection that started the session. Only it may feed
         # or end it; a stray HTTP request or another tab closing must not cut
@@ -97,8 +98,9 @@ class DictationBridge:
                 head = self._readn(sock, 1)
                 if not head:
                     break
-                if head[0] != OP_TEXT:
+                if head[0] not in (OP_TEXT, OP_PARTIAL):
                     continue
+                is_partial = head[0] == OP_PARTIAL
                 raw = self._readn(sock, 4)
                 if not raw:
                     break
@@ -108,7 +110,7 @@ class DictationBridge:
                 payload = self._readn(sock, size)
                 if not payload:
                     break
-                cb = self.on_text
+                cb = self.on_partial if is_partial else self.on_text
                 if cb is not None:
                     try:
                         cb(payload.decode("utf-8", "replace"))
@@ -173,7 +175,21 @@ def _ts():
 
 
 DICTATION = DictationBridge()
-SESSION_TYPE = os.environ.get("XDG_SESSION_TYPE", "unknown").lower()
+SESSION_TYPE = os.environ.get("XDG_SESSION_TYPE", "").lower()
+if SESSION_TYPE not in ("x11", "wayland"):
+    if os.environ.get("WAYLAND_DISPLAY"):
+        SESSION_TYPE = "wayland"
+    elif os.environ.get("DISPLAY"):
+        SESSION_TYPE = "x11"
+    elif any(os.path.exists(f"/tmp/.X11-unix/X{n}") for n in ("0", "1")):
+        SESSION_TYPE = "x11"
+    else:
+        SESSION_TYPE = "unknown"
+if SESSION_TYPE == "x11" and not os.environ.get("DISPLAY"):
+    for _n in ("0", "1"):
+        if os.path.exists(f"/tmp/.X11-unix/X{_n}"):
+            os.environ["DISPLAY"] = f":{_n}"
+            break
 BACKEND_NAME = "none"
 
 # --- INPUT BACKEND ABSTRACTION (Wayland & X11 Compatible) ---
@@ -785,7 +801,8 @@ def serve_static(conn, request_line):
         _http(conn, "500 Internal Server Error", "text/plain; charset=utf-8", b"Unreadable\n")
         return
 
-    if os.path.basename(full) == "index.html":
+    base = os.path.basename(full)
+    if base in ("index.html", "sw.js", "manifest.webmanifest"):
         cache = "no-cache"
     elif "/assets/" in full.replace(os.sep, "/"):
         cache = "public, max-age=31536000, immutable"
@@ -2870,6 +2887,9 @@ def handle_websocket(conn):
                 elif mtype == "dictation_start":
                     DICTATION.on_text = lambda t: send_ws_frame(
                         conn, json.dumps({"type": "dictation_text", "text": t})
+                    )
+                    DICTATION.on_partial = lambda t: send_ws_frame(
+                        conn, json.dumps({"type": "dictation_partial", "text": t})
                     )
                     ok = DICTATION.start(conn)
                     dictation_bytes = 0
