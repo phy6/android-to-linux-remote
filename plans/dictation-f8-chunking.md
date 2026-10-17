@@ -1,5 +1,11 @@
 # F8 — chunk long speech (dictation latency)
 
+> **REVISED — superseded by pause segmentation.** The streaming-chunk implementation below was
+> replaced (see *Revision* at the end). Chunks committed the **streaming** hypothesis, which the
+> log shows is wrong on 95% of utterances (median 4 words off), and which is why the phone's
+> dictated text was noticeably worse than the laptop's. We now segment at pauses and commit each
+> phrase through the **offline two-pass** pass instead. Chunk code was removed.
+
 **Finding (recovered spec).** *"Longer speech takes very long to process → should chunk into
 smaller pieces."* This is a **latency** problem, not an accuracy one.
 
@@ -94,3 +100,38 @@ Landed as a **net-session mid-stream commit** in the bridge (no session teardown
   because it removes the single long stall; measure with the clip harness.
 - Non-sherpa engines (vosk) still have the preview-loses-words shape for net sessions if
   `STREAMING=0`; scope now is the configured sherpa streaming path.
+
+## Revision — pause segmentation (current)
+
+**Why the pivot.** Measured from `~/.local/share/vosk-dictation/log` (463 two-pass sessions):
+
+- the streaming hypothesis differs from the offline re-decode on **95%** of utterances; **median 4
+  words change**, 68% of utterances change ≥2 words (p90 = 19).
+- release→inject latency in hold mode: **median 3.0 s**.
+
+So the two live methods trade differently: the laptop (hold mode) is accurate but waits for
+release + offline; the phone (chunks) was immediate but committed streaming errors. Chosen
+direction: **keep accuracy, segment long holds at pauses.**
+
+**Mechanism (implemented in `dictate-ptt.py`).** While the key is held (`_seg_hold_down`) or a net
+session is open (`net_active`), a run of VAD silence ≥ `SEG_PAUSE_MS` closes the current phrase and
+immediately reopens one — so every phrase flows through the existing `release → _finalize →
+two-pass` path. No session teardown for net; the phone's dictation session stays open.
+
+- Config: `SEGMENT_PAUSES` (default `0`; set `1`), `SEG_PAUSE_MS` (900), `SEG_MIN_MS` (1200).
+- State: `_silence` (bytes, **not** loop iterations — read chunk size varies), `_seg_voiced`,
+  `_seg_pending`, `_seg_hold_down`; `auto_mode` flag so segmentation no longer piggybacks on
+  `auto_gate` being set (that accidentally enabled auto VAD open/close in hold mode).
+- `_finalize` now prefers the offline re-decode for **net** sessions too (`self.net_active or not lw`),
+  since nothing streaming is typed locally for them.
+- Chunk path removed: `_maybe_chunk`/`_chunk_commit`, `CHUNK_MS`, the `("chunk", …)` item, and
+  `commit_final(reset_case=…)`. `App.tsx` accumulation stays (still useful for multi-phrase holds).
+
+**Verified offline** (net protocol, `pause.pcm` = clip + 1.2 s silence ×2, `SEG_PAUSE_MS=900`):
+3 phrase commits during the session at ~2.1 s / 14.9 s / 25.6 s, each carrying the **offline**
+text (`'can you just use the recorded audio and reiterate on that'`), not the streaming guess.
+
+**Still to check on-device:** hold right-Ctrl and speak several sentences with pauses — each phrase
+should land as you pause, in full offline text; a single uninterrupted sentence still commits once.
+Disable with `SEGMENT_PAUSES=0` if it over-splits.
+
