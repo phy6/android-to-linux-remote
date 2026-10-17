@@ -10,13 +10,9 @@ const LONG_PRESS_MS = 320;
 // at the screen to land it. 22px is about a thumb's natural drift.
 const DRAG_CANCEL_PX = 22;
 
-// Hold, then slide up: the mic becomes a radial media fan. The up-slide must
-// clear a deliberate threshold so a stray roll never trips it, and there is
-// hysteresis on the way back down so brushing the line does not flicker between
-// modes. Sliding further out walks the fan from the innermost item outward.
+// Hold, then slide up: opens a sticky radial menu of commands. The slide must
+// clear a deliberate threshold so a stray roll never opens it.
 const COMMAND_SLIDE_PX = 56;
-const COMMAND_EXIT_PX = 42;
-const COMMAND_ITEM_PX = 46;
 
 // The fan's first item is Enter, so the shortest deliberate slide-and-release
 // doubles as a quick Enter key. The rest are the media remote.
@@ -90,13 +86,12 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
   const longPressTimerRef = useRef<number | null>(null);
   const pttEngagedRef = useRef(false);
 
-  // Slide-up command mode: a second, higher threshold turns the hold into a
-  // media remote. Mirrored in refs because pointer events can fire faster than
-  // React re-renders, so the move/up handlers must not read stale state.
-  const [commandMode, setCommandMode] = useState(false);
-  const [commandIdx, setCommandIdx] = useState(0);
-  const commandModeRef = useRef(false);
-  const commandIdxRef = useRef(0);
+  // Slide-up command menu: a higher threshold opens a sticky fan of commands.
+  // It stays open after the finger lifts so the user can tap a big target at
+  // leisure; tapping the backdrop or the x closes it. Mirrored in a ref because
+  // pointer events can fire faster than React re-renders.
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuOpenRef = useRef(false);
 
   const clearLongPressTimer = useCallback(() => {
     if (longPressTimerRef.current !== null) {
@@ -117,12 +112,12 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
       hasMoved: false,
     };
     pttEngagedRef.current = false;
-    commandModeRef.current = false;
-    commandIdxRef.current = 0;
-    setCommandMode(false);
-    setCommandIdx(0);
     setIsPressing(true);
-    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+    try {
+      (e.target as HTMLElement).setPointerCapture(e.pointerId);
+    } catch {
+      // Ignore: the pointer may already be gone (e.g. synthetic events).
+    }
 
     // Start talking the instant a finger lands. Waiting for a hold threshold
     // made a normal press fall through to the dictation sheet instead, which is
@@ -137,40 +132,18 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
 
   const handlePointerMove = (e: React.PointerEvent) => {
     if (!dragRef.current) return;
+    if (menuOpenRef.current) return;
     const dx = e.clientX - dragRef.current.startX;
     const dy = e.clientY - dragRef.current.startY;
     // A near-vertical upward move is the command gesture, never a reposition.
     const upSlide = dy < 0 && -dy > Math.abs(dx);
 
-    if (commandModeRef.current) {
-      // Slid back toward the button: leave command mode without firing.
-      if (dy > -COMMAND_EXIT_PX) {
-        commandModeRef.current = false;
-        commandIdxRef.current = 0;
-        setCommandMode(false);
-        setCommandIdx(0);
-        return;
-      }
-      const depth = -dy - COMMAND_SLIDE_PX;
-      const idx = Math.min(
-        FAN.length - 1,
-        Math.max(0, Math.floor(depth / COMMAND_ITEM_PX)),
-      );
-      if (idx !== commandIdxRef.current) {
-        commandIdxRef.current = idx;
-        setCommandIdx(idx);
-        triggerClick();
-      }
-      return;
-    }
-
-    // Enter command mode and abort the dictation session, so nothing spoken is
-    // ever sent while the user is choosing a command.
+    // Open the sticky command menu and abort the dictation session, so nothing
+    // spoken is ever sent while the user is choosing a command.
     if (!enterMode && !dragRef.current.hasMoved && upSlide && -dy >= COMMAND_SLIDE_PX) {
-      commandModeRef.current = true;
-      commandIdxRef.current = 0;
-      setCommandMode(true);
-      setCommandIdx(0);
+      dragRef.current.hasMoved = true;
+      menuOpenRef.current = true;
+      setMenuOpen(true);
       if (pttEngagedRef.current) {
         pttEngagedRef.current = false;
         onPushToTalkCancel?.();
@@ -210,17 +183,8 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
     if (!dragRef.current) return;
     clearLongPressTimer();
 
-    if (commandModeRef.current) {
-      // Release fires the highlighted fan item; the dictation session was
-      // already cancelled when command mode was entered.
-      const item = FAN[commandIdxRef.current];
-      triggerClick();
-      if (item.action) onCommand?.(item.action);
-      else onEnterKey?.();
-      commandModeRef.current = false;
-      commandIdxRef.current = 0;
-      setCommandMode(false);
-      setCommandIdx(0);
+    if (menuOpenRef.current) {
+      // The menu stays open after the finger lifts; the user taps an item next.
       setIsPressing(false);
       setIsDragging(false);
       dragRef.current = null;
@@ -258,10 +222,8 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
   };
 
   const handlePointerCancel = (e: React.PointerEvent) => {
-    commandModeRef.current = false;
-    commandIdxRef.current = 0;
-    setCommandMode(false);
-    setCommandIdx(0);
+    menuOpenRef.current = false;
+    setMenuOpen(false);
     if (pttEngagedRef.current) {
       pttEngagedRef.current = false;
       onPushToTalkCancel?.();
@@ -276,48 +238,78 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
     }
   };
 
+  const closeMenu = useCallback(() => {
+    menuOpenRef.current = false;
+    setMenuOpen(false);
+  }, []);
+
+  const fireItem = (item: (typeof FAN)[number]) => {
+    triggerClick();
+    if (item.action) onCommand?.(item.action);
+    else onEnterKey?.();
+    closeMenu();
+  };
+
   const active = isPushToTalkActive || isListening;
 
   return (
     <>
-      {/* Radial command fan, laid out around the mic and opening toward the
-          screen centre, so the items never end up under the thumb or off the
-          edge wherever the mic has been parked. */}
-      {commandMode && (() => {
+      {/* Sticky command panel: a big, overlap-free grid anchored to the mic. It
+          stays open until an item is tapped; tapping the backdrop dismisses it. */}
+      {menuOpen && (() => {
         const vw = typeof window !== 'undefined' ? window.innerWidth : 360;
         const vh = typeof window !== 'undefined' ? window.innerHeight : 640;
         const cx = (pos.x / 100) * vw;
         const cy = (pos.y / 100) * vh;
-        const base = Math.atan2(vh / 2 - cy, vw / 2 - cx);
-        const n = FAN.length;
-        const step = (24 * Math.PI) / 180;
-        const radius = Math.max(96, Math.min(vw, vh) * 0.34);
-        const margin = 62;
-        const clamp = (v: number, lo: number, hi: number) =>
-          Math.max(lo, Math.min(hi, v));
+        const gap = 8;
+        const pad = 8;
+        const rowH = 56;
+        const panelW = Math.min(vw - 2 * pad, 340);
+        const panelH = pad * 2 + rowH + gap + 3 * rowH + 2 * gap;
+        const left = Math.max(pad, Math.min(vw - panelW - pad, cx - panelW / 2));
+        let top = cy - 52 - 12 - panelH;
+        if (top < pad) top = Math.min(vh - panelH - pad, cy + 52 + 12);
+        top = Math.max(pad, top);
         return (
-          <div className="fixed inset-0 z-40 pointer-events-none">
-            {FAN.map((item, i) => {
-              const angle = base + (i - (n - 1) / 2) * step;
-              const x = clamp(cx + radius * Math.cos(angle), margin, vw - margin);
-              const y = clamp(cy + radius * Math.sin(angle), margin, vh - margin);
-              const selected = i === commandIdx;
-              return (
-                <div
-                  key={item.key}
-                  style={{ left: `${x}px`, top: `${y}px`, transform: 'translate(-50%, -50%)' }}
-                  className={`absolute flex items-center gap-1.5 rounded-full px-3 py-1.5 border text-xs font-medium transition-all ${
-                    selected
-                      ? 'bg-indigo-500 border-indigo-300 text-white scale-110 shadow-[0_4px_16px_rgba(79,70,229,0.6)]'
-                      : 'bg-slate-900/85 border-slate-700/70 text-slate-300'
-                  }`}
-                >
-                  <item.Icon className="w-4 h-4 shrink-0" />
-                  <span>{item.label}</span>
-                </div>
-              );
-            })}
-          </div>
+          <>
+            <div className="fixed inset-0 z-40" onClick={closeMenu} />
+            <div
+              data-command-menu="true"
+              style={{ left: `${left}px`, top: `${top}px`, width: `${panelW}px` }}
+              className="fixed z-40 rounded-2xl border border-slate-700/80 bg-slate-900/95 p-2 shadow-[0_10px_30px_rgba(0,0,0,0.7)]"
+            >
+              {(() => {
+                const first = FAN[0];
+                return (
+                  <button
+                    type="button"
+                    data-command-item={first.key}
+                    onClick={() => fireItem(first)}
+                    style={{ height: `${rowH}px` }}
+                    className="w-full flex items-center justify-center gap-2 rounded-xl border border-indigo-400/50 bg-indigo-600/90 text-white text-base font-semibold hover:bg-indigo-500 active:scale-[0.98] transition"
+                  >
+                    <first.Icon className="w-5 h-5 shrink-0" />
+                    <span>{first.label}</span>
+                  </button>
+                );
+              })()}
+              <div className="grid grid-cols-2" style={{ gap: `${gap}px`, marginTop: `${gap}px` }}>
+                {FAN.slice(1).map(item => (
+                  <button
+                    key={item.key}
+                    type="button"
+                    data-command-item={item.key}
+                    onClick={() => fireItem(item)}
+                    style={{ height: `${rowH}px` }}
+                    className="flex items-center justify-center gap-2 rounded-xl border border-slate-700/80 bg-slate-800/90 text-slate-100 text-sm font-semibold px-2 hover:border-indigo-400 hover:bg-slate-700 active:scale-[0.98] transition"
+                  >
+                    <item.Icon className="w-5 h-5 shrink-0" />
+                    <span className="truncate">{item.label}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </>
         );
       })()}
 
@@ -375,7 +367,7 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
           className={`relative rounded-full flex items-center justify-center shadow-[0_6px_20px_rgba(0,0,0,0.6)] border transition-all ${
             isPressing ? 'scale-95' : ''
           } ${
-            commandMode
+            menuOpen
               ? 'bg-gradient-to-b from-indigo-600 to-indigo-700 border-indigo-300 text-white shadow-indigo-500/50'
               : enterMode
                 ? 'bg-gradient-to-tr from-emerald-600 to-teal-500 border-emerald-300 text-white shadow-emerald-500/50 animate-pulse'
@@ -385,10 +377,10 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
           }`}
         >
           {/* Pulsing halo while the push-to-talk session is live */}
-          {(active || commandMode) && !enterMode && (
+          {(active || menuOpen) && !enterMode && (
             <span
               className={`absolute -inset-3 rounded-full border-2 animate-ping pointer-events-none ${
-                commandMode ? 'border-indigo-400/60' : 'border-rose-500/60'
+                menuOpen ? 'border-indigo-400/60' : 'border-rose-500/60'
               }`}
             />
           )}
@@ -401,7 +393,7 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
         </div>
 
         {/* Hold hint while pressing; in Return mode it explains the swap */}
-        {isPressing && !enterMode && !commandMode && (
+        {isPressing && !enterMode && !menuOpen && (
           <span className="absolute left-1/2 top-full mt-2 -translate-x-1/2 whitespace-nowrap text-[10px] font-medium text-sky-200/90 bg-slate-900/90 border border-sky-500/30 rounded-full px-2 py-0.5 pointer-events-none">
             Listening · slide up for commands
           </span>
@@ -411,9 +403,9 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
             Tap: Return · × to exit
           </span>
         )}
-        {commandMode && (
+        {menuOpen && (
           <span className="absolute left-1/2 top-full mt-2 -translate-x-1/2 whitespace-nowrap text-[10px] font-semibold text-indigo-100 bg-indigo-950/90 border border-indigo-400/40 rounded-full px-2 py-0.5 pointer-events-none">
-            Slide out to choose · release to fire
+            Tap a command · tap away to close
           </span>
         )}
       </div>
