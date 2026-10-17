@@ -243,11 +243,13 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
     setMenuOpen(false);
   }, []);
 
+  // Firing a command deliberately leaves the menu open, so several commands can
+  // be tapped in a row (pause a video, then resume it, then skip). The user
+  // closes it with the x or by tapping the backdrop.
   const fireItem = (item: (typeof FAN)[number]) => {
     triggerClick();
     if (item.action) onCommand?.(item.action);
     else onEnterKey?.();
-    closeMenu();
   };
 
   const active = isPushToTalkActive || isListening;
@@ -264,8 +266,9 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
         const gap = 8;
         const pad = 8;
         const rowH = 56;
+        const headerH = 28;
         const panelW = Math.min(vw - 2 * pad, 340);
-        const panelH = pad * 2 + rowH + gap + 3 * rowH + 2 * gap;
+        const panelH = pad * 2 + headerH + gap + rowH + gap + 3 * rowH + 2 * gap;
         const left = Math.max(pad, Math.min(vw - panelW - pad, cx - panelW / 2));
         let top = cy - 52 - 12 - panelH;
         if (top < pad) top = Math.min(vh - panelH - pad, cy + 52 + 12);
@@ -278,6 +281,19 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
               style={{ left: `${left}px`, top: `${top}px`, width: `${panelW}px` }}
               className="fixed z-40 rounded-2xl border border-slate-700/80 bg-slate-900/95 p-2 shadow-[0_10px_30px_rgba(0,0,0,0.7)]"
             >
+              <div className="flex items-center justify-between" style={{ height: `${headerH}px` }}>
+                <span className="pl-1 text-xs font-semibold uppercase tracking-wide text-slate-400">
+                  Commands
+                </span>
+                <button
+                  type="button"
+                  aria-label="Close command menu"
+                  onClick={closeMenu}
+                  className="flex h-7 w-7 items-center justify-center rounded-full text-slate-400 hover:bg-slate-700 hover:text-white active:scale-95 transition"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
               {(() => {
                 const first = FAN[0];
                 return (
