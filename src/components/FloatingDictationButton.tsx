@@ -132,18 +132,17 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
     if (!dragRef.current) return;
     const dx = e.clientX - dragRef.current.startX;
     const dy = e.clientY - dragRef.current.startY;
+    // A near-vertical upward move is the command gesture, never a reposition.
+    const upSlide = dy < 0 && -dy > Math.abs(dx);
 
-    // Upward slide past the threshold enters command mode and aborts the
-    // dictation session, so nothing spoken is ever sent while choosing.
-    if (!dragRef.current.hasMoved && !enterMode && dy <= -COMMAND_SLIDE_PX) {
-      if (!commandModeRef.current) {
-        commandModeRef.current = true;
-        setCommandMode(true);
-        if (pttEngagedRef.current) {
-          pttEngagedRef.current = false;
-          onPushToTalkCancel?.();
-        }
-        triggerDictationEngaged();
+    if (commandModeRef.current) {
+      // Slid back toward the button: leave command mode without firing.
+      if (dy > -COMMAND_EXIT_PX) {
+        commandModeRef.current = false;
+        commandIdxRef.current = 0;
+        setCommandMode(false);
+        setCommandIdx(0);
+        return;
       }
       const depth = -dy - COMMAND_SLIDE_PX;
       const idx = Math.min(
@@ -158,14 +157,18 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
       return;
     }
 
-    if (commandModeRef.current) {
-      // Slid back toward the button: leave command mode without firing.
-      if (dy > -COMMAND_EXIT_PX) {
-        commandModeRef.current = false;
-        commandIdxRef.current = 0;
-        setCommandMode(false);
-        setCommandIdx(0);
+    // Enter command mode and abort the dictation session, so nothing spoken is
+    // ever sent while the user is choosing a command.
+    if (!enterMode && !dragRef.current.hasMoved && upSlide && -dy >= COMMAND_SLIDE_PX) {
+      commandModeRef.current = true;
+      commandIdxRef.current = 0;
+      setCommandMode(true);
+      setCommandIdx(0);
+      if (pttEngagedRef.current) {
+        pttEngagedRef.current = false;
+        onPushToTalkCancel?.();
       }
+      triggerDictationEngaged();
       return;
     }
 
@@ -176,6 +179,9 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
         onPushToTalkCancel?.();
       }
       clearLongPressTimer();
+      // The upward slide is reserved for commands, so it cancels the session
+      // without ever moving the button.
+      if (upSlide) return;
       dragRef.current.hasMoved = true;
       setIsDragging(true);
 
@@ -263,6 +269,10 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
   };
 
   const active = isPushToTalkActive || isListening;
+  // If the mic sits high on the screen the remote would run off the top edge,
+  // so it flips to open below the button instead.
+  const listBelow =
+    typeof window !== 'undefined' && (window.innerHeight * pos.y) / 100 < 280;
 
   return (
     <div
@@ -295,14 +305,18 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
 
       {/* Slide-up media remote: appears above the mic while the thumb is high */}
       {commandMode && (
-        <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-3 flex flex-col-reverse gap-1.5 pointer-events-none">
+        <div
+          className={`absolute left-1/2 -translate-x-1/2 flex pointer-events-none ${
+            listBelow ? 'top-full mt-3 flex-col' : 'bottom-full mb-3 flex-col-reverse'
+          }`}
+        >
           {COMMANDS.map((cmd, i) => {
             const selected = i === commandIdx;
             return (
               <div
                 key={cmd.action}
                 style={{ minWidth: 'calc(132px * var(--td-scale, 1))' }}
-                className={`flex items-center gap-2 rounded-full px-3 py-1.5 border text-xs font-medium transition-all ${
+                className={`flex items-center gap-2 rounded-full px-3 py-1.5 mb-1.5 border text-xs font-medium transition-all ${
                   selected
                     ? 'bg-indigo-500 border-indigo-300 text-white scale-105 shadow-[0_4px_16px_rgba(79,70,229,0.6)]'
                     : 'bg-slate-900/85 border-slate-700/70 text-slate-300'
@@ -356,7 +370,11 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
 
       {/* Hold hint while pressing; in Return mode it explains the swap */}
       {commandMode && (
-        <span className="absolute left-1/2 top-full mt-2 -translate-x-1/2 whitespace-nowrap text-[10px] font-semibold text-indigo-100 bg-indigo-950/90 border border-indigo-400/40 rounded-full px-2 py-0.5 pointer-events-none">
+        <span
+          className={`absolute left-1/2 -translate-x-1/2 whitespace-nowrap text-[10px] font-semibold text-indigo-100 bg-indigo-950/90 border border-indigo-400/40 rounded-full px-2 py-0.5 pointer-events-none ${
+            listBelow ? 'bottom-full mb-2' : 'top-full mt-2'
+          }`}
+        >
           Command · slide to choose
         </span>
       )}
