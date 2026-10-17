@@ -114,7 +114,7 @@ export const HorizontalScrollWheel: React.FC<HorizontalScrollWheelProps> = ({
         tabIndex={0}
         role="slider"
         aria-label="Horizontal scroll wheel"
-        style={{ height: 'calc(5rem * var(--td-scale, 1))' }}
+        style={{ height: 'calc(7.5rem * var(--td-scale, 1))' }}
         className={`relative w-full rounded-2xl overflow-hidden cursor-ew-resize select-none border transition-colors touch-none ${
           isActivelyScrubbing
             ? 'border-sky-500/40 bg-slate-900 shadow-inner'

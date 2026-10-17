@@ -192,7 +192,7 @@ export const BottomClickButtons: React.FC<BottomClickButtonsProps> = ({
   return (
     <div className="w-full bg-slate-950 border-t border-slate-900 p-2.5 sm:p-3 select-none">
       {/* 2 Pure Tactile Click Buttons: Unlabelled, Clean, and Hardware-feeling */}
-      <div className="grid grid-cols-2 gap-2.5" style={{ height: 'calc(5rem * var(--td-scale, 1))' }}>
+      <div className="grid grid-cols-2 gap-2.5" style={{ height: 'calc(7.5rem * var(--td-scale, 1))' }}>
         {/* Left Button */}
         <div
           onPointerDown={handleLeftDown}
