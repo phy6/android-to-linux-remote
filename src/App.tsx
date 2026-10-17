@@ -93,6 +93,10 @@ export default function App() {
   const [showSimulator, setShowSimulator] = useState(false);
   const [darkOut, setDarkOut] = useState(false);
   const [isPttActive, setIsPttActive] = useState(false);
+  // Mirrors isPttActive for callbacks that must not offer Return/Delete while a
+  // hold is still running: the laptop streams live text per phrase, and each of
+  // those must not be mistaken for "a dictation just landed".
+  const pttActiveRef = useRef(false);
   const [pttPhase, setPttPhase] = useState<'idle' | 'listening' | 'transcribing'>('idle');
   // True from the instant the mic is pressed until capture actually begins, so
   // the "Listening…" indicator appears immediately instead of waiting on the
@@ -161,9 +165,10 @@ export default function App() {
         pttTranscriptTimerRef.current = null;
         setPttTranscript(null);
       }, 9000);
-      // Offer Return only when words actually landed, and only for as long as
-      // the confirmation is on screen-ish; the mic reverts to the mic after.
-      if (heard.trim()) {
+      // Offer Return only when words actually landed *and the hold has ended*.
+      // Live per-phrase text arrives mid-hold, and offering Return then flipped
+      // the mic (and its Delete key) out from under the user's thumb.
+      if (heard.trim() && !pttActiveRef.current) {
         if (enterPromptTimerRef.current !== null) {
           window.clearTimeout(enterPromptTimerRef.current);
         }
@@ -183,6 +188,10 @@ export default function App() {
       setPttPartial(text);
     });
   }, []);
+
+  useEffect(() => {
+    pttActiveRef.current = isPttActive || pttWarming;
+  }, [isPttActive, pttWarming]);
 
   const showToast = useCallback((text: string, kind: 'ok' | 'warn' = 'ok') => {
     setToast({ text, kind });

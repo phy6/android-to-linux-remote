@@ -166,8 +166,21 @@ class DictationBridge:
             self._reset()
 
     def _reset(self):
+        # Close the old socket, not just the reference. The recogniser treats an
+        # open socket as a live session: abandoning one without closing it left
+        # the mic "busy" so every later press (phone or F9) was refused.
+        sock = self.sock
         self.sock = None
         self.owner = None
+        if sock is not None:
+            try:
+                sock.sendall(bytes([OP_STOP]))
+            except Exception:
+                pass
+            try:
+                sock.close()
+            except Exception:
+                pass
 
 
 def _ts():

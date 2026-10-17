@@ -17,7 +17,7 @@ per-item plans.
 | E | — | live preview while holding | **DONE** (deployed, verified) |
 | E | — | start-of-speech clipping | **DONE** (deployed, verified) |
 | E | **F8** | chunk long speech (latency) | **DONE** (device-verified; long-pause bounds added) |
-| E | **F6** | slide-up command mode | **IMPL + browser-verified** (device check pending) |
+| E | **F6** | slide-up command mode | **IMPL + browser-verified** (centred menu; Return/Delete suppressed during hold; device check pending) |
 | E | F7 | on-device transcription | **DROPPED** (user: laptop needs no more processing) |
 | F | — | media session Phase 1 (now-playing) | **PLAN** → `media-session-phase1.md` |
 | G | **F15** | ergonomic arc + handedness swap | **PLAN** → `ergonomic-handedness-f15.md` |

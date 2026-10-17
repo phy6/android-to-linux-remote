@@ -269,125 +269,116 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
   };
 
   const active = isPushToTalkActive || isListening;
-  // If the mic sits high on the screen the remote would run off the top edge,
-  // so it flips to open below the button instead.
-  const listBelow =
-    typeof window !== 'undefined' && (window.innerHeight * pos.y) / 100 < 280;
 
   return (
-    <div
-      style={{
-        left: `${pos.x}%`,
-        top: `${pos.y}%`,
-        transform: 'translate(-50%, -50%)',
-      }}
-      className={`fixed z-30 select-none touch-none transition-transform duration-75 ${
-        isDragging ? 'scale-110 cursor-grabbing' : 'scale-100 cursor-grab'
-      }`}
-    >
-      {enterMode && (
-        <button
-          type="button"
-          onClick={() => {
-            triggerClick();
-            onBackspace?.();
-          }}
-          aria-label="Send Backspace"
-          style={{
-            width: 'calc(68px * var(--td-scale, 1))',
-            height: 'calc(68px * var(--td-scale, 1))',
-          }}
-          className="absolute right-full top-1/2 -translate-y-1/2 mr-3 rounded-full flex items-center justify-center bg-gradient-to-b from-slate-900 to-slate-950 border border-slate-700/80 text-sky-300 shadow-[0_6px_20px_rgba(0,0,0,0.6)] hover:border-slate-600 hover:text-sky-200 active:scale-95 transition"
-        >
-          <Delete className="w-7 h-7" />
-        </button>
-      )}
-
-      {/* Slide-up media remote: appears above the mic while the thumb is high */}
+    <>
+      {/* Slide-up media remote, centred on screen so the thumb sitting on the
+          mic never covers the list the user is choosing from. */}
       {commandMode && (
-        <div
-          className={`absolute left-1/2 -translate-x-1/2 flex pointer-events-none ${
-            listBelow ? 'top-full mt-3 flex-col' : 'bottom-full mb-3 flex-col-reverse'
-          }`}
-        >
-          {COMMANDS.map((cmd, i) => {
-            const selected = i === commandIdx;
-            return (
-              <div
-                key={cmd.action}
-                style={{ minWidth: 'calc(132px * var(--td-scale, 1))' }}
-                className={`flex items-center gap-2 rounded-full px-3 py-1.5 mb-1.5 border text-xs font-medium transition-all ${
-                  selected
-                    ? 'bg-indigo-500 border-indigo-300 text-white scale-105 shadow-[0_4px_16px_rgba(79,70,229,0.6)]'
-                    : 'bg-slate-900/85 border-slate-700/70 text-slate-300'
-                }`}
-              >
-                <cmd.Icon className="w-4 h-4 shrink-0" />
-                <span>{cmd.label}</span>
-              </div>
-            );
-          })}
+        <div className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-40 flex flex-col items-center gap-2 pointer-events-none">
+          <div className="flex flex-col-reverse items-center gap-1.5">
+            {COMMANDS.map((cmd, i) => {
+              const selected = i === commandIdx;
+              return (
+                <div
+                  key={cmd.action}
+                  style={{ minWidth: 'calc(132px * var(--td-scale, 1))' }}
+                  className={`flex items-center gap-2 rounded-full px-3 py-1.5 border text-xs font-medium transition-all ${
+                    selected
+                      ? 'bg-indigo-500 border-indigo-300 text-white scale-105 shadow-[0_4px_16px_rgba(79,70,229,0.6)]'
+                      : 'bg-slate-900/85 border-slate-700/70 text-slate-300'
+                  }`}
+                >
+                  <cmd.Icon className="w-4 h-4 shrink-0" />
+                  <span>{cmd.label}</span>
+                </div>
+              );
+            })}
+          </div>
+          <span className="whitespace-nowrap text-[10px] font-semibold text-indigo-100 bg-indigo-950/90 border border-indigo-400/40 rounded-full px-2 py-0.5">
+            Command · slide to choose
+          </span>
         </div>
       )}
 
-      {/* Simple floating circular button with microphone icon */}
       <div
-        onPointerDown={handlePointerDown}
-        onPointerMove={handlePointerMove}
-        onPointerUp={handlePointerUp}
-        onPointerCancel={handlePointerCancel}
-        role="button"
-        tabIndex={0}
-        aria-label={enterMode ? 'Send Return key' : isPttLabel}
-        style={{ width: 'calc(104px * var(--td-scale, 1))', height: 'calc(104px * var(--td-scale, 1))' }}
-        className={`relative rounded-full flex items-center justify-center shadow-[0_6px_20px_rgba(0,0,0,0.6)] border transition-all ${
-          isPressing ? 'scale-95' : ''
-        } ${
-          commandMode
-            ? 'bg-gradient-to-b from-indigo-600 to-indigo-700 border-indigo-300 text-white shadow-indigo-500/50'
-            : enterMode
-              ? 'bg-gradient-to-tr from-emerald-600 to-teal-500 border-emerald-300 text-white shadow-emerald-500/50 animate-pulse'
-              : active
-                ? 'bg-rose-600 border-rose-400 text-white shadow-rose-600/50'
-                : 'bg-gradient-to-b from-slate-900 to-slate-950 border-slate-700/80 text-sky-300 shadow-black/60 hover:border-slate-600 hover:text-sky-200'
+        style={{
+          left: `${pos.x}%`,
+          top: `${pos.y}%`,
+          transform: 'translate(-50%, -50%)',
+        }}
+        className={`fixed z-30 select-none touch-none transition-transform duration-75 ${
+          isDragging ? 'scale-110 cursor-grabbing' : 'scale-100 cursor-grab'
         }`}
       >
-        {/* Pulsing halo while the push-to-talk session is live */}
-        {(active || commandMode) && !enterMode && (
-          <span
-            className={`absolute -inset-3 rounded-full border-2 animate-ping pointer-events-none ${
-              commandMode ? 'border-indigo-400/60' : 'border-rose-500/60'
-            }`}
-          />
+        {enterMode && (
+          <button
+            type="button"
+            onClick={() => {
+              triggerClick();
+              onBackspace?.();
+            }}
+            aria-label="Send Backspace"
+            style={{
+              width: 'calc(68px * var(--td-scale, 1))',
+              height: 'calc(68px * var(--td-scale, 1))',
+            }}
+            className="absolute right-full top-1/2 -translate-y-1/2 mr-3 rounded-full flex items-center justify-center bg-gradient-to-b from-slate-900 to-slate-950 border border-slate-700/80 text-sky-300 shadow-[0_6px_20px_rgba(0,0,0,0.6)] hover:border-slate-600 hover:text-sky-200 active:scale-95 transition"
+          >
+            <Delete className="w-7 h-7" />
+          </button>
         )}
 
-        {enterMode ? (
-          <CornerDownLeft className="w-11 h-11" />
-        ) : (
-          <Mic className={`w-11 h-11 ${active ? 'animate-bounce' : ''}`} />
-        )}
-      </div>
-
-      {/* Hold hint while pressing; in Return mode it explains the swap */}
-      {commandMode && (
-        <span
-          className={`absolute left-1/2 -translate-x-1/2 whitespace-nowrap text-[10px] font-semibold text-indigo-100 bg-indigo-950/90 border border-indigo-400/40 rounded-full px-2 py-0.5 pointer-events-none ${
-            listBelow ? 'bottom-full mb-2' : 'top-full mt-2'
+        {/* Simple floating circular button with microphone icon */}
+        <div
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
+          onPointerCancel={handlePointerCancel}
+          role="button"
+          tabIndex={0}
+          aria-label={enterMode ? 'Send Return key' : isPttLabel}
+          style={{ width: 'calc(104px * var(--td-scale, 1))', height: 'calc(104px * var(--td-scale, 1))' }}
+          className={`relative rounded-full flex items-center justify-center shadow-[0_6px_20px_rgba(0,0,0,0.6)] border transition-all ${
+            isPressing ? 'scale-95' : ''
+          } ${
+            commandMode
+              ? 'bg-gradient-to-b from-indigo-600 to-indigo-700 border-indigo-300 text-white shadow-indigo-500/50'
+              : enterMode
+                ? 'bg-gradient-to-tr from-emerald-600 to-teal-500 border-emerald-300 text-white shadow-emerald-500/50 animate-pulse'
+                : active
+                  ? 'bg-rose-600 border-rose-400 text-white shadow-rose-600/50'
+                  : 'bg-gradient-to-b from-slate-900 to-slate-950 border-slate-700/80 text-sky-300 shadow-black/60 hover:border-slate-600 hover:text-sky-200'
           }`}
         >
-          Command · slide to choose
-        </span>
-      )}
-      {isPressing && !enterMode && !commandMode && (
-        <span className="absolute left-1/2 top-full mt-2 -translate-x-1/2 whitespace-nowrap text-[10px] font-medium text-sky-200/90 bg-slate-900/90 border border-sky-500/30 rounded-full px-2 py-0.5 pointer-events-none">
-          Listening · slide up for commands
-        </span>
-      )}
-      {enterMode && (
-        <span className="absolute left-1/2 top-full mt-2 -translate-x-1/2 whitespace-nowrap text-[10px] font-semibold text-emerald-100 bg-emerald-950/90 border border-emerald-400/40 rounded-full px-2 py-0.5 pointer-events-none">
-          Tap: Return
-        </span>
-      )}
-    </div>
+          {/* Pulsing halo while the push-to-talk session is live */}
+          {(active || commandMode) && !enterMode && (
+            <span
+              className={`absolute -inset-3 rounded-full border-2 animate-ping pointer-events-none ${
+                commandMode ? 'border-indigo-400/60' : 'border-rose-500/60'
+              }`}
+            />
+          )}
+
+          {enterMode ? (
+            <CornerDownLeft className="w-11 h-11" />
+          ) : (
+            <Mic className={`w-11 h-11 ${active ? 'animate-bounce' : ''}`} />
+          )}
+        </div>
+
+        {/* Hold hint while pressing; in Return mode it explains the swap */}
+        {isPressing && !enterMode && !commandMode && (
+          <span className="absolute left-1/2 top-full mt-2 -translate-x-1/2 whitespace-nowrap text-[10px] font-medium text-sky-200/90 bg-slate-900/90 border border-sky-500/30 rounded-full px-2 py-0.5 pointer-events-none">
+            Listening · slide up for commands
+          </span>
+        )}
+        {enterMode && (
+          <span className="absolute left-1/2 top-full mt-2 -translate-x-1/2 whitespace-nowrap text-[10px] font-semibold text-emerald-100 bg-emerald-950/90 border border-emerald-400/40 rounded-full px-2 py-0.5 pointer-events-none">
+            Tap: Return
+          </span>
+        )}
+      </div>
+    </>
   );
 };
