@@ -21,6 +21,7 @@ import urllib.request
 import hashlib
 import hmac
 import base64
+import secrets
 import threading
 import subprocess
 import tempfile
@@ -30,7 +31,7 @@ import re
 import pwd
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-DAEMON_VERSION = "1.8.0"
+DAEMON_VERSION = "1.9.0"
 
 PORT = int(os.environ.get("TAILDECK_PORT", 8080))
 DICTATE_HOST = os.environ.get("TAILDECK_DICTATE_HOST", "127.0.0.1")
@@ -793,6 +794,25 @@ SHARE_DIR = os.environ.get(
     "TAILDECK_SHARE_DIR", os.path.join(os.path.expanduser("~"), "taildeck-share")
 )
 MAX_UPLOAD = int(os.environ.get("TAILDECK_MAX_UPLOAD", str(64 * 1024 * 1024)))
+
+# Share links: a token URL that hands someone a *subfolder* of the share, for a
+# while, with an optional write permission and an optional single-use limit.
+# The store is owner-only (0600) and sits beside the other taildeck config. See
+# plans/safe-share-links.md for the threat model -- a link narrows what a
+# recipient can reach; it is not a boundary against someone already on the LAN.
+SHARES_FILE = os.environ.get(
+    "TAILDECK_SHARES_FILE",
+    os.path.join(os.path.expanduser("~"), ".config", "taildeck", "shares.json"),
+)
+SHARES_LOCK = threading.Lock()
+
+# Raw phone audio, recorded to the laptop. Separate from dictation: this is the
+# music/voice path (no recogniser, no typing), written as a WAV for the user to
+# keep. It exists so a phone on the music stand or guitar can be a wireless mic
+# for local practice recording -- see plans/mic-requirements.md (options A/B).
+TAKES_DIR = os.environ.get(
+    "TAILDECK_TAKES_DIR", os.path.join(os.path.expanduser("~"), "taildeck-takes")
+)
 
 # Phase 2: clipboard bridge. Reading and setting the desktop clipboard is always
 # available; watching it and pushing changes to phones is opt-in, because a
@@ -1679,6 +1699,319 @@ def _list_files(rel_dir=""):
     return entries
 
 
+# --- SHARE LINKS ------------------------------------------------------------
+#
+# A link is a token that reveals one subfolder of SHARE_DIR to whoever holds it,
+# until it expires or is revoked. Both the link's own folder and the path a
+# visitor asks for are put through the same sandbox, so a link can never climb
+# out of the folder it was made for. The landing page is plain HTML with a CSP
+# so any browser can use it without the app.
+
+
+def _load_shares():
+    """The links file, or a fresh empty store. Never raises."""
+    try:
+        with open(SHARES_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and isinstance(data.get("links"), list):
+            return data
+    except FileNotFoundError:
+        pass
+    except Exception:
+        return {"version": 1, "links": []}
+    return {"version": 1, "links": []}
+
+
+def _save_shares(store):
+    """Write the store atomically, owner-only. Caller holds SHARES_LOCK."""
+    try:
+        os.makedirs(os.path.dirname(SHARES_FILE), exist_ok=True)
+        tmp = SHARES_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(store, fh, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, SHARES_FILE)
+        return True
+    except Exception:
+        return False
+
+
+def _share_public(link):
+    """The owner-facing view of a link. Includes the token so a link can be
+    re-copied later; see plans/safe-share-links.md for why that is acceptable."""
+    expires = int(link.get("expires") or 0)
+    max_uses = int(link.get("maxUses") or 0)
+    uses = int(link.get("uses") or 0)
+    revoked = bool(link.get("revoked"))
+    expired = bool(expires) and time.time() >= expires
+    exhausted = bool(max_uses) and uses >= max_uses
+    return {
+        "id": link.get("id", ""),
+        "label": link.get("label", ""),
+        "dir": link.get("dir", ""),
+        "write": bool(link.get("write")),
+        "created": int(link.get("created") or 0),
+        "expires": expires,
+        "maxUses": max_uses,
+        "uses": uses,
+        "revoked": revoked,
+        "expired": expired,
+        "exhausted": exhausted,
+        "active": not (revoked or expired or exhausted),
+        "token": link.get("token", ""),
+        "path": "/s/" + str(link.get("token", "")),
+    }
+
+
+def _lookup_share(token, store=None):
+    """The link with this token, or None. Constant-time on the token compare."""
+    if not token or not isinstance(token, str):
+        return None
+    store = store if store is not None else _load_shares()
+    match = None
+    for link in store.get("links", []):
+        stored = str(link.get("token", ""))
+        if len(stored) == len(token) and hmac.compare_digest(stored, token):
+            match = link
+    return match
+
+
+def _share_valid(link):
+    """True while a link may be used at all: not revoked and not expired. The
+    use cap is checked separately, on entry only, so one visit can still browse
+    and download after its single entry has been spent."""
+    if not link or link.get("revoked"):
+        return False
+    expires = int(link.get("expires") or 0)
+    if expires and time.time() >= expires:
+        return False
+    return True
+
+
+def _share_dir(rel):
+    """Absolute path for a share-relative *directory*. Unlike _share_path, an
+    empty path means the share root itself, which is what a link scoped to the
+    whole share (and the browse root) needs. None when the path is unsafe."""
+    if not (rel or "").strip().strip("/"):
+        root = os.path.abspath(SHARE_DIR)
+        return root if os.path.isdir(root) else None
+    return _share_path(rel)
+
+
+def _share_link_dir(link, sub):
+    """Absolute path for `sub` inside the link's own folder, or None. Two
+    sandboxes deep: the link's dir first, then the visitor's relative path."""
+    root = _share_dir(link.get("dir"))
+    if root is None:
+        return None
+    if not (sub or "").strip().strip("/"):
+        return root
+    inner = _safe_rel_path(sub)
+    if inner is None:
+        return None
+    full = os.path.abspath(os.path.join(root, inner))
+    if full != root and not full.startswith(root + os.sep):
+        return None
+    return full
+
+
+def _consume_share(link):
+    """Spend one entry against a link and persist. Returns False if it could not
+    be spent (a race lost, or already exhausted)."""
+    with SHARES_LOCK:
+        store = _load_shares()
+        for current in store.get("links", []):
+            if current.get("id") != link.get("id"):
+                continue
+            if not _share_valid(current):
+                return False
+            max_uses = int(current.get("maxUses") or 0)
+            if max_uses:
+                used = int(current.get("uses") or 0)
+                if used >= max_uses:
+                    return False
+                current["uses"] = used + 1
+            _save_shares(store)
+            link["uses"] = current.get("uses", 0)
+            return True
+    return False
+
+
+def _share_ttl_clamp(ttl):
+    """Normalised ttl in seconds; 0 means never expires. Clamped to 30 days."""
+    try:
+        ttl = int(ttl or 0)
+    except Exception:
+        return 0
+    if ttl <= 0:
+        return 0
+    return min(ttl, 30 * 24 * 3600)
+
+
+def _human_size(n):
+    try:
+        n = int(n)
+    except Exception:
+        return "?"
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n} {unit}" if unit == "B" else f"{n / 1024:.1f} {unit}"
+        n /= 1024.0
+    return "?"
+
+
+def _share_page(token, link, sub, message=""):
+    """The recipient's landing page: one folder, download links, maybe upload."""
+    import html as _html
+
+    dir_full = _share_link_dir(link, sub)
+    entries = None
+    if dir_full is not None:
+        try:
+            names = os.listdir(dir_full)
+        except Exception:
+            names = None
+        if names is not None:
+            entries = []
+            for name in names:
+                if name.startswith("."):
+                    continue
+                full = os.path.join(dir_full, name)
+                try:
+                    st = os.stat(full)
+                except Exception:
+                    continue
+                entries.append({
+                    "name": name,
+                    "dir": os.path.isdir(full),
+                    "size": st.st_size,
+                    "modified": int(st.st_mtime),
+                })
+            entries.sort(key=lambda e: (not e["dir"], e["name"].lower()))
+
+    base = (link.get("dir") or "").strip("/")
+    inner = _safe_rel_path(sub) or "" if (sub or "").strip("/") else ""
+    # Uploads are relative to the link root, not to the share root, so a link
+    # scoped to one folder never writes into a sibling of the same name.
+    rel_now = inner
+    depth_parts = [p for p in inner.split("/") if p]
+
+    def href(rel):
+        q = urllib.parse.urlencode({"d": rel}) if rel else ""
+        return f"/s/{_html.escape(token)}{'?' + q if q else ''}"
+
+    crumbs = [f'<a href="{href("")}">{_html.escape(base.split("/")[-1] or "Shared folder")}</a>']
+    walk = []
+    for part in depth_parts:
+        walk.append(part)
+        crumbs.append(f'<a href="{href("/".join(walk))}">{_html.escape(part)}</a>')
+
+    rows = []
+    if entries is None:
+        rows.append('<p class="muted">This folder is not available.</p>')
+    elif not entries:
+        rows.append('<p class="muted">This folder is empty.</p>')
+    else:
+        if depth_parts:
+            parent = "/".join(depth_parts[:-1])
+            rows.append(f'<a class="row" href="{href(parent)}"><span class="ic">&#8593;</span>'
+                        f'<span class="nm">Up</span></a>')
+        for e in entries:
+            name = _html.escape(e["name"])
+            if e["dir"]:
+                child = "/".join(depth_parts + [e["name"]])
+                rows.append(f'<a class="row" href="{href(child)}"><span class="ic">&#128193;</span>'
+                            f'<span class="nm">{name}</span></a>')
+            else:
+                child = "/".join(depth_parts + [e["name"]])
+                dl = f"/s/{_html.escape(token)}/download?{urllib.parse.urlencode({'d': child})}"
+                rows.append(f'<a class="row" href="{dl}" download><span class="ic">&#128196;</span>'
+                            f'<span class="nm">{name}</span>'
+                            f'<span class="sz">{_human_size(e["size"])}</span></a>')
+
+    upload = ""
+    if link.get("write"):
+        upload = f"""
+<form id="up" class="up">
+  <input id="f" type="file" />
+  <button type="submit">Upload here</button>
+  <span id="st" class="muted"></span>
+</form>
+<script>
+document.getElementById('up').addEventListener('submit', async (ev) => {{
+  ev.preventDefault();
+  const f = document.getElementById('f').files[0];
+  const st = document.getElementById('st');
+  if (!f) {{ st.textContent = 'Pick a file first.'; return; }}
+  st.textContent = 'Uploading…';
+  try {{
+    const url = '/s/{_html.escape(token)}/upload?' + new URLSearchParams({{d: {json.dumps(rel_now)}, name: f.name}});
+    const res = await fetch(url, {{method: 'POST', headers: {{'Content-Type': 'application/octet-stream'}}, body: f}});
+    const data = await res.json();
+    st.textContent = data && data.ok ? 'Uploaded.' : 'Upload failed.';
+    if (data && data.ok) setTimeout(() => location.reload(), 400);
+  }} catch (e) {{
+    st.textContent = 'Upload failed.';
+  }}
+}});
+</script>"""
+
+    expiry = "no expiry"
+    expires = int(link.get("expires") or 0)
+    if expires:
+        left = int(expires - time.time())
+        expiry = "expires in %dh" % max(0, left // 3600) if left >= 3600 else "expires in %dm" % max(0, left // 60)
+    max_uses = int(link.get("maxUses") or 0)
+    uses = int(link.get("uses") or 0)
+    uses_txt = ""
+    if max_uses:
+        uses_txt = f" &middot; {max_uses - uses} of {max_uses} use(s) left"
+
+    label = _html.escape(link.get("label") or "")
+    title = label or _html.escape(base.split("/")[-1] or "Shared folder")
+    banner = f'<p class="note">{_html.escape(message)}</p>' if message else ""
+
+    return f"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="robots" content="noindex" />
+<title>{title} &middot; TailDeck share</title>
+<style>
+:root {{ color-scheme: dark; }}
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; background: #020617; color: #e2e8f0;
+  font: 15px/1.45 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }}
+.wrap {{ max-width: 720px; margin: 0 auto; padding: 20px 16px 48px; }}
+h1 {{ font-size: 18px; margin: 0 0 2px; }}
+.crumbs {{ font-size: 12px; color: #64748b; margin-bottom: 14px; }}
+.crumbs a {{ color: #38bdf8; text-decoration: none; }}
+.crumbs a + a::before {{ content: " / "; color: #475569; }}
+.row {{ display: flex; align-items: center; gap: 10px; padding: 12px;
+  background: #0f172a; border: 1px solid #1e293b; border-radius: 12px;
+  margin-bottom: 8px; color: inherit; text-decoration: none; }}
+.row:hover {{ border-color: #334155; }}
+.ic {{ width: 22px; text-align: center; }}
+.nm {{ flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; }}
+.sz {{ color: #64748b; font-size: 12px; }}
+.muted {{ color: #64748b; }}
+.note {{ background: #082f49; border: 1px solid #0e7490; color: #a5f3fc;
+  padding: 10px; border-radius: 10px; }}
+.up {{ display: flex; gap: 8px; align-items: center; margin-top: 16px;
+  padding-top: 16px; border-top: 1px solid #1e293b; }}
+.up button {{ background: #0ea5e9; color: #04121f; border: 0; border-radius: 10px;
+  padding: 10px 14px; font-weight: 600; }}
+footer {{ margin-top: 24px; color: #475569; font-size: 12px; }}
+</style></head>
+<body><div class="wrap">
+<h1>{title}</h1>
+<div class="crumbs">{" &middot; ".join(crumbs)}</div>
+{banner}{"".join(rows)}{upload}
+<footer>Shared with TailDeck &middot; {expiry}{uses_txt}</footer>
+</div></body></html>"""
+
+
 # --- SCREEN VIEW API --------------------------------------------------------
 #
 # Read-only view of the X screen: a one-shot JPEG for a thumbnail/refresh, and a
@@ -2541,6 +2874,153 @@ def perform_update(dry_run=False):
     return True, report
 
 
+# Sessions for one-visit links: opening the landing page spends an entry and
+# leaves a cookie, so browsing and downloading within that visit do not spend
+# more. In-memory only -- a restart invalidates live visits.
+_SHARE_SESSIONS = {}
+_SHARE_SESSIONS_LOCK = threading.Lock()
+_SHARE_SESSION_CAP = 500
+
+
+def _share_session_ok(token, sid):
+    if not sid:
+        return False
+    with _SHARE_SESSIONS_LOCK:
+        return sid in _SHARE_SESSIONS.get(token, ())
+
+
+def _share_session_new(token):
+    sid = secrets.token_urlsafe(16)
+    with _SHARE_SESSIONS_LOCK:
+        if len(_SHARE_SESSIONS) > _SHARE_SESSION_CAP:
+            _SHARE_SESSIONS.clear()
+        _SHARE_SESSIONS.setdefault(token, set()).add(sid)
+    return sid
+
+
+def _share_cookie_sid(headers):
+    for part in (headers.get("cookie") or "").split(";"):
+        name, _, value = part.strip().partition("=")
+        if name == "tds":
+            return value.strip()
+    return ""
+
+
+def _share_send(conn, status, html, cookie=""):
+    extra = "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; "
+    extra += "script-src 'unsafe-inline'; connect-src 'self'\r\n"
+    extra += "X-Content-Type-Options: nosniff\r\n"
+    if cookie:
+        extra += f"Set-Cookie: {cookie}\r\n"
+    _http(conn, status, "text/html; charset=utf-8", html.encode("utf-8"), "no-store", extra=extra)
+
+
+def _share_missing(conn):
+    """One opaque answer for unknown, expired, revoked and used-up links."""
+    _share_send(conn, "404 Not Found", (
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\" />"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />"
+        "<title>Not found</title></head><body style=\"background:#020617;color:#e2e8f0;"
+        "font:15px system-ui;padding:40px;\">"
+        "<h1 style=\"font-size:18px\">This link is not available</h1>"
+        "<p style=\"color:#64748b\">It may have expired, been used, or been revoked.</p>"
+        "</body></html>"))
+
+
+def handle_share_request(conn, raw, request_line):
+    """Answer /s/<token>... for link visitors. Returns True when it handled the
+    request, so the caller does not fall through to static file serving."""
+    try:
+        parts = request_line.split()
+        method = parts[0].upper()
+        target = parts[1]
+    except Exception:
+        return False
+    path = target.split("?", 1)[0]
+    if path != "/s" and not path.startswith("/s/"):
+        return False
+
+    rest = path[len("/s/"):] if path.startswith("/s/") else ""
+    head, _, action = rest.partition("/")
+    token = urllib.parse.unquote(head)
+
+    headers = _parse_headers(raw.decode("utf-8", errors="ignore"))
+    query = _query(target)
+    sub = query.get("d", "")
+
+    link = _lookup_share(token)
+    if not _share_valid(link):
+        _share_missing(conn)
+        return True
+
+    sid = _share_cookie_sid(headers)
+
+    if action == "" and method == "GET":
+        if not _share_session_ok(token, sid):
+            if not _consume_share(link):
+                _share_missing(conn)
+                return True
+            sid = _share_session_new(token)
+        cookie = f"tds={sid}; Path=/s/{token}; HttpOnly; SameSite=Lax; Max-Age=86400"
+        _share_send(conn, "200 OK", _share_page(token, link, sub), cookie=cookie)
+        return True
+
+    # Everything else needs the cookie the landing page handed out, so a copied
+    # download URL does not outlive the visit that created it.
+    if not _share_session_ok(token, sid):
+        _share_missing(conn)
+        return True
+
+    if action == "download" and method == "GET":
+        full = _share_link_dir(link, sub)
+        if full is None or not os.path.isfile(full):
+            _share_missing(conn)
+            return True
+        try:
+            with open(full, "rb") as fh:
+                data = fh.read()
+        except Exception:
+            _http(conn, "500 Internal Server Error", "text/plain; charset=utf-8",
+                  b"Unreadable\n")
+            return True
+        ctype = MIME_TYPES.get(os.path.splitext(full)[1].lower(), "application/octet-stream")
+        filename = os.path.basename(full).replace('"', "").replace("\\", "")
+        _http(conn, "200 OK", ctype, data, "no-store",
+              extra=f'Content-Disposition: attachment; filename="{filename}"\r\n')
+        return True
+
+    if action == "upload" and method == "POST":
+        if not link.get("write"):
+            _json(conn, {"ok": False, "error": "read-only link"}, "403 Forbidden")
+            return True
+        name = (query.get("name") or "").strip()
+        clean = name.replace("/", "").replace("\\", "").strip()
+        if not clean or clean.startswith("."):
+            _json(conn, {"ok": False, "error": "bad name"}, "400 Bad Request")
+            return True
+        parent = _share_link_dir(link, sub)
+        if parent is None:
+            _json(conn, {"ok": False, "error": "bad path"}, "400 Bad Request")
+            return True
+        full = os.path.join(parent, clean)
+        data = _read_http_body(conn, raw, headers)
+        if len(data) > MAX_UPLOAD:
+            _json(conn, {"ok": False, "error": "too large"}, "413 Payload Too Large")
+            return True
+        try:
+            os.makedirs(parent, exist_ok=True)
+            with open(full, "wb") as fh:
+                fh.write(data)
+        except Exception:
+            _json(conn, {"ok": False, "error": "unwritable"}, "500 Internal Server Error")
+            return True
+        _json(conn, {"ok": True, "name": clean, "size": len(data)})
+        return True
+
+    _share_missing(conn)
+    return True
+
+
 def handle_api(conn, raw, request_line):
     """Answer /api/* and the CA download. Returns True when it handled the
     request, so the caller does not fall through to static file serving."""
@@ -2562,6 +3042,9 @@ def handle_api(conn, raw, request_line):
         else:
             _http(conn, "404 Not Found", "text/plain; charset=utf-8",
                   b"TailDeck: no CA here; the certificate is self-signed.\n")
+        return True
+
+    if handle_share_request(conn, raw, request_line):
         return True
 
     if not path.startswith("/api/"):
@@ -2955,6 +3438,86 @@ def handle_api(conn, raw, request_line):
             return True
         print(f"[TailDeck] file saved: {rel} ({len(data)} bytes)", flush=True)
         _json(conn, {"ok": True, "path": rel.strip("/"), "size": len(data)})
+        return True
+
+    if path.rstrip("/") == "/api/shares" and method == "GET":
+        store = _load_shares()
+        _json(conn, {"ok": True,
+                     "shares": [_share_public(l) for l in store.get("links", [])]})
+        return True
+
+    if path.rstrip("/") == "/api/shares" and method == "POST":
+        q = _query(target)
+        raw_dir = q.get("dir", "") or ""
+        dir_rel = _safe_rel_path(raw_dir)
+        if dir_rel is None and raw_dir.strip("/"):
+            _json(conn, {"ok": False, "error": "bad path"}, "400 Bad Request")
+            return True
+        dir_rel = dir_rel or ""
+        root = _share_dir(dir_rel)
+        if root is None or not os.path.isdir(root):
+            _json(conn, {"ok": False, "error": "no such folder"}, "400 Bad Request")
+            return True
+        ttl = _share_ttl_clamp(q.get("ttl"))
+        try:
+            max_uses = max(0, min(int(q.get("maxUses") or 0), 10000))
+        except Exception:
+            max_uses = 0
+        link = {
+            "id": secrets.token_hex(8),
+            "label": (q.get("label") or "").strip()[:80],
+            "token": secrets.token_urlsafe(32),
+            "dir": dir_rel,
+            "write": q.get("write", "") in ("1", "true", "yes"),
+            "created": int(time.time()),
+            "expires": (int(time.time()) + ttl) if ttl else 0,
+            "maxUses": max_uses,
+            "uses": 0,
+            "revoked": False,
+        }
+        with SHARES_LOCK:
+            store = _load_shares()
+            store.setdefault("links", []).append(link)
+            saved = _save_shares(store)
+        if not saved:
+            _json(conn, {"ok": False, "error": "could not save"}, "500 Internal Server Error")
+            return True
+        print(f"[TailDeck] share link created for {dir_rel or '<share root>'}"
+              f" (write={link['write']}, ttl={ttl}, maxUses={max_uses})", flush=True)
+        _json(conn, {"ok": True, "share": _share_public(link)})
+        return True
+
+    if path.startswith("/api/shares/"):
+        rest = path[len("/api/shares/"):]
+        share_id, _, action = rest.partition("/")
+        share_id = urllib.parse.unquote(share_id)
+        with SHARES_LOCK:
+            store = _load_shares()
+            link = next((l for l in store.get("links", []) if l.get("id") == share_id), None)
+            if link is None:
+                _json(conn, {"ok": False, "error": "no such link"}, "404 Not Found")
+                return True
+            if action == "renew" and method == "POST":
+                ttl = _share_ttl_clamp(_query(target).get("ttl"))
+                link["expires"] = (int(time.time()) + ttl) if ttl else 0
+                _save_shares(store)
+                _json(conn, {"ok": True, "share": _share_public(link)})
+                return True
+            if action == "revoke" and method == "POST":
+                # Revoke is final: delete the link to hand out a new one. Live
+                # visits lose access immediately.
+                link["revoked"] = True
+                _save_shares(store)
+                _SHARE_SESSIONS.pop(str(link.get("token")), None)
+                _json(conn, {"ok": True, "share": _share_public(link)})
+                return True
+            if action == "delete" and method == "POST":
+                store["links"] = [l for l in store.get("links", []) if l.get("id") != share_id]
+                _save_shares(store)
+                _SHARE_SESSIONS.pop(str(link.get("token")), None)
+                _json(conn, {"ok": True})
+                return True
+        _json(conn, {"ok": False, "error": "bad action"}, "400 Bad Request")
         return True
 
     if path == "/api/screen/frame" and method == "GET":
