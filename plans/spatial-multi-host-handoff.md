@@ -44,21 +44,34 @@ behind it.
    - the edge indicator only re-renders when the active direction changes,
    - `pointercancel` clears state instead of being routed through tap detection.
 
-5. **Cross-host file transfer (`src/components/FilesTab.tsx` / `src/services/filesClient.ts`)** —
+5. **Cross-host file + folder transfer (`src/components/FilesTab.tsx` / `src/services/filesClient.ts`)** —
    `transferFileViaPhone(sourceHost, targetHost, path)` downloads the file to the
    *phone* and re-uploads it to the target (there is no laptop-to-laptop link;
    the phone is the broker). It refuses bodies larger than `MAX_TRANSFER_BYTES`
    (64 MB, matching the daemon's `TAILDECK_MAX_UPLOAD` default) before buffering
    the upload half, and returns a typed `TransferResult` with an error string.
-   FilesTab surfaces "Send to…" per file with a target chooser when other laptops
-   are saved.
+   `transferFolderViaPhone` mirrors a whole directory: it recursively lists the
+   source, then downloads and re-uploads each file into the same sub-path on the
+   target (the daemon's upload handler already `os.makedirs` the parent, so no
+   daemon change was needed — stdlib-only is preserved). It is bounded by
+   `MAX_FOLDER_FILES` (2000) and per-file `MAX_TRANSFER_BYTES`, and reports
+   `filesTransferred` / `bytesTransferred` / `skipped`. FilesTab surfaces
+   "Send to…" per entry (files **and** folders) with a target chooser when other
+   laptops are saved.
 
 ## Known limits
 
 - Transfer buffers the whole file in phone memory for the round trip; very large
   files are refused rather than streamed.
+- An **empty** source folder copies nothing — the daemon has no mkdir endpoint,
+  so directories only exist once a file lands in them.
+- Oversized or unreadable files inside a folder copy are skipped and counted,
+  not fatal to the rest of the folder.
 - The window-level `pointerup` safety net was removed from the trackpad now that
   `setPointerCapture` (wrapped in try/catch) covers the normal case.
+- **Drag gestures are not built yet.** Moving a file/folder is via the per-entry
+  "Send to…" tray; long-press drag-to-place in the switcher and dragging an entry
+  across a screen edge are still to do (see the touch-gesture follow-up).
 
 ## Verification
 - `bun run typecheck` (`tsc --noEmit`)

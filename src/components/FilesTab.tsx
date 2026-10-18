@@ -17,6 +17,7 @@ import {
   uploadFile,
   saveBlob,
   transferFileViaPhone,
+  transferFolderViaPhone,
 } from '../services/filesClient';
 import { ShareLinkDialog } from './ShareLinkDialog';
 import { ShareLinksPanel } from './ShareLinksPanel';
@@ -117,6 +118,18 @@ export const FilesTab: React.FC<FilesTabProps> = ({ host, otherHosts = [] }) => 
   const onSendTo = async (entry: ShareEntry, target: { host: string; name: string }) => {
     setSendFor(null);
     setBusy(entry.path);
+    if (entry.dir) {
+      const result = await transferFolderViaPhone(host, target.host, entry.path, '');
+      setBusy(null);
+      setNote(
+        result.ok
+          ? `Copied ${entry.name} to ${target.name} (${result.filesTransferred} file${
+              result.filesTransferred === 1 ? '' : 's'
+            })`
+          : `Could not copy ${entry.name}: ${result.error ?? 'unknown error'}`,
+      );
+      return;
+    }
     const result = await transferFileViaPhone(host, target.host, entry.path, '');
     setBusy(null);
     setNote(
@@ -235,14 +248,14 @@ export const FilesTab: React.FC<FilesTabProps> = ({ host, otherHosts = [] }) => 
                     {entry.modified ? ` · ${formatWhen(entry.modified)}` : ''}
                   </div>
                 </div>
-                {!entry.dir && otherHosts.length > 0 && (
+                {otherHosts.length > 0 && (
                   <button
                     type="button"
                     onClick={(e) => {
                       e.stopPropagation();
                       setSendFor(sendFor === entry.path ? null : entry.path);
                     }}
-                    title="Send to another laptop"
+                    title={entry.dir ? 'Copy folder to another laptop' : 'Send to another laptop'}
                     className="p-1.5 rounded-lg bg-slate-800 border border-slate-700 text-slate-400 hover:text-sky-300 shrink-0"
                   >
                     <Send className="w-3.5 h-3.5" />

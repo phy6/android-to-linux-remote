@@ -152,6 +152,106 @@ export async function transferFileViaPhone(
   }
 }
 
+export interface FolderTransferResult {
+  ok: boolean;
+  folder: string;
+  filesTransferred: number;
+  bytesTransferred: number;
+  skipped: number;
+  error?: string;
+}
+
+/** Guard against runaway recursion when mirroring a folder across hosts. */
+export const MAX_FOLDER_FILES = 2000;
+
+function joinPath(...parts: string[]): string {
+  return parts.filter(Boolean).join('/');
+}
+
+async function collectFiles(
+  host: string,
+  dir: string,
+  out: ShareEntry[],
+  limit: number,
+): Promise<boolean> {
+  const listing = await listFiles(host, dir);
+  if (!listing) return false;
+  for (const entry of listing.entries) {
+    if (out.length >= limit) return false;
+    if (entry.dir) {
+      if (!(await collectFiles(host, entry.path, out, limit))) return false;
+    } else {
+      out.push(entry);
+    }
+  }
+  return true;
+}
+
+/**
+ * Copy a whole folder from one laptop's share into another's, brokered through
+ * the phone. Recursively lists the source, then downloads and re-uploads each
+ * file into the mirrored sub-path on the target (the daemon creates missing
+ * parent directories on upload). Per-file `maxBytes` bounds phone memory; files
+ * that are missing or oversized are skipped and counted rather than aborting
+ * the whole copy.
+ */
+export async function transferFolderViaPhone(
+  sourceHost: string,
+  targetHost: string,
+  folderPath: string,
+  targetDir = '',
+  opts: { onProgress?: (bytes: number, files: number) => void; maxBytes?: number; maxFiles?: number } = {},
+): Promise<FolderTransferResult> {
+  const folder = folderPath.split('/').filter(Boolean).pop() || 'folder';
+  const result: FolderTransferResult = {
+    ok: false,
+    folder,
+    filesTransferred: 0,
+    bytesTransferred: 0,
+    skipped: 0,
+  };
+  if (!apiBase(sourceHost)) {
+    result.error = 'source unreachable';
+    return result;
+  }
+  if (!apiBase(targetHost)) {
+    result.error = 'target unreachable';
+    return result;
+  }
+  const files: ShareEntry[] = [];
+  const complete = await collectFiles(sourceHost, folderPath, files, opts.maxFiles ?? MAX_FOLDER_FILES);
+  if (!complete) {
+    result.error = 'folder too large or unreadable';
+    return result;
+  }
+  if (files.length === 0) {
+    result.ok = true;
+    return result;
+  }
+  const maxBytes = opts.maxBytes ?? MAX_TRANSFER_BYTES;
+  const destRoot = joinPath(targetDir, folder);
+  for (const entry of files) {
+    const rel = entry.path.slice(folderPath.length).replace(/^\//, '');
+    const relDir = rel.split('/').slice(0, -1).join('/');
+    const blob = await downloadFile(sourceHost, entry.path);
+    if (!blob || blob.size > maxBytes) {
+      result.skipped += 1;
+      continue;
+    }
+    const file = new File([blob], entry.name, { type: blob.type });
+    if (await uploadFile(targetHost, joinPath(destRoot, relDir), file)) {
+      result.filesTransferred += 1;
+      result.bytesTransferred += blob.size;
+      opts.onProgress?.(result.bytesTransferred, result.filesTransferred);
+    } else {
+      result.skipped += 1;
+    }
+  }
+  result.ok = result.skipped === 0;
+  if (!result.ok) result.error = `${result.skipped} file(s) skipped`;
+  return result;
+}
+
 /** Hand a Blob to the browser's downloader via a throwaway anchor. */
 export function saveBlob(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob);
