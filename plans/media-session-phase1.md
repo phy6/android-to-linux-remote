@@ -1,5 +1,7 @@
 # Media session — Phase 1 (now-playing + status)
 
+**Status.** DONE — shipped in commit `a811f60` ("Show what is playing on the laptop in the media tab").
+
 **Finding.** *Phase 1 media session (now-playing + control).* The drawer already has a **Media**
 tab with transport/volume buttons (`SideMenuDrawer.tsx:991-1050`) driving `media_control`
 (`taildeck-daemon.py:569`). What is missing is **what is playing** — there is no now-playing

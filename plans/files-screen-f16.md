@@ -1,5 +1,7 @@
 # F16 — Files screen (shared-folder browser)
 
+**Status.** DONE — browser landed in commit `0c8d8a3`; safe, revocable share links in `0041bd0`.
+
 **Finding.** *"Files/shared folder has no UI at all (backend exists, unreachable)."*
 
 ## Why

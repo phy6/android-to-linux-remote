@@ -1,5 +1,7 @@
 # F15 — ergonomic arc layout + left/right-handed profile
 
+**Status.** DONE — shipped in commit `d890cd4` ("Add handedness switching and move the mic menus onto the vertical axis").
+
 **Finding.** *"Ergonomic arc layout + left/right-handed profile swap."*
 
 ## Answering the handedness question (decided)
