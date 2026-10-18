@@ -9,6 +9,7 @@ import { PWAInstallButton } from './PWAInstallButton';
 import { PairingCodeModal } from './PairingCodeModal';
 import { ScanPairingModal } from './ScanPairingModal';
 import { UpdatesPanel } from './UpdatesPanel';
+import { FilesTab } from './FilesTab';
 import { UnlockPanel } from './UnlockPanel';
 import {
   notificationSupport,
@@ -20,6 +21,7 @@ import {
   WifiOff,
   Activity,
   Download,
+  Folder,
   Copy,
   Check,
   Terminal,
@@ -104,7 +106,7 @@ const SectionTitle: React.FC<{ children: React.ReactNode }> = ({ children }) => 
   <h4 className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">{children}</h4>
 );
 
-export type SideMenuTab = 'tailscale' | 'keys' | 'media' | 'settings' | 'help';
+export type SideMenuTab = 'tailscale' | 'keys' | 'media' | 'files' | 'settings' | 'help';
 
 const MediaNowCard: React.FC<{ now: NowPlaying | null }> = ({ now }) => {
   const title = now?.title ?? '';
@@ -193,7 +195,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
   const [tailscaleIp, setTailscaleIp] = useState(connectionStatus.hostAddress || '');
   const [alertPermission, setAlertPermission] = useState<AlertPermission>(notificationSupport());
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<'tailscale' | 'keys' | 'media' | 'settings' | 'help'>('keys');
+  const [activeTab, setActiveTab] = useState<SideMenuTab>('keys');
   const [nowPlaying, setNowPlaying] = useState<NowPlaying | null>(null);
 
   // Now-playing is pushed by the laptop when it changes; the client replays the
@@ -451,6 +453,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
             [
               { id: 'keys', label: 'Keyboard', Icon: Keyboard },
               { id: 'media', label: 'Media', Icon: Music },
+              { id: 'files', label: 'Files', Icon: Folder },
               { id: 'tailscale', label: 'Connection', Icon: Wifi },
               { id: 'settings', label: 'Settings', Icon: Sliders },
               { id: 'help', label: 'Help', Icon: HelpCircle },
@@ -466,7 +469,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
               }`}
             >
               <Icon className="w-5 h-5" />
-              <span className="text-xs">{label}</span>
+              <span className="text-[11px] whitespace-nowrap">{label}</span>
             </button>
           ))}
         </div>
@@ -1132,6 +1135,9 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
               </div>
             </div>
           )}
+
+          {/* TAB: FILES */}
+          {activeTab === 'files' && <FilesTab host={connectionStatus.hostAddress} />}
 
           {/* TAB 3: SETTINGS */}
           {activeTab === 'settings' && (
