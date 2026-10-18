@@ -9,6 +9,7 @@ import sys
 import os
 import io
 import json
+import wave
 import time
 import socket
 import ssl
@@ -29,7 +30,7 @@ import re
 import pwd
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-DAEMON_VERSION = "1.7.0"
+DAEMON_VERSION = "1.8.0"
 
 PORT = int(os.environ.get("TAILDECK_PORT", 8080))
 DICTATE_HOST = os.environ.get("TAILDECK_DICTATE_HOST", "127.0.0.1")
@@ -197,11 +198,104 @@ class DictationBridge:
                 pass
 
 
+class RecordSink:
+    """Writes raw phone PCM to a WAV on the laptop.
+
+    Deliberately separate from DictationBridge. Dictation is speech-tuned on the
+    phone (noise suppression / AGC / echo-cancel on) and its whole purpose is to
+    reach the recogniser and type text. A *recording* wants the untouched signal
+    and a file on disk, so it has its own messages ("record_audio"), never touches
+    vosk, and takes whatever format the phone declares. Only the connection that
+    opened the session may feed or close it.
+    """
+
+    def __init__(self):
+        self.wav = None
+        self.path = None
+        self.owner = None
+        self.frames = 0
+        self.sample_rate = 16000
+        self.lock = threading.Lock()
+
+    def start(self, owner=None, sample_rate=16000, label=""):
+        self._reset()
+        try:
+            os.makedirs(TAKES_DIR, exist_ok=True)
+        except OSError as e:
+            print(f"[TailDeck] record dir failed: {e}", flush=True)
+            return None
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", label).strip("_")
+        name = f"{stamp}-{safe}.wav" if safe else f"{stamp}.wav"
+        self.path = os.path.join(TAKES_DIR, name)
+        self.sample_rate = int(sample_rate) or 16000
+        try:
+            # wave writes the header on first write and fixes the sizes on close,
+            # so the file is a valid WAV even if the session is cut short.
+            self.wav = wave.open(self.path, "wb")
+            self.wav.setnchannels(1)
+            self.wav.setsampwidth(2)
+            self.wav.setframerate(self.sample_rate)
+        except Exception as e:
+            print(f"[TailDeck] record start failed: {e}", flush=True)
+            self._reset()
+            return None
+        self.owner = owner
+        self.frames = 0
+        print(f"[TailDeck] {_ts()} record -> {self.path} @ {self.sample_rate} Hz", flush=True)
+        return self.path
+
+    def audio(self, pcm, conn=None):
+        if self.wav is None or not pcm:
+            return
+        if conn is not None and self.owner is not None and self.owner is not conn:
+            return
+        try:
+            with self.lock:
+                self.wav.writeframes(pcm)
+                self.frames += 1
+        except Exception as e:
+            print(f"[TailDeck] record write dropped: {e}", flush=True)
+
+    def stop(self, conn=None, discard=False):
+        """Finalise the WAV. `discard` throws the partial away instead of keeping it."""
+        if conn is not None and self.owner is not None and self.owner is not conn:
+            return None
+        path, frames = self.path, self.frames
+        self._reset()
+        if path:
+            if discard:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                print(f"[TailDeck] {_ts()} record discarded after {frames} frames", flush=True)
+                return None
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                size = 0
+            print(f"[TailDeck] {_ts()} record saved {path} frames={frames} bytes={size}", flush=True)
+        return path
+
+    def _reset(self):
+        w = self.wav
+        self.wav = None
+        self.owner = None
+        self.path = None
+        if w is not None:
+            try:
+                w.close()
+            except Exception:
+                pass
+
+
 def _ts():
     return time.strftime("%H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d}"
 
 
 DICTATION = DictationBridge()
+RECORDING = RecordSink()
 SESSION_TYPE = os.environ.get("XDG_SESSION_TYPE", "").lower()
 if SESSION_TYPE not in ("x11", "wayland"):
     if os.environ.get("WAYLAND_DISPLAY"):
@@ -1927,7 +2021,7 @@ def _rdp_proxy(conn):
 
 def _capabilities():
     """Feature flags reported in host_info so clients can adapt."""
-    caps = ["media", "dictation", "scripts", "notify", "apps", "power"]
+    caps = ["media", "dictation", "scripts", "notify", "apps", "power", "record"]
     if _has_command("xrandr"):
         caps.append("displays")
     if _backlight_device():
@@ -3202,6 +3296,29 @@ def handle_websocket(conn):
                     DICTATION.cancel(conn)
                     print(f"[TailDeck] {peer} dictation_cancel bytes={dictation_bytes}", flush=True)
                     send_ws_frame(conn, json.dumps({"type": "dictation_stopped"}))
+                elif mtype == "record_start":
+                    path = RECORDING.start(
+                        conn,
+                        int(msg.get("sampleRate", 16000) or 16000),
+                        str(msg.get("label", "")),
+                    )
+                    print(f"[TailDeck] {peer} record_start ok={path is not None}", flush=True)
+                    send_ws_frame(conn, json.dumps({
+                        "type": "record_ready",
+                        "ok": path is not None,
+                        "path": os.path.basename(path) if path else None,
+                    }))
+                elif mtype == "record_audio":
+                    RECORDING.audio(base64.b64decode(msg.get("data", "")), conn)
+                elif mtype == "record_stop":
+                    path = RECORDING.stop(conn)
+                    send_ws_frame(conn, json.dumps({
+                        "type": "record_stopped",
+                        "path": os.path.basename(path) if path else None,
+                    }))
+                elif mtype == "record_cancel":
+                    RECORDING.stop(conn, discard=True)
+                    send_ws_frame(conn, json.dumps({"type": "record_stopped"}))
                 elif mtype == "ping":
                     pong = {"type": "pong", "timestamp": msg.get("timestamp", time.time() * 1000)}
                     send_ws_frame(conn, json.dumps(pong))
@@ -3212,6 +3329,9 @@ def handle_websocket(conn):
     finally:
         if is_ws:
             DICTATION.stop(conn)
+            # Finalise any WAV still open: a client that vanishes mid-recording
+            # must still leave a playable file behind.
+            RECORDING.stop(conn)
             # Never let a half-finished drag or held key outlive its client.
             INPUT_HANDLER.release_all()
             with _WS_CLIENTS_LOCK:

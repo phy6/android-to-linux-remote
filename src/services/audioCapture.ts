@@ -31,7 +31,15 @@ const IDLE_RELEASE_MS = 20000;
 /** How much audio is held back and replayed when a session starts. */
 const PRE_ROLL_SAMPLES = TARGET_RATE; // one second
 
-const AUDIO_CONSTRAINTS: MediaStreamConstraints = {
+/**
+ * Speech processing (NS / AGC / echo-cancel) is tuned for dictation and is
+ * actively wrong for music: it reshapes the spectrum and squashes dynamics. The
+ * profile selects the constraints the mic is opened with; 'music' turns all three
+ * off so an instrument or voice is captured as it sounds.
+ */
+export type CaptureProfile = 'speech' | 'music';
+
+const SPEECH_CONSTRAINTS: MediaStreamConstraints = {
   audio: {
     channelCount: 1,
     echoCancellation: true,
@@ -39,6 +47,36 @@ const AUDIO_CONSTRAINTS: MediaStreamConstraints = {
     autoGainControl: true,
   },
 };
+
+const MUSIC_CONSTRAINTS: MediaStreamConstraints = {
+  audio: {
+    channelCount: 1,
+    echoCancellation: false,
+    noiseSuppression: false,
+    autoGainControl: false,
+  },
+};
+
+let captureProfile: CaptureProfile = 'speech';
+
+function constraintsFor(profile: CaptureProfile): MediaStreamConstraints {
+  return profile === 'music' ? MUSIC_CONSTRAINTS : SPEECH_CONSTRAINTS;
+}
+
+/**
+ * Switch the shared mic's profile. Takes effect on the next open: while the mic
+ * is idle it is released so the next press rebuilds with the new constraints;
+ * while a session is live the change waits for it to end.
+ */
+export function setCaptureProfile(profile: CaptureProfile): void {
+  if (profile === captureProfile) return;
+  captureProfile = profile;
+  if (activeSessions === 0) releaseMic();
+}
+
+export function getCaptureProfile(): CaptureProfile {
+  return captureProfile;
+}
 
 const WORKLET_CODE = `
   class PcmTap extends AudioWorkletProcessor {
@@ -144,7 +182,7 @@ async function acquireMic(): Promise<{ stream: MediaStream; ctx: AudioContext }>
     sharedStream !== null &&
     sharedStream.getAudioTracks().some((track) => track.readyState === 'live');
   if (!live) {
-    sharedStream = await navigator.mediaDevices.getUserMedia(AUDIO_CONSTRAINTS);
+    sharedStream = await navigator.mediaDevices.getUserMedia(constraintsFor(captureProfile));
   }
 
   if (!sharedCtx || sharedCtx.state === 'closed') {

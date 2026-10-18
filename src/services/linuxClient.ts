@@ -11,6 +11,8 @@ const WS_OPEN = 1;
 // Audio captured before the laptop confirms the session must be held, not
 // dropped, or the first word is lost. At 16 kHz mono s16le this is 3 seconds.
 const MAX_DICTATION_QUEUE_BYTES = 16000 * 2 * 3;
+// Same pre-ready buffer for raw recordings: only the handshake window is held.
+const MAX_RECORD_QUEUE_BYTES = 16000 * 2 * 3;
 
 type EventCallback = (event: InputEventPayload) => void;
 type StatusCallback = (status: ConnectionStatus) => void;
@@ -19,6 +21,7 @@ type DictationPartialCallback = (text: string) => void;
 type NotifyCallback = (notice: { title: string; body: string }) => void;
 type AuthChallengeCallback = (challenge: AuthChallenge) => void;
 type MediaNowCallback = (now: NowPlaying) => void;
+type RecordingSavedCallback = (path: string | null, ok: boolean) => void;
 
 class LinuxClientService {
   private socket: WebSocket | null = null;
@@ -37,6 +40,11 @@ class LinuxClientService {
   private dictationWaiter: ((ok: boolean) => void) | null = null;
   private dictationQueue: ArrayBuffer[] = [];
   private dictationQueueBytes = 0;
+  private recordReady = false;
+  private recordWaiter: ((ok: boolean) => void) | null = null;
+  private recordQueue: ArrayBuffer[] = [];
+  private recordQueueBytes = 0;
+  private recordingSavedListeners: Set<RecordingSavedCallback> = new Set();
   private pendingDy = 0;
   private pendingScrollX = 0;
   private pendingScrollY = 0;
@@ -89,6 +97,17 @@ class LinuxClientService {
     this.dictationPartialListeners.add(callback);
     return () => {
       this.dictationPartialListeners.delete(callback);
+    };
+  }
+
+  /**
+   * Fired once a recording ends. `path` is the WAV the laptop saved (a bare
+   * filename under its takes folder), or null if nothing was kept.
+   */
+  public onRecordingSaved(callback: RecordingSavedCallback): () => void {
+    this.recordingSavedListeners.add(callback);
+    return () => {
+      this.recordingSavedListeners.delete(callback);
     };
   }
 
@@ -243,6 +262,27 @@ class LinuxClientService {
                 }
               });
             }
+          } else if (data.type === 'record_ready') {
+            this.recordReady = !!data.ok;
+            if (this.recordReady) {
+              this.flushRecordQueue();
+            } else {
+              this.dropRecordQueue();
+            }
+            const resolve = this.recordWaiter;
+            this.recordWaiter = null;
+            resolve?.(this.recordReady);
+          } else if (data.type === 'record_stopped') {
+            this.recordReady = false;
+            this.dropRecordQueue();
+            const path = typeof data.path === 'string' ? data.path : null;
+            this.recordingSavedListeners.forEach((cb) => {
+              try {
+                cb(path, path !== null);
+              } catch {
+                // A listener throwing must not break the socket handler.
+              }
+            });
           } else if (data.type === 'media_now') {
             const now: NowPlaying = {
               active: !!data.active,
@@ -372,6 +412,10 @@ class LinuxClientService {
     // A stale track belongs to the laptop we just left; drop it so the next
     // connection starts from "nothing playing" instead of the last one.
     this.lastMediaNow = null;
+    // A recording session lived on the socket we just left; do not let the next
+    // connection stream into it before it says record_ready.
+    this.recordReady = false;
+    this.dropRecordQueue();
     if (this.socket) {
       try {
         this.socket.close();
@@ -546,6 +590,89 @@ class LinuxClientService {
 
   public get isDictationReady(): boolean {
     return this.dictationReady;
+  }
+
+  /**
+   * Ask the laptop to open a WAV on disk and accept raw phone audio. Unlike
+   * dictation this never touches the recogniser: the PCM is written as-is, for
+   * keeping. `label` only affects the filename.
+   */
+  public startRecording(sampleRate = 16000, label = '', timeoutMs = 4000): Promise<boolean> {
+    if (!this.socket || this.socket.readyState !== WS_OPEN) {
+      return Promise.resolve(false);
+    }
+    this.dropRecordQueue();
+    const socket = this.socket;
+    return new Promise<boolean>((resolve) => {
+      const timer = window.setTimeout(() => {
+        if (this.recordWaiter === wrapped) this.recordWaiter = null;
+        resolve(false);
+      }, timeoutMs);
+      const wrapped = (ok: boolean) => {
+        window.clearTimeout(timer);
+        resolve(ok);
+      };
+      this.recordWaiter = wrapped;
+      socket.send(JSON.stringify({ type: 'record_start', sampleRate, label }));
+    });
+  }
+
+  /** Stream one chunk of mono s16le PCM to the laptop's recording. */
+  public sendRecordingAudio(pcm: ArrayBuffer) {
+    if (!this.socket || this.socket.readyState !== WS_OPEN) return;
+    if (!this.recordReady) {
+      // Hold audio captured before the laptop confirms, or the start is clipped.
+      if (this.recordQueueBytes + pcm.byteLength > MAX_RECORD_QUEUE_BYTES) return;
+      this.recordQueue.push(pcm);
+      this.recordQueueBytes += pcm.byteLength;
+      return;
+    }
+    this.sendRecordingChunk(pcm);
+  }
+
+  private sendRecordingChunk(pcm: ArrayBuffer) {
+    if (!this.socket || this.socket.readyState !== WS_OPEN) return;
+    const bytes = new Uint8Array(pcm);
+    let binary = '';
+    const CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+    }
+    this.socket.send(
+      JSON.stringify({ type: 'record_audio', data: btoa(binary) })
+    );
+  }
+
+  private flushRecordQueue() {
+    const queued = this.recordQueue;
+    this.recordQueue = [];
+    this.recordQueueBytes = 0;
+    for (const pcm of queued) this.sendRecordingChunk(pcm);
+  }
+
+  private dropRecordQueue() {
+    this.recordQueue = [];
+    this.recordQueueBytes = 0;
+  }
+
+  /** Finalise the WAV; the laptop reports the saved filename via onRecordingSaved. */
+  public stopRecording() {
+    if (!this.socket || this.socket.readyState !== WS_OPEN) return;
+    this.socket.send(JSON.stringify({ type: 'record_stop' }));
+    this.recordReady = false;
+    this.dropRecordQueue();
+  }
+
+  /** Abandon the recording; the laptop deletes the partial file. */
+  public cancelRecording() {
+    if (!this.socket || this.socket.readyState !== WS_OPEN) return;
+    this.socket.send(JSON.stringify({ type: 'record_cancel' }));
+    this.recordReady = false;
+    this.dropRecordQueue();
+  }
+
+  public get isRecordingReady(): boolean {
+    return this.recordReady;
   }
 
   public sendTypeText(text: string) {
