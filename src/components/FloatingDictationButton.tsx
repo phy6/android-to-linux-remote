@@ -11,8 +11,9 @@ const LONG_PRESS_MS = 320;
 // at the screen to land it. 22px is about a thumb's natural drift.
 const DRAG_CANCEL_PX = 22;
 
-// Hold, then slide up: opens a sticky cluster of commands. Slide left instead
-// for the apps pinned on the phone. Each slide must clear a deliberate
+// Hold, then slide up: opens a sticky cluster of commands. Slide down instead
+// for the apps pinned on the phone. Both menus sit on the vertical axis, so a
+// left/right drag is free to move the mic. Each slide must clear a deliberate
 // threshold so a stray roll never opens a panel.
 const COMMAND_SLIDE_PX = 56;
 
@@ -50,6 +51,10 @@ interface FloatingDictationButtonProps {
   onCommand?: (cmd: MediaAction) => void;
   /** host:port of the connected laptop, used to list and launch its apps. */
   host?: string;
+  /** Which bottom corner the mic defaults to. The live position still wins. */
+  side?: 'right' | 'left';
+  /** Fires when a drag moves the mic across the middle, so handedness can follow. */
+  onSideChange?: (side: 'right' | 'left') => void;
 }
 
 export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = ({
@@ -67,16 +72,20 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
   onExitEnterMode,
   onCommand,
   host = '',
+  side = 'right',
+  onSideChange,
 }) => {
   const { triggerClick, triggerDictationEngaged } = useHaptics(hapticsEnabled, soundEnabled);
 
-  // Position stored in percentage of viewport (default: centered near bottom thumb zone)
+  // Position stored in percentage of viewport. The default hugs the dominant
+  // thumb: right-aligned about two-thirds up, mirrored when left-handed.
   const [pos, setPos] = useState<{ x: number; y: number }>(() => {
+    const fallback = side === 'left' ? { x: 14, y: 34 } : { x: 86, y: 34 };
     try {
       const saved = localStorage.getItem('taildeck_floating_mic_pos');
-      return saved ? JSON.parse(saved) : { x: 50, y: 72 };
+      return saved ? JSON.parse(saved) : fallback;
     } catch {
-      return { x: 50, y: 72 };
+      return fallback;
     }
   });
 
@@ -93,7 +102,7 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
   const longPressTimerRef = useRef<number | null>(null);
   const pttEngagedRef = useRef(false);
 
-  // Slide-up command cluster, and the slide-left shortcut panel. Both stay open
+  // Slide-up command cluster, and the slide-down shortcut panel. Both stay open
   // after the finger lifts so a target can be tapped at leisure; tapping the
   // mic/backdrop closes whichever is showing. Mirrored in a ref because pointer
   // events can fire faster than React re-renders.
@@ -149,14 +158,15 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
     if (openPanelRef.current) return;
     const dx = e.clientX - dragRef.current.startX;
     const dy = e.clientY - dragRef.current.startY;
-    // Near-vertical up is the command gesture, near-horizontal left is the
-    // shortcut panel. Both are deliberate slides, never a reposition.
+    // Both menus live on the vertical axis: up opens the command cluster, down
+    // opens the app shortcuts. Left/right is left free to move the mic, which is
+    // what switches handedness when it crosses the middle.
     const upSlide = dy < 0 && -dy > Math.abs(dx);
-    const leftSlide = dx < 0 && -dx > Math.abs(dy);
+    const downSlide = dy > 0 && dy > Math.abs(dx);
 
     const opened = !enterMode && !dragRef.current.hasMoved;
     const wants = opened && ((upSlide && -dy >= COMMAND_SLIDE_PX) ? 'commands'
-      : (leftSlide && -dx >= COMMAND_SLIDE_PX) ? 'apps'
+      : (downSlide && dy >= COMMAND_SLIDE_PX) ? 'apps'
       : null);
 
     // Open the sticky panel and abort the dictation session, so nothing spoken
@@ -182,7 +192,7 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
       clearLongPressTimer();
       // Both slides are reserved for their panels, so they cancel the session
       // without ever moving the button.
-      if (upSlide || leftSlide) return;
+      if (upSlide || downSlide) return;
       dragRef.current.hasMoved = true;
       setIsDragging(true);
 
@@ -219,8 +229,10 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
     }
 
     if (dragRef.current.hasMoved) {
-      // Saved dragged position
+      // Saved dragged position. Crossing the middle switches handedness, so the
+      // mic is itself the left/right switch.
       localStorage.setItem('taildeck_floating_mic_pos', JSON.stringify(pos));
+      onSideChange?.(pos.x >= 50 ? 'right' : 'left');
       triggerClick();
     } else if (enterMode) {
       // A tap on the Return key submits, then the mic comes straight back.
@@ -471,7 +483,7 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
 
         {/* Direction hints: two curved wedges hugging the inside of the mic rim,
             their arcs following the rim and their points aimed at the centre.
-            Up opens the commands, left opens the app shortcuts. Each is its own
+            Up opens the commands, down opens the app shortcuts. Each is its own
             target, so the rest of the mic still takes a press. They hide as soon
             as a panel opens, so they never draw over its buttons. */}
         {!enterMode && !active && !openPanel && (
@@ -492,7 +504,7 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
               className="pointer-events-auto cursor-pointer fill-sky-300 transition hover:fill-sky-200 active:fill-sky-100"
             />
             <path
-              d="M 25 52 Q 11 52 3.093 62.396 A 50 50 0 0 1 3.093 41.604 Q 11 52 25 52 Z"
+              d="M 52 79 Q 52 93 41.604 100.907 A 50 50 0 0 0 62.396 100.907 Q 52 93 52 79 Z"
               role="button"
               tabIndex={0}
               aria-label="Open app shortcuts"
@@ -543,7 +555,7 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
         {/* Hold hint while pressing; in Return mode it explains the swap */}
         {isPressing && !enterMode && !openPanel && (
           <span className="absolute left-1/2 top-full mt-2 -translate-x-1/2 whitespace-nowrap text-[10px] font-medium text-sky-200/90 bg-slate-900/90 border border-sky-500/30 rounded-full px-2 py-0.5 pointer-events-none">
-            Listening · slide up: keys · left: apps
+            Listening · slide up: keys · down: apps
           </span>
         )}
         {enterMode && (

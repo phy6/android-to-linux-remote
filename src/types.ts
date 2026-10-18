@@ -75,4 +75,5 @@ export interface RemoteSettings {
   preferLocal: boolean; // try the same-hotspot link first, fall back to Tailscale
   connectionAlerts: boolean; // post a system notification when the link comes up or drops
   buttonScale: number; // global size multiplier for the big thumb controls
+  handedness: 'right' | 'left'; // which side the thumb controls and drawer live on
 }

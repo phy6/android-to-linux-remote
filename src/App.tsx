@@ -51,6 +51,7 @@ const DEFAULT_SETTINGS: RemoteSettings = {
   preferLocal: true,
   connectionAlerts: true,
   buttonScale: DEFAULT_BUTTON_SCALE,
+  handedness: 'right',
 };
 
 export default function App() {
@@ -71,7 +72,9 @@ export default function App() {
         typeof parsed.buttonScale === 'number'
           ? Math.min(MAX_BUTTON_SCALE, Math.max(MIN_BUTTON_SCALE, parsed.buttonScale))
           : DEFAULT_BUTTON_SCALE;
-      return { ...DEFAULT_SETTINGS, ...parsed, wheelSensitivity, buttonScale };
+      // Only two profiles exist; fall back to right on anything unrecognised.
+      const handedness = parsed.handedness === 'left' ? 'left' : 'right';
+      return { ...DEFAULT_SETTINGS, ...parsed, wheelSensitivity, buttonScale, handedness };
     } catch {
       return DEFAULT_SETTINGS;
     }
@@ -936,6 +939,10 @@ export default function App() {
         onExitEnterMode={exitEnterPrompt}
         onCommand={(cmd) => linuxClient.sendMedia(cmd)}
         host={connectionStatus.hostAddress}
+        side={settings.handedness}
+        onSideChange={(side) => {
+          if (side !== settings.handedness) handleUpdateSettings({ handedness: side });
+        }}
       />
 
       {/* Voice Dictation Input Sheet */}

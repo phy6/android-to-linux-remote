@@ -324,15 +324,18 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
   const installCommand = `curl -fsSL "${INSTALL_URL}" | bash`;
   const oneLinerCommand = `curl -sSL "${DAEMON_URL}" -o taildeck-daemon.py && python3 taildeck-daemon.py`;
 
-  // Edge drag detection on left side of screen
+  // Edge drag detection. The drawer lives opposite the thumb so it never fights
+  // the mic: a right-handed profile pulls it in from the left edge, and vice versa.
+  const drawerSide: 'right' | 'left' = settings.handedness === 'right' ? 'left' : 'right';
   useEffect(() => {
     const handleTouchStart = (e: TouchEvent) => {
       const touch = e.touches[0];
-      // If closed, only initiate drag if touch starts near the left edge (< 32px)
-      if (!isOpen && touch.clientX < 32) {
-        dragStartXRef.current = touch.clientX;
-        currentDragXRef.current = touch.clientX;
-      } else if (isOpen) {
+      const atEdge =
+        drawerSide === 'right'
+          ? touch.clientX > window.innerWidth - 32
+          : touch.clientX < 32;
+      // If closed, only initiate drag if touch starts near the drawer's edge
+      if (!isOpen ? atEdge : true) {
         dragStartXRef.current = touch.clientX;
         currentDragXRef.current = touch.clientX;
       }
@@ -344,8 +347,9 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
       const deltaX = touch.clientX - dragStartXRef.current;
 
       if (!isOpen) {
-        // Dragging in from left
-        const progress = Math.min(1, Math.max(0, deltaX / 280));
+        // Dragging in from the drawer's edge
+        const reach = drawerSide === 'right' ? -deltaX : deltaX;
+        const progress = Math.min(1, Math.max(0, reach / 280));
         setDragProgress(progress);
         if (progress > 0.4) {
           onOpen();
@@ -353,8 +357,9 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
           setDragProgress(null);
         }
       } else {
-        // Dragging out to left to close
-        if (deltaX < -50) {
+        // Dragging back out to the drawer's edge to close
+        const away = drawerSide === 'right' ? deltaX : -deltaX;
+        if (away < -50) {
           onClose();
           dragStartXRef.current = null;
           setDragProgress(null);
@@ -376,21 +381,29 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
       window.removeEventListener('touchmove', handleTouchMove);
       window.removeEventListener('touchend', handleTouchEnd);
     };
-  }, [isOpen, onOpen, onClose]);
+  }, [isOpen, onOpen, onClose, drawerSide]);
 
   return (
     <>
-      {/* Edge Handle Tab (always visible on left side for convenient pull/tap) */}
+      {/* Edge Handle Tab (visible on the drawer's side for convenient pull/tap) */}
       {!isOpen && (
         <div
           onClick={() => {
             triggerClick();
             onOpen();
           }}
-          className="fixed left-0 top-1/2 -translate-y-1/2 z-30 flex items-center justify-center w-5 h-16 rounded-r-xl bg-slate-900/90 border-r border-y border-slate-700/80 shadow-lg text-slate-400 hover:text-white cursor-pointer active:scale-95 transition-all select-none touch-none backdrop-blur-md opacity-40 hover:opacity-100"
+          className={`fixed top-1/2 -translate-y-1/2 z-30 flex items-center justify-center w-5 h-16 bg-slate-900/90 shadow-lg text-slate-400 hover:text-white cursor-pointer active:scale-95 transition-all select-none touch-none backdrop-blur-md opacity-40 hover:opacity-100 ${
+            drawerSide === 'right'
+              ? 'right-0 rounded-l-xl border-l border-y border-slate-700/80'
+              : 'left-0 rounded-r-xl border-r border-y border-slate-700/80'
+          }`}
           title="Drag or tap to open menu & Tailscale settings"
         >
-          <ChevronRight className="w-3.5 h-3.5" />
+          {drawerSide === 'right' ? (
+            <ChevronLeft className="w-3.5 h-3.5" />
+          ) : (
+            <ChevronRight className="w-3.5 h-3.5" />
+          )}
         </div>
       )}
 
@@ -405,9 +418,11 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
       {/* Slide-in Menu Drawer */}
       <div
         ref={drawerRef}
-        className={`fixed inset-y-0 left-0 z-50 w-full max-w-sm bg-slate-950 border-r border-slate-800 shadow-2xl flex flex-col transition-transform duration-300 ease-out select-none ${
-          isOpen ? 'translate-x-0' : '-translate-x-full'
-        }`}
+        className={`fixed inset-y-0 z-50 w-full max-w-sm bg-slate-950 border-slate-800 shadow-2xl flex flex-col transition-transform duration-300 ease-out select-none ${
+          drawerSide === 'right'
+            ? 'right-0 border-l translate-x-full'
+            : 'left-0 border-r -translate-x-full'
+        } ${isOpen ? '!translate-x-0' : ''}`}
       >
         {/* Drawer Header */}
         <div className="flex items-center justify-between p-4 border-b border-slate-800 bg-slate-950/90">
@@ -1195,6 +1210,39 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                   checked={settings.invertScroll}
                   onChange={(v) => onUpdateSettings({ invertScroll: v })}
                 />
+                <div className="space-y-1.5">
+                  <span className="font-semibold text-slate-300 flex items-center gap-1.5">
+                    <ArrowLeft className="w-3.5 h-3.5 text-sky-400" />
+                    <ArrowRight className="w-3.5 h-3.5 text-sky-400" />
+                    <span>Handedness</span>
+                  </span>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      onClick={() => onUpdateSettings({ handedness: 'right' })}
+                      className={`py-2 px-3 rounded-xl border text-sm font-medium transition-colors ${
+                        settings.handedness !== 'left'
+                          ? 'bg-sky-500/20 border-sky-500/50 text-sky-200'
+                          : 'bg-slate-900 border-slate-700 text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      Right-handed
+                    </button>
+                    <button
+                      onClick={() => onUpdateSettings({ handedness: 'left' })}
+                      className={`py-2 px-3 rounded-xl border text-sm font-medium transition-colors ${
+                        settings.handedness === 'left'
+                          ? 'bg-sky-500/20 border-sky-500/50 text-sky-200'
+                          : 'bg-slate-900 border-slate-700 text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      Left-handed
+                    </button>
+                  </div>
+                  <p className="text-[10px] text-slate-500">
+                    Mirrors the menu edge and thumb controls. Dragging the mic across the middle
+                    switches this on the fly.
+                  </p>
+                </div>
               </section>
 
               <section className="space-y-3 pt-4 border-t border-slate-800">
