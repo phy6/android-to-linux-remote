@@ -1002,12 +1002,16 @@ def _list_apps():
                 continue
             if not fields.get("Name") or not fields.get("Exec"):
                 continue
+            icon = (fields.get("Icon") or "").strip()
+            resolved = _resolve_icon(icon)
             found[app_id] = {
                 "id": app_id,
                 "name": fields["Name"],
                 "comment": fields.get("Comment", ""),
                 "categories": [c for c in fields.get("Categories", "").split(";") if c],
-                "icon": fields.get("Icon", ""),
+                "icon": icon,
+                "iconPath": resolved or "",
+                "iconVersion": _icon_version(resolved),
                 "path": os.path.join(directory, name),
             }
     return sorted(found.values(), key=lambda a: a["name"].lower())
@@ -1024,6 +1028,129 @@ def _find_app(app_id):
             if fields and fields.get("Type", "Application") == "Application":
                 return full, fields
     return None
+
+
+# A .desktop file names its icon ("brave-browser", "org.xfce.terminal") or gives
+# an absolute path. The phone wants an actual picture, so resolve the name here.
+ICON_THEME_DIRS = [
+    os.path.expanduser("~/.local/share/icons"),
+    os.path.expanduser("~/.icons"),
+    "/usr/local/share/icons",
+    "/usr/share/icons",
+    "/var/lib/flatpak/exports/share/icons",
+    os.path.expanduser("~/.local/share/flatpak/exports/share/icons"),
+]
+ICON_PIXMAP_DIRS = [
+    os.path.expanduser("~/.local/share/pixmaps"),
+    "/usr/local/share/pixmaps",
+    "/usr/share/pixmaps",
+]
+# Bigger rasters read better at phone size; scalable costs the most bytes for the
+# same result, so it ranks last.
+ICON_SIZES = ("256x256", "128x128", "96x96", "64x64", "48x48", "32x32", "scalable")
+ICON_HINTS = ("apps", "applications", "preferences", "devices", "places",
+              "mimetypes", "actions", "categories", "status")
+ICON_EXTS = (".png", ".svg", ".webp")
+# hicolor is the spec fallback every application must install into, so it wins
+# ties; the rest are ordered to match this machine before a full directory scan.
+ICON_THEME_ORDER = ("hicolor", "Adwaita", "breeze", "Papirus", "Yaru", "elementary")
+
+_ICON_INDEX = None
+_ICON_INDEX_LOCK = threading.Lock()
+_ICON_CACHE = {}
+
+
+def _icon_theme_names():
+    names = list(ICON_THEME_ORDER)
+    for root in ICON_THEME_DIRS:
+        try:
+            for entry in os.listdir(root):
+                if os.path.isdir(os.path.join(root, entry)) and entry not in names:
+                    names.append(entry)
+        except Exception:
+            continue
+    return names
+
+
+def _icon_index():
+    """name -> best icon file, built once by listing the theme app folders.
+
+    Listing beats probing: a name has to be tried against every root/theme/size
+    combination otherwise, which is thousands of failed stats per icon.
+    """
+    global _ICON_INDEX
+    with _ICON_INDEX_LOCK:
+        if _ICON_INDEX is not None:
+            return _ICON_INDEX
+        best = {}
+        for root in ICON_THEME_DIRS:
+            for theme in _icon_theme_names():
+                for size_rank, size in enumerate(ICON_SIZES):
+                    for hint_rank, hint in enumerate(ICON_HINTS):
+                        directory = os.path.join(root, theme, size, hint)
+                        try:
+                            entries = os.listdir(directory)
+                        except Exception:
+                            continue
+                        for entry in entries:
+                            base, ext = os.path.splitext(entry)
+                            ext = ext.lower()
+                            if ext not in ICON_EXTS:
+                                continue
+                            score = (size_rank, hint_rank, ICON_EXTS.index(ext))
+                            key = base.lower()
+                            if key not in best or score < best[key][0]:
+                                best[key] = (score, os.path.join(directory, entry))
+        _ICON_INDEX = {name: hit[1] for name, hit in best.items()}
+        return _ICON_INDEX
+
+
+def _resolve_icon_uncached(name):
+    """Best-effort icon file for a .desktop Icon= value. None when unresolved."""
+    name = (name or "").strip()
+    if not name or len(name) > 256:
+        return None
+    if os.path.isabs(name):
+        try:
+            if os.path.isfile(name) and os.path.getsize(name) < 4 * 1024 * 1024:
+                return name
+        except Exception:
+            pass
+        return None
+    if "/" in name or "\\" in name or name.startswith("."):
+        return None
+    base, ext = os.path.splitext(name)
+    if ext.lower() in ICON_EXTS or ext.lower() == ".xpm":
+        name = base
+    hit = _icon_index().get(name.lower())
+    if hit:
+        return hit
+    for directory in ICON_PIXMAP_DIRS:
+        for suffix in ICON_EXTS:
+            candidate = os.path.join(directory, name + suffix)
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+def _resolve_icon(name):
+    key = (name or "").strip()
+    if key in _ICON_CACHE:
+        return _ICON_CACHE[key]
+    hit = _resolve_icon_uncached(key)
+    _ICON_CACHE[key] = hit
+    return hit
+
+
+def _icon_version(path):
+    """Stable id for an icon file, so the phone re-fetches only when it changes."""
+    if not path:
+        return ""
+    try:
+        st = os.stat(path)
+    except Exception:
+        return ""
+    return f"{int(st.st_mtime)}-{st.st_size}"
 
 
 def _strip_exec_field_codes(exec_line):
@@ -2578,9 +2705,29 @@ def handle_api(conn, raw, request_line):
     if path == "/api/apps" and method == "GET":
         apps = _list_apps()
         _json(conn, {"ok": True, "count": len(apps), "apps": [
-            {k: a[k] for k in ("id", "name", "comment", "categories", "icon")}
+            {k: a[k] for k in ("id", "name", "comment", "categories", "icon", "iconVersion")}
             for a in apps
         ]})
+        return True
+
+    if path == "/api/apps/icon" and method == "GET":
+        query = urllib.parse.parse_qs(target.split("?", 1)[1]) if "?" in target else {}
+        app_id = (query.get("id") or [""])[0]
+        hit = _find_app(app_id)
+        icon = _resolve_icon(hit[1].get("Icon", "")) if hit else None
+        if not icon:
+            _http(conn, "404 Not Found", "text/plain; charset=utf-8", b"no icon\n")
+            return True
+        ctype = MIME_TYPES.get(os.path.splitext(icon)[1].lower(), "application/octet-stream")
+        try:
+            with open(icon, "rb") as fh:
+                body = fh.read()
+        except Exception:
+            _http(conn, "500 Internal Server Error", "text/plain; charset=utf-8", b"unreadable\n")
+            return True
+        # The client puts the file's version in the URL, so a changed icon is a
+        # different URL and this copy can be cached hard.
+        _http(conn, "200 OK", ctype, body, cache="public, max-age=31536000, immutable")
         return True
 
     if path == "/api/apps/launch" and method in ("POST", "PUT"):

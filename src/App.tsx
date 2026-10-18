@@ -935,6 +935,7 @@ export default function App() {
         }}
         onExitEnterMode={exitEnterPrompt}
         onCommand={(cmd) => linuxClient.sendMedia(cmd)}
+        host={connectionStatus.hostAddress}
       />
 
       {/* Voice Dictation Input Sheet */}
