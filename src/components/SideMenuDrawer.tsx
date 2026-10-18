@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { ConnectionStatus, RemoteSettings, SessionType, MediaAction } from '../types';
+import { ConnectionStatus, RemoteSettings, SessionType, MediaAction, NowPlaying } from '../types';
 import { linuxClient } from '../services/linuxClient';
 import { LOCAL_HOST, IS_LOCAL_MODE, describeRoute } from '../services/localMode';
 import { useSavedLaptops } from '../services/savedLaptops';
@@ -106,6 +106,44 @@ const SectionTitle: React.FC<{ children: React.ReactNode }> = ({ children }) => 
 
 export type SideMenuTab = 'tailscale' | 'keys' | 'media' | 'settings' | 'help';
 
+const MediaNowCard: React.FC<{ now: NowPlaying | null }> = ({ now }) => {
+  const title = now?.title ?? '';
+  const active = !!now?.active && title.trim() !== '';
+  const lengthMs = now?.lengthMs ?? 0;
+  const positionMs = now?.positionMs ?? 0;
+  const progress = lengthMs > 0 ? Math.min(100, Math.max(0, (positionMs / lengthMs) * 100)) : 0;
+  const playing = now?.status === 'Playing';
+  const subtitle = active
+    ? [now?.artist, now?.album].filter(Boolean).join(' · ') || now?.player || ''
+    : 'Play something on the laptop';
+  return (
+    <div className="rounded-2xl bg-slate-900 border border-slate-800 p-3.5">
+      <div className="flex items-center gap-3">
+        <div
+          className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 border ${
+            active
+              ? 'bg-sky-500/15 border-sky-500/30 text-sky-300'
+              : 'bg-slate-800 border-slate-700 text-slate-500'
+          }`}
+        >
+          {playing ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className={`text-sm font-medium truncate ${active ? 'text-slate-100' : 'text-slate-400'}`}>
+            {active ? title : 'Nothing playing'}
+          </div>
+          <div className="text-[11px] text-slate-400 truncate">{subtitle}</div>
+        </div>
+      </div>
+      {active && lengthMs > 0 && (
+        <div className="mt-3 h-1 rounded-full bg-slate-800 overflow-hidden">
+          <div className="h-full bg-sky-500" style={{ width: `${progress}%` }} />
+        </div>
+      )}
+    </div>
+  );
+};
+
 interface SideMenuDrawerProps {
   isOpen: boolean;
   onClose: () => void;
@@ -156,6 +194,11 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
   const [alertPermission, setAlertPermission] = useState<AlertPermission>(notificationSupport());
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'tailscale' | 'keys' | 'media' | 'settings' | 'help'>('keys');
+  const [nowPlaying, setNowPlaying] = useState<NowPlaying | null>(null);
+
+  // Now-playing is pushed by the laptop when it changes; the client replays the
+  // last one, so a drawer that was closed still shows the current track.
+  useEffect(() => linuxClient.onMediaNow(setNowPlaying), []);
 
   // Honour a requested tab on the closed→open edge, without fighting the user's
   // own tab choice while the drawer stays open.
@@ -990,6 +1033,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
               has focused. Keys ride the same channel as the keyboard. */}
           {activeTab === 'media' && (
             <div className="space-y-4">
+              <MediaNowCard now={nowPlaying} />
               <SectionTitle>Media controls</SectionTitle>
               <p className="text-xs text-slate-400">
                 Drives whichever player is focused on the laptop — music, video,

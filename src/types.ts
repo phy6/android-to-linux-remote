@@ -11,6 +11,18 @@ export type MediaAction =
   | 'yt_playpause'
   | 'yt_replay';
 
+/** What the laptop reports playing, from MPRIS. `active` false when nothing is. */
+export interface NowPlaying {
+  active: boolean;
+  player?: string;
+  status?: string;
+  title?: string;
+  artist?: string;
+  album?: string;
+  lengthMs?: number;
+  positionMs?: number;
+}
+
 export type InputEventPayload =
   | { type: 'move'; dx: number; dy: number }
   | { type: 'click'; button: 'left' | 'right' | 'middle'; action: 'down' | 'up' | 'click' }

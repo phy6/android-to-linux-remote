@@ -691,6 +691,8 @@ MAX_UPLOAD = int(os.environ.get("TAILDECK_MAX_UPLOAD", str(64 * 1024 * 1024)))
 # synced clipboard can ferry secrets between devices without the user noticing.
 CLIPBOARD_WATCH = os.environ.get("TAILDECK_CLIPBOARD_WATCH", "0") == "1"
 CLIPBOARD_POLL = float(os.environ.get("TAILDECK_CLIPBOARD_POLL", "1.5"))
+# How often the now-playing poller asks MPRIS what the laptop is playing.
+MEDIA_POLL = float(os.environ.get("TAILDECK_MEDIA_POLL", "2.0"))
 CLIPBOARD_MAX = int(os.environ.get("TAILDECK_CLIPBOARD_MAX", str(64 * 1024)))
 
 # Phase 3: screen view. Frames come from ffmpeg's x11grab (the whole X screen,
@@ -1258,6 +1260,9 @@ def _clipboard_write(text):
 
 _CLIP_LAST = {"value": None}
 
+# Last now-playing payload pushed to phones, so the poller only sends changes.
+_MEDIA_LAST = {"value": None}
+
 
 def _clipboard_watcher():
     """Poll the clipboard and push changes to phones. Off unless enabled; the
@@ -1269,6 +1274,106 @@ def _clipboard_watcher():
             _CLIP_LAST["value"] = text
             broadcast_json({"type": "clipboard", "text": text})
         time.sleep(CLIPBOARD_POLL)
+
+
+# --- Now playing, via MPRIS over the session bus ----------------------------
+# The player owns the truth; we only read it. busctl ships with systemd and
+# speaks JSON, so the daemon stays stdlib-only and needs no playerctl. Every
+# call degrades to "nothing playing" rather than raising, so a laptop with no
+# session bus, no player, or an old busctl just shows an idle card.
+
+MPRIS_PREFIX = "org.mpris.MediaPlayer2."
+MPRIS_OBJECT = "/org/mpris/MediaPlayer2"
+MPRIS_PLAYER = "org.mpris.MediaPlayer2.Player"
+
+
+def _busctl_json(*args):
+    if not _has_command("busctl"):
+        return None
+    try:
+        out = subprocess.run(
+            ["busctl", "--user", "--json=short", *args],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3,
+        )
+        if out.returncode != 0:
+            return None
+        return json.loads(out.stdout.decode("utf-8", errors="replace") or "null")
+    except Exception:
+        return None
+
+
+def _mpris_players():
+    listing = _busctl_json("list")
+    if not isinstance(listing, list):
+        return []
+    names = [row.get("name", "") for row in listing if isinstance(row, dict)]
+    return sorted({n for n in names if isinstance(n, str) and n.startswith(MPRIS_PREFIX)})
+
+
+def _mpris_property(dest, prop):
+    node = _busctl_json("get-property", dest, MPRIS_OBJECT, MPRIS_PLAYER, prop)
+    if isinstance(node, dict) and "data" in node:
+        return node["data"]
+    return None
+
+
+def _mpris_variant(value):
+    """Unwrap one busctl JSON variant ({'type':..,'data':..}) to its value."""
+    if isinstance(value, dict) and "data" in value:
+        return value["data"]
+    return value
+
+
+def _mpris_text(value):
+    """MPRIS puts artists in a list and titles in a plain string; take either."""
+    if isinstance(value, list):
+        return value[0] if value and isinstance(value[0], str) else ""
+    return value if isinstance(value, str) else ""
+
+
+def now_playing():
+    """The laptop's current track: the player that is actually 'Playing', else
+    the first one found. {'active': False} when there is nothing to read."""
+    players = _mpris_players()
+    if not players:
+        return {"active": False}
+    chosen, chosen_status = players[0], None
+    for dest in players:
+        status = _mpris_property(dest, "PlaybackStatus")
+        if status == "Playing":
+            chosen, chosen_status = dest, status
+            break
+        if chosen_status is None:
+            chosen, chosen_status = dest, status
+    raw_meta = _mpris_property(chosen, "Metadata")
+    if not isinstance(raw_meta, dict):
+        raw_meta = {}
+    meta = {key: _mpris_variant(value) for key, value in raw_meta.items()}
+    position = _mpris_property(chosen, "Position")
+    length_us = meta.get("mpris:length")
+    return {
+        "active": True,
+        "player": chosen[len(MPRIS_PREFIX):],
+        "status": chosen_status or "Stopped",
+        "title": _mpris_text(meta.get("xesam:title")),
+        "artist": _mpris_text(meta.get("xesam:artist")),
+        "album": _mpris_text(meta.get("xesam:album")),
+        "lengthMs": int(length_us / 1000) if isinstance(length_us, (int, float)) else 0,
+        "positionMs": int(position / 1000) if isinstance(position, (int, float)) else 0,
+    }
+
+
+def _media_watcher():
+    """Push now-playing changes to phones; silent while nothing moves."""
+    while True:
+        try:
+            payload = now_playing()
+            if payload != _MEDIA_LAST["value"]:
+                _MEDIA_LAST["value"] = payload
+                broadcast_json({"type": "media_now", **payload})
+        except Exception:
+            pass
+        time.sleep(MEDIA_POLL)
 
 
 def _query(target):
@@ -2233,6 +2338,10 @@ def handle_api(conn, raw, request_line):
 
     headers = _parse_headers(raw.decode("utf-8", errors="ignore"))
 
+    if path == "/api/media/now" and method == "GET":
+        _json(conn, now_playing())
+        return True
+
     if path == "/api/scripts" and method == "GET":
         _json(conn, {"ok": True, "dir": SCRIPTS_DIR, "scripts": _list_scripts()})
         return True
@@ -2862,6 +2971,13 @@ def handle_websocket(conn):
         }
         send_ws_frame(conn, json.dumps(welcome))
 
+        # Send the current track up front, so a client connecting between two
+        # changes is not left on "nothing playing" until the next one arrives.
+        try:
+            send_ws_frame(conn, json.dumps({"type": "media_now", **now_playing()}))
+        except Exception:
+            pass
+
         with _WS_CLIENTS_LOCK:
             WS_CLIENTS.add(conn)
 
@@ -3112,6 +3228,9 @@ if __name__ == "__main__":
 
         if CLIPBOARD_WATCH:
             threading.Thread(target=_clipboard_watcher, daemon=True).start()
+
+        if _has_command("busctl"):
+            threading.Thread(target=_media_watcher, daemon=True).start()
 
         run_ws_server()
     except KeyboardInterrupt:

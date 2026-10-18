@@ -1,4 +1,4 @@
-import { ConnectionStatus, InputEventPayload, MediaAction, SessionType } from '../types';
+import { ConnectionStatus, InputEventPayload, MediaAction, SessionType, NowPlaying } from '../types';
 import type { AuthAssertion, AuthChallenge } from './authClient';
 
 export type { MediaAction };
@@ -18,6 +18,7 @@ type DictationTextCallback = (text: string) => void;
 type DictationPartialCallback = (text: string) => void;
 type NotifyCallback = (notice: { title: string; body: string }) => void;
 type AuthChallengeCallback = (challenge: AuthChallenge) => void;
+type MediaNowCallback = (now: NowPlaying) => void;
 
 class LinuxClientService {
   private socket: WebSocket | null = null;
@@ -27,6 +28,10 @@ class LinuxClientService {
   private dictationPartialListeners: Set<DictationPartialCallback> = new Set();
   private notifyListeners: Set<NotifyCallback> = new Set();
   private authChallengeListeners: Set<AuthChallengeCallback> = new Set();
+  private mediaNowListeners: Set<MediaNowCallback> = new Set();
+  // Last now-playing payload, replayed to a late subscriber (a drawer that was
+  // closed when the push arrived) instead of waiting for the next change.
+  private lastMediaNow: NowPlaying | null = null;
   private pendingDx = 0;
   private dictationReady = false;
   private dictationWaiter: ((ok: boolean) => void) | null = null;
@@ -92,6 +97,21 @@ class LinuxClientService {
     this.notifyListeners.add(callback);
     return () => {
       this.notifyListeners.delete(callback);
+    };
+  }
+
+  /** What the laptop is playing, pushed when it changes. */
+  public onMediaNow(callback: MediaNowCallback): () => void {
+    this.mediaNowListeners.add(callback);
+    if (this.lastMediaNow) {
+      try {
+        callback(this.lastMediaNow);
+      } catch {
+        // A listener throwing must not break the subscriber.
+      }
+    }
+    return () => {
+      this.mediaNowListeners.delete(callback);
     };
   }
 
@@ -223,6 +243,25 @@ class LinuxClientService {
                 }
               });
             }
+          } else if (data.type === 'media_now') {
+            const now: NowPlaying = {
+              active: !!data.active,
+              player: typeof data.player === 'string' ? data.player : undefined,
+              status: typeof data.status === 'string' ? data.status : undefined,
+              title: typeof data.title === 'string' ? data.title : '',
+              artist: typeof data.artist === 'string' ? data.artist : '',
+              album: typeof data.album === 'string' ? data.album : '',
+              lengthMs: Number(data.lengthMs) || 0,
+              positionMs: Number(data.positionMs) || 0,
+            };
+            this.lastMediaNow = now;
+            this.mediaNowListeners.forEach((cb) => {
+              try {
+                cb(now);
+              } catch {
+                // A listener throwing must not break the socket handler.
+              }
+            });
           } else if (data.type === 'notify') {
             const notice = {
               title: String(data.title ?? 'TailDeck'),
@@ -330,6 +369,9 @@ class LinuxClientService {
 
   public disconnect() {
     this.stopPingLoop();
+    // A stale track belongs to the laptop we just left; drop it so the next
+    // connection starts from "nothing playing" instead of the last one.
+    this.lastMediaNow = null;
     if (this.socket) {
       try {
         this.socket.close();
