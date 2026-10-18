@@ -45,7 +45,7 @@ CONNECTION_LOG = os.environ.get(
 )
 NOTIFY_CONNECTIONS = os.environ.get("TAILDECK_NOTIFY", "1").lower() not in ("0", "false", "no")
 
-OP_START, OP_STOP, OP_PCM, OP_TEXT, OP_PARTIAL, OP_OK = 0x01, 0x02, 0x03, 0x04, 0x05, 0x01
+OP_START, OP_STOP, OP_PCM, OP_TEXT, OP_PARTIAL, OP_OK, OP_CANCEL = 0x01, 0x02, 0x03, 0x04, 0x05, 0x01, 0x06
 
 
 class DictationBridge:
@@ -165,6 +165,20 @@ class DictationBridge:
         except Exception:
             self._reset()
 
+    def cancel(self, conn=None):
+        """Abandon the session without typing anything. A gesture that opened a
+        command or shortcut panel never meant to dictate, so its audio is
+        discarded instead of recognised."""
+        if conn is not None and self.owner is not None and self.owner is not conn:
+            return
+        self.owner = None
+        if not self.sock:
+            return
+        try:
+            print(f"[TailDeck] {_ts()} bridge -> OP_CANCEL after {self._sent_frames} PCM frames", flush=True)
+        finally:
+            self._reset()
+
     def _reset(self):
         # Close the old socket, not just the reference. The recogniser treats an
         # open socket as a live session: abandoning one without closing it left
@@ -174,7 +188,7 @@ class DictationBridge:
         self.owner = None
         if sock is not None:
             try:
-                sock.sendall(bytes([OP_STOP]))
+                sock.sendall(bytes([OP_CANCEL]))
             except Exception:
                 pass
             try:
@@ -3036,6 +3050,10 @@ def handle_websocket(conn):
                 elif mtype == "dictation_stop":
                     DICTATION.stop(conn)
                     print(f"[TailDeck] {peer} dictation_stop bytes={dictation_bytes}", flush=True)
+                    send_ws_frame(conn, json.dumps({"type": "dictation_stopped"}))
+                elif mtype == "dictation_cancel":
+                    DICTATION.cancel(conn)
+                    print(f"[TailDeck] {peer} dictation_cancel bytes={dictation_bytes}", flush=True)
                     send_ws_frame(conn, json.dumps({"type": "dictation_stopped"}))
                 elif mtype == "ping":
                     pong = {"type": "pong", "timestamp": msg.get("timestamp", time.time() * 1000)}

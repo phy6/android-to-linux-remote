@@ -189,7 +189,7 @@ export default function App() {
       // Offer Return only when words actually landed *and the hold has ended*.
       // Live per-phrase text arrives mid-hold, and offering Return then flipped
       // the mic (and its Delete key) out from under the user's thumb.
-      if (heard.trim() && !pttActiveRef.current) {
+      if (heard.trim() && !pttActiveRef.current && !pttCancelledRef.current) {
         armEnterPrompt();
       }
     });
@@ -252,6 +252,9 @@ export default function App() {
   const pttSendTimerRef = useRef<number | null>(null);
   const pttTokenRef = useRef(0);
   const pttCommittedRef = useRef('');
+  // True once a gesture aborted the session (e.g. a slide that opened a command
+  // panel). Any transcript that still arrives for it must never arm Return mode.
+  const pttCancelledRef = useRef(false);
   const captureRef = useRef<PcmCapture | null>(null);
   const daemonPttRef = useRef(false);
 
@@ -262,6 +265,7 @@ export default function App() {
     setPttTranscript(null);
     setPttPartial(null);
     pttCommittedRef.current = '';
+    pttCancelledRef.current = false;
     setPttPhase('listening');
     setPttWarming(true);
     if (enterPromptTimerRef.current !== null) {
@@ -360,6 +364,7 @@ export default function App() {
   const handlePttEnd = useCallback(() => {
     // Invalidate any start that is still awaiting permission.
     pttTokenRef.current += 1;
+    pttCancelledRef.current = false;
     setIsPttActive(false);
     setPttWarming(false);
 
@@ -406,6 +411,7 @@ export default function App() {
 
   const handlePttCancel = useCallback(() => {
     pttTokenRef.current += 1;
+    pttCancelledRef.current = true;
     setIsPttActive(false);
     setPttWarming(false);
     clearTranscriptTimer();
@@ -420,7 +426,7 @@ export default function App() {
       daemonPttRef.current = false;
       captureRef.current?.stop();
       captureRef.current = null;
-      linuxClient.stopDictation();
+      linuxClient.cancelDictation();
       return;
     }
     speech.abortListening();

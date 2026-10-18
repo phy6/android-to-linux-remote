@@ -537,6 +537,13 @@ class LinuxClientService {
     this.dropDictationQueue();
   }
 
+  public cancelDictation() {
+    if (!this.socket || this.socket.readyState !== WS_OPEN) return;
+    this.socket.send(JSON.stringify({ type: 'dictation_cancel' }));
+    this.dictationReady = false;
+    this.dropDictationQueue();
+  }
+
   public get isDictationReady(): boolean {
     return this.dictationReady;
   }
