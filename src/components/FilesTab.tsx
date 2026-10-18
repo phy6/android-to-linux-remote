@@ -8,13 +8,23 @@ import {
   RefreshCw,
   AlertCircle,
   Link2,
+  Send,
 } from 'lucide-react';
-import { ShareEntry, listFiles, downloadFile, uploadFile, saveBlob } from '../services/filesClient';
+import {
+  ShareEntry,
+  listFiles,
+  downloadFile,
+  uploadFile,
+  saveBlob,
+  transferFileViaPhone,
+} from '../services/filesClient';
 import { ShareLinkDialog } from './ShareLinkDialog';
 import { ShareLinksPanel } from './ShareLinksPanel';
 
 interface FilesTabProps {
   host: string;
+  /** Other saved laptops this phone can push files to, brokered via the phone. */
+  otherHosts?: Array<{ host: string; name: string }>;
 }
 
 function formatSize(bytes: number): string {
@@ -29,7 +39,7 @@ function formatWhen(seconds: number): string {
   return new Date(seconds * 1000).toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
 }
 
-export const FilesTab: React.FC<FilesTabProps> = ({ host }) => {
+export const FilesTab: React.FC<FilesTabProps> = ({ host, otherHosts = [] }) => {
   const [dir, setDir] = useState('');
   const [entries, setEntries] = useState<ShareEntry[]>([]);
   const [status, setStatus] = useState<'loading' | 'ready' | 'error'>('loading');
@@ -37,6 +47,8 @@ export const FilesTab: React.FC<FilesTabProps> = ({ host }) => {
   const [note, setNote] = useState<string | null>(null);
   const [sharing, setSharing] = useState(false);
   const [sharesKey, setSharesKey] = useState(0);
+  // Which file's "send to another laptop" target tray is open.
+  const [sendFor, setSendFor] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   // Where the picker was opened; the upload must not follow a later navigation.
   const uploadDirRef = useRef('');
@@ -100,6 +112,18 @@ export const FilesTab: React.FC<FilesTabProps> = ({ host }) => {
     }
     saveBlob(blob, entry.name);
     setNote(`Saved ${entry.name}`);
+  };
+
+  const onSendTo = async (entry: ShareEntry, target: { host: string; name: string }) => {
+    setSendFor(null);
+    setBusy(entry.path);
+    const result = await transferFileViaPhone(host, target.host, entry.path, '');
+    setBusy(null);
+    setNote(
+      result.ok
+        ? `Sent ${entry.name} to ${target.name}`
+        : `Could not send ${entry.name}: ${result.error ?? 'unknown error'}`,
+    );
   };
 
   const parts = dir ? dir.split('/') : [];
@@ -179,38 +203,77 @@ export const FilesTab: React.FC<FilesTabProps> = ({ host }) => {
       ) : (
         <div className="space-y-1.5">
           {entries.map((entry) => (
-            <button
-              key={entry.path}
-              onClick={() => (entry.dir ? setDir(entry.path) : onDownload(entry))}
-              disabled={busy === entry.path}
-              className={`w-full flex items-center gap-2.5 p-2.5 rounded-xl bg-slate-900 border border-slate-800 text-left hover:border-slate-700 active:bg-slate-800/60 disabled:opacity-60`}
-            >
+            <div key={entry.path} className="space-y-1.5">
               <div
-                className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 border ${
-                  entry.dir
-                    ? 'bg-sky-500/15 border-sky-500/30 text-sky-300'
-                    : 'bg-slate-800 border-slate-700 text-slate-400'
+                role="button"
+                tabIndex={0}
+                aria-disabled={busy === entry.path}
+                onClick={() => (entry.dir ? setDir(entry.path) : onDownload(entry))}
+                onKeyDown={(e) => {
+                  if (e.key !== 'Enter' && e.key !== ' ') return;
+                  e.preventDefault();
+                  if (entry.dir) setDir(entry.path);
+                  else void onDownload(entry);
+                }}
+                className={`w-full flex items-center gap-2.5 p-2.5 rounded-xl bg-slate-900 border border-slate-800 text-left hover:border-slate-700 active:bg-slate-800/60 ${
+                  busy === entry.path ? 'opacity-60' : 'cursor-pointer'
                 }`}
               >
-                {entry.dir ? <Folder className="w-4 h-4" /> : <FileIcon className="w-4 h-4" />}
-              </div>
-              <div className="min-w-0 flex-1">
-                <div className="text-slate-100 truncate">{entry.name}</div>
-                <div className="text-[11px] text-slate-500 truncate">
-                  {entry.dir ? 'Folder' : formatSize(entry.size)}
-                  {entry.modified ? ` · ${formatWhen(entry.modified)}` : ''}
-                </div>
-              </div>
-              {entry.dir ? (
-                <ChevronRight className="w-4 h-4 text-slate-600 shrink-0" />
-              ) : (
-                <Download
-                  className={`w-4 h-4 shrink-0 ${
-                    busy === entry.path ? 'text-sky-400 animate-pulse' : 'text-slate-500'
+                <div
+                  className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 border ${
+                    entry.dir
+                      ? 'bg-sky-500/15 border-sky-500/30 text-sky-300'
+                      : 'bg-slate-800 border-slate-700 text-slate-400'
                   }`}
-                />
+                >
+                  {entry.dir ? <Folder className="w-4 h-4" /> : <FileIcon className="w-4 h-4" />}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="text-slate-100 truncate">{entry.name}</div>
+                  <div className="text-[11px] text-slate-500 truncate">
+                    {entry.dir ? 'Folder' : formatSize(entry.size)}
+                    {entry.modified ? ` · ${formatWhen(entry.modified)}` : ''}
+                  </div>
+                </div>
+                {!entry.dir && otherHosts.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setSendFor(sendFor === entry.path ? null : entry.path);
+                    }}
+                    title="Send to another laptop"
+                    className="p-1.5 rounded-lg bg-slate-800 border border-slate-700 text-slate-400 hover:text-sky-300 shrink-0"
+                  >
+                    <Send className="w-3.5 h-3.5" />
+                  </button>
+                )}
+                {entry.dir ? (
+                  <ChevronRight className="w-4 h-4 text-slate-600 shrink-0" />
+                ) : (
+                  <Download
+                    className={`w-4 h-4 shrink-0 ${
+                      busy === entry.path ? 'text-sky-400 animate-pulse' : 'text-slate-500'
+                    }`}
+                  />
+                )}
+              </div>
+              {sendFor === entry.path && (
+                <div className="flex flex-wrap items-center gap-1.5 pl-10">
+                  <span className="text-[10px] uppercase tracking-wide text-slate-500">Send to</span>
+                  {otherHosts.map((target) => (
+                    <button
+                      key={target.host}
+                      type="button"
+                      onClick={() => void onSendTo(entry, target)}
+                      className="px-2 py-1 rounded-lg bg-sky-500/15 border border-sky-500/30 text-sky-300 text-[10px] font-semibold hover:bg-sky-500/25"
+                    >
+                      {target.name || target.host}
+                    </button>
+                  ))}
+                </div>
               )}
-            </button>
+            </div>
           ))}
         </div>
       )}

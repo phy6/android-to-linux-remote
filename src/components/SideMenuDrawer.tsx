@@ -1137,7 +1137,14 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
           )}
 
           {/* TAB: FILES */}
-          {activeTab === 'files' && <FilesTab host={connectionStatus.hostAddress} />}
+          {activeTab === 'files' && (
+            <FilesTab
+              host={connectionStatus.hostAddress}
+              otherHosts={savedLaptops
+                .filter((l) => l.host !== connectionStatus.hostAddress)
+                .map((l) => ({ host: l.host, name: l.name }))}
+            />
+          )}
 
           {/* TAB 3: SETTINGS */}
           {activeTab === 'settings' && (

@@ -94,6 +94,64 @@ export async function uploadFile(host: string, dir: string, file: File): Promise
   }
 }
 
+/**
+ * Copy a file from one laptop's share into another's, brokered through the
+ * phone (there is no laptop-to-laptop link). The bytes are held in phone memory
+ * for the round trip, so this is bounded by the daemon's own upload ceiling —
+ * anything larger is refused up front rather than buffered and rejected.
+ */
+export const MAX_TRANSFER_BYTES = 64 * 1024 * 1024;
+
+export interface TransferResult {
+  ok: boolean;
+  filename: string;
+  bytesTransferred: number;
+  error?: string;
+}
+
+export async function transferFileViaPhone(
+  sourceHost: string,
+  targetHost: string,
+  filePath: string,
+  targetDir = '',
+  opts: { onProgress?: (bytes: number) => void; maxBytes?: number } = {},
+): Promise<TransferResult> {
+  const filename = filePath.split('/').pop() || 'file';
+  const maxBytes = opts.maxBytes ?? MAX_TRANSFER_BYTES;
+  const base = apiBase(sourceHost);
+  if (!base) return { ok: false, filename, bytesTransferred: 0, error: 'source unreachable' };
+  try {
+    const res = await fetch(`${base}/api/files/download?path=${encodeURIComponent(filePath)}`, {
+      cache: 'no-store',
+    });
+    if (!res.ok) return { ok: false, filename, bytesTransferred: 0, error: 'source file unavailable' };
+
+    // Refuse before buffering when the source declares an oversized body.
+    const declared = Number(res.headers.get('content-length') || '0');
+    if (declared && declared > maxBytes) {
+      void res.body?.cancel();
+      return { ok: false, filename, bytesTransferred: 0, error: `too large (${declared} bytes)` };
+    }
+
+    const blob = await res.blob();
+    if (blob.size > maxBytes) {
+      return { ok: false, filename, bytesTransferred: 0, error: `too large (${blob.size} bytes)` };
+    }
+    opts.onProgress?.(blob.size);
+
+    const file = new File([blob], filename, { type: blob.type });
+    const ok = await uploadFile(targetHost, targetDir, file);
+    return {
+      ok,
+      filename,
+      bytesTransferred: ok ? blob.size : 0,
+      error: ok ? undefined : 'upload failed',
+    };
+  } catch {
+    return { ok: false, filename, bytesTransferred: 0, error: 'transfer failed' };
+  }
+}
+
 /** Hand a Blob to the browser's downloader via a throwaway anchor. */
 export function saveBlob(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob);

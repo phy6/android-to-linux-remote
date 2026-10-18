@@ -1,4 +1,4 @@
-import React, { useRef, useState, useCallback, useEffect } from 'react';
+import React, { useRef, useState, useCallback } from 'react';
 import { linuxClient } from '../services/linuxClient';
 import { useHaptics } from '../hooks/useHaptics';
 
@@ -10,6 +10,8 @@ interface TrackpadProps {
   twoFingerRightClick: boolean;
   hapticsEnabled: boolean;
   soundEnabled: boolean;
+  onPassOff?: (direction: 'left' | 'right' | 'top' | 'bottom') => void;
+  activeAdjacentDirections?: Array<'left' | 'right' | 'top' | 'bottom'>;
 }
 
 interface TouchPoint {
@@ -24,6 +26,9 @@ interface VisualRipple {
   y: number;
 }
 
+const EDGE_PUSH_THRESHOLD = 32; // Pixels pushed into border to trigger pass-off
+const EDGE_MARGIN = 28; // Margin from container border
+
 export const Trackpad: React.FC<TrackpadProps> = ({
   sensitivity,
   acceleration,
@@ -32,6 +37,8 @@ export const Trackpad: React.FC<TrackpadProps> = ({
   twoFingerRightClick,
   hapticsEnabled,
   soundEnabled,
+  onPassOff,
+  activeAdjacentDirections = [],
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const { triggerClick, triggerHeavyClick } = useHaptics(hapticsEnabled, soundEnabled);
@@ -42,6 +49,21 @@ export const Trackpad: React.FC<TrackpadProps> = ({
   const touchStartPosRef = useRef<Map<number, TouchPoint>>(new Map());
   const hasMovedRef = useRef<Map<number, boolean>>(new Map());
 
+  // Edge push tracking for spatial screen pass-off
+  const edgePushRef = useRef<{ direction: 'left' | 'right' | 'top' | 'bottom'; distance: number } | null>(null);
+  const activeEdgePushRef = useRef<'left' | 'right' | 'top' | 'bottom' | null>(null);
+  const [activeEdgePush, setActiveEdgePush] = useState<'left' | 'right' | 'top' | 'bottom' | null>(null);
+  // One pass-off per gesture: latched until the pointer lifts.
+  const pushedOffRef = useRef(false);
+  // Cached on pointer-down so we never call getBoundingClientRect per move.
+  const containerRectRef = useRef<DOMRect | null>(null);
+
+  const setEdgePush = useCallback((dir: 'left' | 'right' | 'top' | 'bottom' | null) => {
+    if (activeEdgePushRef.current === dir) return;
+    activeEdgePushRef.current = dir;
+    setActiveEdgePush(dir);
+  }, []);
+
   // Visual ripples and active touches state
   const [visualRipples, setVisualRipples] = useState<VisualRipple[]>([]);
   const [touchState, setTouchState] = useState<'idle' | 'moving' | 'scrolling'>('idle');
@@ -51,7 +73,6 @@ export const Trackpad: React.FC<TrackpadProps> = ({
     (delta: number) => {
       const sign = Math.sign(delta);
       const abs = Math.abs(delta);
-      // Non-linear power curve for fine control at low speeds and swift leaps at high speeds
       const accelerated = Math.pow(abs, acceleration) * sensitivity;
       return sign * accelerated;
     },
@@ -71,6 +92,8 @@ export const Trackpad: React.FC<TrackpadProps> = ({
     const rect = containerRef.current?.getBoundingClientRect();
     const localX = rect ? e.clientX - rect.left : e.clientX;
     const localY = rect ? e.clientY - rect.top : e.clientY;
+    containerRectRef.current = rect ?? null;
+    pushedOffRef.current = false;
 
     activePointersRef.current.set(e.pointerId, { id: e.pointerId, x: e.clientX, y: e.clientY });
     touchStartTimeRef.current.set(e.pointerId, Date.now());
@@ -103,7 +126,6 @@ export const Trackpad: React.FC<TrackpadProps> = ({
     const rawDx = e.clientX - prevPos.x;
     const rawDy = e.clientY - prevPos.y;
 
-    // Check if movement exceeds jitter threshold (3px)
     if (startPos) {
       const totalDist = Math.hypot(e.clientX - startPos.x, e.clientY - startPos.y);
       if (totalDist > 4) {
@@ -111,7 +133,6 @@ export const Trackpad: React.FC<TrackpadProps> = ({
       }
     }
 
-    // Update position
     activePointersRef.current.set(e.pointerId, { id: e.pointerId, x: e.clientX, y: e.clientY });
 
     const count = activePointersRef.current.size;
@@ -122,9 +143,46 @@ export const Trackpad: React.FC<TrackpadProps> = ({
       const accelDy = applyAcceleration(rawDy);
       linuxClient.sendMove(accelDx, accelDy);
       setTouchState('moving');
+
+      // Check Edge Pass-off if adjacent laptop exists in that direction
+      if (containerRectRef.current && onPassOff && activeAdjacentDirections.length > 0 && !pushedOffRef.current) {
+        const rect = containerRectRef.current;
+        let pushDir: 'left' | 'right' | 'top' | 'bottom' | null = null;
+
+        if (e.clientX <= rect.left + EDGE_MARGIN && rawDx < -2 && activeAdjacentDirections.includes('left')) {
+          pushDir = 'left';
+        } else if (e.clientX >= rect.right - EDGE_MARGIN && rawDx > 2 && activeAdjacentDirections.includes('right')) {
+          pushDir = 'right';
+        } else if (e.clientY <= rect.top + EDGE_MARGIN && rawDy < -2 && activeAdjacentDirections.includes('top')) {
+          pushDir = 'top';
+        } else if (e.clientY >= rect.bottom - EDGE_MARGIN && rawDy > 2 && activeAdjacentDirections.includes('bottom')) {
+          pushDir = 'bottom';
+        }
+
+        if (pushDir) {
+          const delta = Math.max(Math.abs(rawDx), Math.abs(rawDy));
+          if (!edgePushRef.current || edgePushRef.current.direction !== pushDir) {
+            edgePushRef.current = { direction: pushDir, distance: delta };
+          } else {
+            edgePushRef.current.distance += delta;
+          }
+
+          if (!edgePushRef.current || edgePushRef.current.distance >= EDGE_PUSH_THRESHOLD) {
+            triggerHeavyClick();
+            pushedOffRef.current = true;
+            edgePushRef.current = null;
+            setEdgePush(null);
+            onPassOff(pushDir);
+          } else {
+            setEdgePush(pushDir);
+          }
+        } else {
+          edgePushRef.current = null;
+          setEdgePush(null);
+        }
+      }
     } else if (count === 2) {
       // 2-FINGER: SCROLLING
-      // Calculate average delta between the 2 fingers
       const scrollMultiplier = invertScroll ? -1 : 1;
       const scrollDx = rawDx * sensitivity * scrollMultiplier;
       const scrollDy = rawDy * sensitivity * scrollMultiplier;
@@ -140,14 +198,11 @@ export const Trackpad: React.FC<TrackpadProps> = ({
     const elapsed = Date.now() - startTime;
     const initialCount = activePointersRef.current.size;
 
-    // Check for Tap-To-Click (short duration and minimal movement)
     if (elapsed < 240 && !hasMoved) {
       if (initialCount === 2 && twoFingerRightClick) {
-        // Two finger tap = Right click
         triggerHeavyClick();
         linuxClient.sendClick('right', 'click');
       } else if (initialCount === 1 && tapToClick) {
-        // One finger tap = Left click
         triggerClick();
         linuxClient.sendClick('left', 'click');
       }
@@ -157,6 +212,11 @@ export const Trackpad: React.FC<TrackpadProps> = ({
     touchStartTimeRef.current.delete(e.pointerId);
     touchStartPosRef.current.delete(e.pointerId);
     hasMovedRef.current.delete(e.pointerId);
+
+    edgePushRef.current = null;
+    pushedOffRef.current = false;
+    containerRectRef.current = null;
+    setEdgePush(null);
 
     if (activePointersRef.current.size === 0) {
       setTouchState('idle');
@@ -171,25 +231,20 @@ export const Trackpad: React.FC<TrackpadProps> = ({
     }
   };
 
-  // Clean up pointers if canceled
+  // A cancelled pointer must not be interpreted as a tap — just forget it.
   const handlePointerCancel = (e: React.PointerEvent<HTMLDivElement>) => {
     activePointersRef.current.delete(e.pointerId);
     touchStartTimeRef.current.delete(e.pointerId);
     touchStartPosRef.current.delete(e.pointerId);
     hasMovedRef.current.delete(e.pointerId);
+    edgePushRef.current = null;
+    pushedOffRef.current = false;
+    containerRectRef.current = null;
+    setEdgePush(null);
     if (activePointersRef.current.size === 0) {
       setTouchState('idle');
     }
   };
-
-  useEffect(() => {
-    const handleGlobalUp = () => {
-      activePointersRef.current.clear();
-      setTouchState('idle');
-    };
-    window.addEventListener('pointerup', handleGlobalUp);
-    return () => window.removeEventListener('pointerup', handleGlobalUp);
-  }, []);
 
   return (
     <div
@@ -198,40 +253,49 @@ export const Trackpad: React.FC<TrackpadProps> = ({
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
       onPointerCancel={handlePointerCancel}
-      className="relative flex-1 w-full min-h-[280px] bg-slate-900/40 select-none overflow-hidden touch-none cursor-crosshair flex flex-col items-center justify-center border-y border-slate-800/60"
-      style={{
-        backgroundImage: `radial-gradient(circle, rgba(148, 163, 184, 0.08) 1.5px, transparent 1.5px)`,
-        backgroundSize: '24px 24px',
-      }}
+      className="absolute inset-0 touch-none select-none overflow-hidden cursor-crosshair bg-slate-950 flex flex-col justify-between"
     >
-      {/* Subtle glass reflection edge */}
-      <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-slate-600/30 to-transparent pointer-events-none" />
+      {/* Visual Edge Pass-off Indicators */}
+      {activeAdjacentDirections.includes('left') && (
+        <div
+          className={`absolute left-0 inset-y-0 w-3 bg-gradient-to-r from-sky-500/50 to-transparent transition-opacity duration-150 pointer-events-none ${
+            activeEdgePush === 'left' ? 'opacity-100 w-6 from-sky-400' : 'opacity-30'
+          }`}
+        />
+      )}
+      {activeAdjacentDirections.includes('right') && (
+        <div
+          className={`absolute right-0 inset-y-0 w-3 bg-gradient-to-l from-sky-500/50 to-transparent transition-opacity duration-150 pointer-events-none ${
+            activeEdgePush === 'right' ? 'opacity-100 w-6 from-sky-400' : 'opacity-30'
+          }`}
+        />
+      )}
+      {activeAdjacentDirections.includes('top') && (
+        <div
+          className={`absolute top-0 inset-x-0 h-3 bg-gradient-to-b from-sky-500/50 to-transparent transition-opacity duration-150 pointer-events-none ${
+            activeEdgePush === 'top' ? 'opacity-100 h-6 from-sky-400' : 'opacity-30'
+          }`}
+        />
+      )}
+      {activeAdjacentDirections.includes('bottom') && (
+        <div
+          className={`absolute bottom-0 inset-x-0 h-3 bg-gradient-to-t from-sky-500/50 to-transparent transition-opacity duration-150 pointer-events-none ${
+            activeEdgePush === 'bottom' ? 'opacity-100 h-6 from-sky-400' : 'opacity-30'
+          }`}
+        />
+      )}
 
-      {/* Ripple Animations */}
-      {visualRipples.map((ripple) => (
+      {/* Subtle Grid Dot Accent for Touch Context */}
+      <div className="absolute inset-0 opacity-15 bg-[radial-gradient(#38bdf8_1px,transparent_1px)] [background-size:24px_24px] pointer-events-none" />
+
+      {/* Touch Ripples */}
+      {visualRipples.map((r) => (
         <span
-          key={ripple.id}
-          className="absolute -translate-x-1/2 -translate-y-1/2 rounded-full pointer-events-none border border-sky-400/60 bg-sky-500/20 animate-ping"
-          style={{
-            left: ripple.x,
-            top: ripple.y,
-            width: 48,
-            height: 48,
-            animationDuration: '450ms',
-          }}
+          key={r.id}
+          style={{ left: r.x - 24, top: r.y - 24 }}
+          className="absolute w-12 h-12 rounded-full border border-sky-400/60 bg-sky-500/10 pointer-events-none animate-ping opacity-75"
         />
       ))}
-
-      {/* Center Subtle Trackpad Alignment Dot */}
-      <div className="pointer-events-none flex flex-col items-center justify-center opacity-30 transition-opacity duration-300">
-        <div className="w-1.5 h-1.5 rounded-full bg-slate-500" />
-      </div>
-
-      {/* Subtle corner target brackets */}
-      <div className="absolute top-3 left-3 w-3 h-3 border-t border-l border-slate-700/40 pointer-events-none" />
-      <div className="absolute top-3 right-3 w-3 h-3 border-t border-r border-slate-700/40 pointer-events-none" />
-      <div className="absolute bottom-3 left-3 w-3 h-3 border-b border-l border-slate-700/40 pointer-events-none" />
-      <div className="absolute bottom-3 right-3 w-3 h-3 border-b border-r border-slate-700/40 pointer-events-none" />
     </div>
   );
 };

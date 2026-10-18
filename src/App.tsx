@@ -1,10 +1,13 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import type { CSSProperties } from 'react';
-import { AlertCircle, Check, Wifi, WifiOff } from 'lucide-react';
+import { AlertCircle, Check, Wifi, WifiOff, Laptop } from 'lucide-react';
 import { useRegisterSW } from 'virtual:pwa-register/react';
 import { linuxClient } from './services/linuxClient';
 import { LOCAL_HOST, IS_LOCAL_MODE, describeRoute, servedByLabel } from './services/localMode';
 import { rememberLaptop, loadSavedLaptops } from './services/savedLaptops';
+import type { SavedLaptop } from './services/savedLaptops';
+import { useSpatialLayout } from './hooks/useSpatialLayout';
+import { HostSwitcherModal } from './components/HostSwitcherModal';
 import { autoconnectOrder, isTailnetIp } from './services/pairing';
 import { ConnectionStatus, RemoteSettings } from './types';
 import {
@@ -81,6 +84,7 @@ export default function App() {
   });
 
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>(linuxClient.getStatus());
+  const [savedLaptops, setSavedLaptops] = useState<SavedLaptop[]>(() => loadSavedLaptops());
   const [activeAppIndex, setActiveAppIndex] = useState(0);
 
   // Live size preview while dragging the resize grip; null means "use the
@@ -94,6 +98,7 @@ export default function App() {
   const [showSetup, setShowSetup] = useState(false);
   const [isDictationOpen, setIsDictationOpen] = useState(false);
   const [showSimulator, setShowSimulator] = useState(false);
+  const [showHostSwitcher, setShowHostSwitcher] = useState(false);
   const [darkOut, setDarkOut] = useState(false);
   const [isPttActive, setIsPttActive] = useState(false);
   // Mirrors isPttActive for callbacks that must not offer Return/Delete while a
@@ -110,6 +115,14 @@ export default function App() {
   const pttTranscriptTimerRef = useRef<number | null>(null);
 
   const speech = useSpeechRecognition();
+
+  // Spatial multi-host layout: which saved laptop sits on each side of the one
+  // we're driving right now, so the trackpad can hand control off at the edge.
+  const activeHost = connectionStatus.hostAddress || '';
+  const spatial = useSpatialLayout(savedLaptops, activeHost);
+  const adjacentDirections = (['left', 'right', 'top', 'bottom'] as const).filter(
+    (direction) => !!spatial.getHostByDirection(direction),
+  );
 
   // Register the service worker once, at the root, so an update is noticed even
   // if the drawer is never opened. The Settings tab's Updates card reads this.
@@ -476,6 +489,27 @@ export default function App() {
     });
   };
 
+  // Switch the driving socket to another saved laptop. Reuses the same connect
+  // path as a launch, so the address is remembered for next time too.
+  const handleSelectHost = (host: string) => {
+    if (!host || host === connectionStatus.hostAddress) {
+      setShowHostSwitcher(false);
+      return;
+    }
+    linuxClient.connect(host);
+    handleUpdateSettings({ tailscaleIp: host });
+    setShowHostSwitcher(false);
+    showToast(`Switched to ${host}`, 'ok');
+  };
+
+  // Trackpad pushed off an edge: hand control to whatever laptop sits there.
+  const handleTrackpadPassOff = (direction: 'left' | 'right' | 'top' | 'bottom') => {
+    const target = spatial.getHostByDirection(direction);
+    if (!target) return;
+    showToast(`Passing control to ${target.name}`, 'ok');
+    handleSelectHost(target.host);
+  };
+
   useEffect(() => {
     const unsub = linuxClient.subscribeStatus((status) => {
       setConnectionStatus(status);
@@ -678,10 +712,12 @@ export default function App() {
     const alt = (info?.addresses ?? [])
       .filter((ip) => !isTailnetIp(ip))
       .map((ip) => `${ip}:${httpsPort}`);
-    rememberLaptop(connectionStatus.hostAddress, info?.hostname ?? '', {
-      alt,
-      tailnet: info?.tailnet ?? null,
-    });
+    setSavedLaptops(
+      rememberLaptop(connectionStatus.hostAddress, info?.hostname ?? '', {
+        alt,
+        tailnet: info?.tailnet ?? null,
+      }),
+    );
   }, [
     connectionStatus.connected,
     connectionStatus.hostAddress,
@@ -730,6 +766,23 @@ export default function App() {
           />
         </div>
 
+        {/* Floating host switcher: shows live link state and how many saved
+            laptops are reachable. Opens the spatial layout canvas. */}
+        <button
+          type="button"
+          onClick={() => setShowHostSwitcher(true)}
+          title="Switch laptop / spatial layout"
+          className="fixed top-3 right-3 z-30 flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-slate-900/85 border border-slate-700 text-slate-200 backdrop-blur-sm shadow-lg shadow-black/40 active:scale-95 transition"
+        >
+          <span
+            className={`w-2 h-2 rounded-full ${connectionStatus.connected ? 'bg-emerald-400' : 'bg-slate-600'}`}
+          />
+          <Laptop className="w-4 h-4" />
+          {spatial.onlineCount > 0 && (
+            <span className="text-[10px] font-bold text-sky-300">{spatial.onlineCount}</span>
+          )}
+        </button>
+
         {/* 3/5 Screen: Pure Unmarked Glass Trackpad */}
         <div className="flex-1 relative min-h-0 flex flex-col">
           <Trackpad
@@ -740,6 +793,8 @@ export default function App() {
             twoFingerRightClick={settings.twoFingerRightClick}
             hapticsEnabled={settings.hapticFeedback}
             soundEnabled={settings.soundFeedback}
+            onPassOff={handleTrackpadPassOff}
+            activeAdjacentDirections={adjacentDirections}
           />
         </div>
 
@@ -782,6 +837,20 @@ export default function App() {
         onEnterDarkOut={enterDarkOut}
         appUpdateReady={appUpdateReady}
         onApplyAppUpdate={applyAppUpdate}
+      />
+
+      {/* Spatial multi-host switcher: position laptops around the primary
+          screen so trackpad edge pass-off and one-tap control work. */}
+      <HostSwitcherModal
+        isOpen={showHostSwitcher}
+        onClose={() => setShowHostSwitcher(false)}
+        connectionStatus={connectionStatus}
+        savedLaptops={savedLaptops}
+        spatialConfigs={spatial.configs}
+        onUpdatePosition={spatial.updatePosition}
+        onUpdateRotation={spatial.updateRotation}
+        onUpdateShortId={spatial.updateShortId}
+        onSelectHost={handleSelectHost}
       />
 
       {/* Setup / QR: the whole way in, on one screen. Opens itself when the app
