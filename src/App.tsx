@@ -282,7 +282,13 @@ export default function App() {
     // warm from the previous press, so this is usually just a graph re-wire.
     const capture = new PcmCapture({
       onChunk: (pcm) => linuxClient.sendDictationAudio(pcm),
-      onError: () => showToast('Microphone unavailable', 'warn'),
+      onError: () =>
+        showToast(
+          window.isSecureContext
+            ? 'Microphone unavailable'
+            : 'Talking needs a secure link: use Setup and open the https :8443 address',
+          'warn',
+        ),
     });
     let micError: unknown = null;
     const micReady = capture.start().catch((err) => {
@@ -330,7 +336,9 @@ export default function App() {
         setPttWarming(false);
         setPttPhase('idle');
         showSpeechNotice(
-          'Microphone blocked. Allow it for this site in your browser settings.'
+          window.isSecureContext
+            ? 'Microphone blocked. Allow it for this site in your browser settings.'
+            : 'Talking needs a secure link. Open Setup, install the certificate, then use the https :8443 address.'
         );
         setIsPttActive(false);
         return;
@@ -591,7 +599,7 @@ export default function App() {
     showToast(
       secure
         ? 'Local mode: connected straight over the hotspot'
-        : 'Same hotspot: trackpad and keys work, but talking needs the secure Tailscale link',
+        : 'Same hotspot: trackpad and keys work. For talking, open Setup and use the https :8443 link',
       secure ? 'ok' : 'warn',
     );
   }, [showToast]);
