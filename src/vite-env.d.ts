@@ -13,7 +13,19 @@ interface TailDeckNativeShim {
   hostInfo?: unknown;
 }
 
+interface TailDeckNativeAppBridge {
+  onHostInfo: (json: string) => void;
+  /** Writes to the shell's log (logcat tag TailDeckJSBridge); diagnostics only. */
+  log?: (message: string) => void;
+  /**
+   * Ask the native shell to load a different laptop's deck. The shell reloads
+   * the WebView at that laptop's origin (it owns the deck URL), which is the
+   * only way a host switch keeps localStorage and the socket on one origin.
+   */
+  switchHost?: (host: string, port: number, isHttps: boolean) => void;
+}
+
 interface Window {
   taildeck?: TailDeckNativeShim;
-  TailDeckNative?: { onHostInfo: (json: string) => void };
+  TailDeckNative?: TailDeckNativeAppBridge;
 }

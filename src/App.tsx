@@ -3,7 +3,7 @@ import type { CSSProperties } from 'react';
 import { AlertCircle, Check, Wifi, WifiOff, Laptop } from 'lucide-react';
 import { useRegisterSW } from 'virtual:pwa-register/react';
 import { linuxClient } from './services/linuxClient';
-import { LOCAL_HOST, IS_LOCAL_MODE, describeRoute, servedByLabel } from './services/localMode';
+import { LOCAL_HOST, IS_LOCAL_MODE, describeRoute, servedByLabel, isNativeShell } from './services/localMode';
 import { rememberLaptop, loadSavedLaptops } from './services/savedLaptops';
 import type { SavedLaptop } from './services/savedLaptops';
 import { useSpatialLayout } from './hooks/useSpatialLayout';
@@ -493,9 +493,42 @@ export default function App() {
   // path as a launch, so the address is remembered for next time too.
   const handleSelectHost = (host: string) => {
     if (!host || host === connectionStatus.hostAddress) {
+      window.TailDeckNative?.log?.(`selectHost ignored "${host}" (connected=${connectionStatus.hostAddress})`);
       setShowHostSwitcher(false);
       return;
     }
+
+    // Inside the native shell the page is served *by* the active laptop, so a
+    // cross-origin socket to the next one leaves the WebView on the old origin.
+    // Ask the shell to reload at the target origin; it owns the deck URL and
+    // persists the host. Older shells have no bridge method — and a page-initiated
+    // navigation is reverted by the shell's AndroidView update — so there we keep
+    // the direct socket, refusing the one combination the browser forbids.
+    if (isNativeShell()) {
+      const split = host.lastIndexOf(':');
+      const hostname = split > 0 ? host.slice(0, split) : host;
+      const portText = split > 0 ? host.slice(split + 1) : '';
+      const port = /^\d+$/.test(portText) ? Number(portText) : 8443;
+      const isHttps = port !== 8080;
+      const switchNative = window.TailDeckNative?.switchHost;
+      window.TailDeckNative?.log?.(
+        `selectHost ${host} -> ${hostname}:${port} https=${isHttps} bridge=${typeof switchNative} from=${connectionStatus.hostAddress}`,
+      );
+      if (typeof switchNative === 'function') {
+        switchNative.call(window.TailDeckNative, hostname, port, isHttps);
+        setShowHostSwitcher(false);
+        showToast(`Switching to ${hostname}`, 'ok');
+        return;
+      }
+      if (!isHttps && location.protocol === 'https:') {
+        // A secure page cannot open ws:// (mixed content). Point the user at
+        // the laptop's TLS port instead of failing silently.
+        setShowHostSwitcher(false);
+        showToast(`Use ${hostname}:8443 — plain http can't be reached from a secure page`, 'warn');
+        return;
+      }
+    }
+
     linuxClient.connect(host);
     handleUpdateSettings({ tailscaleIp: host });
     setShowHostSwitcher(false);
@@ -837,6 +870,10 @@ export default function App() {
         onEnterDarkOut={enterDarkOut}
         appUpdateReady={appUpdateReady}
         onApplyAppUpdate={applyAppUpdate}
+        onSelectHost={(host) => {
+          handleSelectHost(host);
+          setIsDrawerOpen(false);
+        }}
       />
 
       {/* Spatial multi-host switcher: position laptops around the primary

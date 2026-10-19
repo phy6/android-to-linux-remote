@@ -159,6 +159,12 @@ interface SideMenuDrawerProps {
   onOpenDictation: () => void;
   onOpenDiagnostics: () => void;
   onOpenSetup: () => void;
+  /**
+   * Switch to another saved laptop. App owns this so the native shell can
+   * reload the WebView at the target origin instead of opening a cross-origin
+   * socket from the old laptop's page.
+   */
+  onSelectHost?: (host: string) => void;
   isSimulatorActive: boolean;
   onEnterDarkOut: () => void;
   appUpdateReady: boolean;
@@ -177,6 +183,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
   onOpenDictation,
   onOpenDiagnostics,
   onOpenSetup,
+  onSelectHost,
   isSimulatorActive,
   onEnterDarkOut,
   appUpdateReady,
@@ -254,10 +261,17 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
   const currentDragXRef = useRef<number>(0);
   const [dragProgress, setDragProgress] = useState<number | null>(null); // 0 to 1
 
+  const connectToHost = (host: string) => {
+    const clean = host.trim();
+    if (!clean) return;
+    if (onSelectHost) onSelectHost(clean);
+    else linuxClient.connect(clean);
+  };
+
   const handleConnect = (e: React.FormEvent) => {
     e.preventDefault();
     triggerClick();
-    linuxClient.connect(tailscaleIp);
+    connectToHost(tailscaleIp);
   };
 
   const handleDisconnect = () => {
@@ -272,7 +286,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
     if (!payload) return false;
     triggerClick();
     setPairMode(null);
-    linuxClient.connect(payload.h);
+    connectToHost(payload.h);
     onClose();
     return true;
   };
@@ -569,7 +583,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                                 onClick={() => {
                                   triggerClick();
                                   setTailscaleIp(laptop.host);
-                                  linuxClient.connect(laptop.host);
+                                  connectToHost(laptop.host);
                                 }}
                                 className="px-2.5 py-1.5 rounded-lg bg-sky-600 text-white text-[11px] font-medium hover:bg-sky-500"
                               >
@@ -640,7 +654,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                                   type="button"
                                   onClick={() => {
                                     setTailscaleIp(value);
-                                    linuxClient.connect(value);
+                                    connectToHost(value);
                                   }}
                                   className="px-2.5 py-1.5 rounded-lg bg-sky-600 text-white text-[11px] font-medium hover:bg-sky-500"
                                 >
@@ -706,7 +720,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                     type="button"
                     onClick={() => {
                       setTailscaleIp(LOCAL_HOST);
-                      linuxClient.connect(LOCAL_HOST);
+                      connectToHost(LOCAL_HOST);
                     }}
                     className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl font-medium text-xs bg-emerald-600/20 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-600/30 transition"
                   >

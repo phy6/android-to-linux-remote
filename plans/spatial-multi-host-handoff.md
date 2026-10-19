@@ -59,6 +59,24 @@ behind it.
    "Send to…" per entry (files **and** folders) with a target chooser when other
    laptops are saved.
 
+6. **Native shell owns the host switch (`src/App.tsx`, `window.TailDeckNative.switchHost`)** —
+   In the Android shell the deck is *served by* the active laptop, so the page
+   origin is that laptop. Connecting the socket to a second laptop from inside
+   the page left the WebView on the old origin: its `localStorage` still
+   described the old host, and a reload was never requested. Observed on the
+   phone as the deck dropping to `SetupQrScreen` while the daemon logged the
+   new socket opening (`ws open 10.117.111.43` at 23:43:37, closed 23:50:54,
+   `bytes=0`) and **no second `ws open`** after the switch — the reloaded page
+   never connected.
+
+   `handleSelectHost` now detects `isNativeShell()` and, when the shell exposes
+   `switchHost`, hands the target address to the native side instead of calling
+   `linuxClient.connect`. The shell persists a new `ConnectionConfig` and reloads
+   the WebView at that laptop's `deckUrl` (`?td_native=1`), so the deck, its
+   storage, and its socket share the new origin. Browser/Pages builds keep the
+   direct connect path. Ports follow the daemon convention: `8080` is plain
+   HTTP; anything else (default `8443`) is HTTPS.
+
 ## Known limits
 
 - Transfer buffers the whole file in phone memory for the round trip; very large
@@ -72,6 +90,48 @@ behind it.
 - **Drag gestures are not built yet.** Moving a file/folder is via the per-entry
   "Send to…" tray; long-press drag-to-place in the switcher and dragging an entry
   across a screen edge are still to do (see the touch-gesture follow-up).
+- **Native host switching needs a rebuilt shell.** The page prefers
+  `window.TailDeckNative.switchHost` (the shell saves the host and reloads).
+  Shells built before that method existed keep the direct cross-origin socket:
+  a page-initiated navigation is **not** viable because `TailDeckWebView`'s
+  `AndroidView` update calls `loadUrl(url)` whenever `webView.url != url`, so the
+  target page is immediately replaced by the old one (observed 01:04:14 —
+  socket closed, one `?td_native=1` navigation attempted, page restored from the
+  WebView cache still showing the old host). For those shells a switch to a plain
+  `http` (`:8080`) target from a page on `https` is refused with a toast, since
+  the browser blocks the `ws://` upgrade as mixed content; use the `:8443` address.
+
+  **The APK is built through git, not on the daemon host.** Pushing
+  `taildeck-android` to `main` triggers `.github/workflows/android.yml` on GitHub
+  Actions (JDK 17 + SDK 35), which uploads `taildeck-debug-apk` and, when the
+  signing secrets are present, `taildeck-release-apk`. Download and install with:
+
+  ```bash
+  gh run watch --repo phy6/taildeck-android
+  gh run download --repo phy6/taildeck-android -n taildeck-release-apk -D /tmp/td-apk
+  adb install -r /tmp/td-apk/app-release.apk
+  ```
+
+  Install the **release** APK over the installed app (same signing key); a debug
+  APK will fail with `INSTALL_FAILED_UPDATE_INCOMPATIBLE`.
+
+  **Verified on the phone (v1.0.21, HP only — TravelMate was offline):** switching
+  hp `:8443` → hp `:8080` closed the old socket and reconnected on the new origin
+  (`closed … hotspot https`, `connected … hotspot http`, 01:32:36), and switching
+  back did the inverse at 01:34:53. The shell's prefs follow the switch, so a
+  relaunch loads the last laptop.
+
+7. **The phone must not serve a stale deck (`vite.config.ts`)** —
+   `registerType` moved from `'prompt'` to `'autoUpdate'`. The prompt build left an
+   old service worker controlling the WebView across app restarts, so a fixed
+   bundle could keep running for hours: the on-device switch test at 01:21 showed
+   *no* bridge call and *no* navigation, i.e. old JS. `autoUpdate` sets workbox
+   `skipWaiting` + `clientsClaim`, so a new bundle takes over on the next launch.
+   Web builds now also stamp `GITHUB_SHA` into `__BUILD_SHA__`, and the drawer
+   footer shows `TailDeck <sha>`, which is how to tell which bundle is live on the
+   phone. `handleSelectHost` writes a one-line `window.TailDeckNative.log(...)`
+   trace of every switch attempt (logcat tag `TailDeckJSBridge`) for the same
+   reason.
 
 ## Verification
 - `bun run typecheck` (`tsc --noEmit`)
