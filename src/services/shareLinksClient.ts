@@ -6,7 +6,7 @@
 // same origin the phone already talks to, so a link is http:// on the hotspot
 // and https:// when the app came in over TLS. See plans/safe-share-links.md.
 
-import { apiBase } from './scriptsClient';
+import { apiBase, apiFetch } from './http';
 
 export interface ShareLink {
   id: string;
@@ -69,7 +69,7 @@ export async function listShares(host: string): Promise<ShareLink[] | null> {
   const base = apiBase(host);
   if (!base) return null;
   try {
-    const res = await fetch(`${base}/api/shares`, { cache: 'no-store' });
+    const res = await apiFetch(`${base}/api/shares`, { cache: 'no-store' });
     if (!res.ok) return null;
     const data = await res.json();
     if (!data?.ok) return null;
@@ -85,7 +85,7 @@ async function postShare(host: string, path: string): Promise<ShareLink | null> 
   const base = apiBase(host);
   if (!base) return null;
   try {
-    const res = await fetch(`${base}${path}`, { method: 'POST', cache: 'no-store' });
+    const res = await apiFetch(`${base}${path}`, { method: 'POST', cache: 'no-store' });
     if (!res.ok) return null;
     const data = await res.json();
     return data?.ok ? cleanLink(data.share) : null;
@@ -115,7 +115,7 @@ export async function revokeShare(host: string, id: string): Promise<boolean> {
   const base = apiBase(host);
   if (!base) return false;
   try {
-    const res = await fetch(`${base}/api/shares/${encodeURIComponent(id)}/revoke`, {
+    const res = await apiFetch(`${base}/api/shares/${encodeURIComponent(id)}/revoke`, {
       method: 'POST',
     });
     return res.ok;
@@ -128,7 +128,7 @@ export async function deleteShare(host: string, id: string): Promise<boolean> {
   const base = apiBase(host);
   if (!base) return false;
   try {
-    const res = await fetch(`${base}/api/shares/${encodeURIComponent(id)}/delete`, {
+    const res = await apiFetch(`${base}/api/shares/${encodeURIComponent(id)}/delete`, {
       method: 'POST',
     });
     return res.ok;

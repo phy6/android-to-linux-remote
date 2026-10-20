@@ -6,7 +6,7 @@
 // carries the file's version, so a changed icon is a different URL and the
 // browser's own cache does the "store locally, update when needed" part.
 
-import { apiBase } from './scriptsClient';
+import { apiBase, apiFetch } from './http';
 
 export interface AppEntry {
   id: string;
@@ -77,7 +77,7 @@ export async function fetchApps(host: string): Promise<AppEntry[]> {
   const base = apiBase(host);
   if (!base) return [];
   try {
-    const res = await fetch(`${base}/api/apps`, { cache: 'no-store' });
+    const res = await apiFetch(`${base}/api/apps`, { cache: 'no-store' });
     if (!res.ok) return [];
     const data = await res.json();
     const apps = cleanList(data?.apps);
@@ -107,7 +107,7 @@ export async function launchApp(host: string, id: string): Promise<boolean> {
   const base = apiBase(host);
   if (!base || !id) return false;
   try {
-    const res = await fetch(`${base}/api/apps/launch`, {
+    const res = await apiFetch(`${base}/api/apps/launch`, {
       method: 'POST',
       // text/plain keeps this a CORS "simple request" - no preflight needed.
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },

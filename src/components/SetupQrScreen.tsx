@@ -1,4 +1,5 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import QRCode from 'qrcode';
 import { X, Copy, Check, Wifi, ShieldCheck, Globe, ScanLine, RefreshCw } from 'lucide-react';
 import { ConnectionStatus } from '../types';
@@ -109,6 +110,9 @@ const StepCard: React.FC<{ step: SetupStep; index: number }> = ({ step, index })
 export const SetupQrScreen: React.FC<SetupQrScreenProps> = ({ isOpen, onClose, status, onScan }) => {
   const originHost = typeof location !== 'undefined' ? location.host : undefined;
   const originProtocol = typeof location !== 'undefined' ? location.protocol : 'https:';
+  const panelRef = useRef<HTMLDivElement>(null);
+  const closeRef = useRef<HTMLButtonElement>(null);
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
 
   const routes = useMemo(() => pairingRoutes(status, originHost), [status, originHost]);
 
@@ -185,6 +189,70 @@ export const SetupQrScreen: React.FC<SetupQrScreenProps> = ({ isOpen, onClose, s
     return out;
   }, [routes, status.hostOsInfo, originHost, originProtocol]);
 
+  useEffect(() => {
+    if (!isOpen) return;
+    // The overlay is portaled to <body> below, so the app root can be made
+    // inert: no background focus targets and no stray screen-reader stops.
+    // Declared before the focus effect so its cleanup lifts inert first.
+    const root = document.getElementById('root');
+    if (!root) return;
+    const hadInert = root.hasAttribute('inert');
+    const hadHidden = root.getAttribute('aria-hidden');
+    root.setAttribute('inert', '');
+    root.setAttribute('aria-hidden', 'true');
+    return () => {
+      if (!hadInert) root.removeAttribute('inert');
+      if (hadHidden === null) root.removeAttribute('aria-hidden');
+      else root.setAttribute('aria-hidden', hadHidden);
+    };
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const active = document.activeElement;
+    restoreFocusRef.current =
+      active instanceof HTMLElement && active !== document.body ? active : null;
+    const timer = window.setTimeout(() => closeRef.current?.focus(), 0);
+    return () => {
+      window.clearTimeout(timer);
+      const target = restoreFocusRef.current;
+      restoreFocusRef.current = null;
+      const fallback = document.querySelector<HTMLElement>('button[aria-controls="taildeck-menu"]');
+      const focusTarget = target && document.contains(target) ? target : fallback;
+      focusTarget?.focus();
+    };
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== 'Tab' || !panelRef.current) return;
+      const focusable = Array.from(
+        panelRef.current.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      );
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const active = document.activeElement;
+      if (event.shiftKey && (active === first || !panelRef.current.contains(active))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (active === last || !panelRef.current.contains(active))) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [isOpen, onClose]);
+
   if (!isOpen) return null;
 
   const pill = status.connected
@@ -193,18 +261,24 @@ export const SetupQrScreen: React.FC<SetupQrScreenProps> = ({ isOpen, onClose, s
       ? { text: 'Connecting…', cls: 'text-sky-300 border-sky-500/40 bg-sky-500/10' }
       : { text: 'Not connected', cls: 'text-rose-300 border-rose-500/40 bg-rose-500/10' };
 
-  return (
+  return createPortal(
     <div className="fixed inset-0 z-[60] flex items-stretch sm:items-center justify-center p-0 sm:p-4">
-      <div className="absolute inset-0 bg-black/85 backdrop-blur-sm animate-fadeIn" onClick={onClose} />
+      <div className="absolute inset-0 bg-black/85 backdrop-blur-sm animate-fadeIn" onClick={onClose} aria-hidden="true" />
 
-      <div className="relative w-full sm:max-w-md h-full sm:h-auto sm:max-h-[90vh] flex flex-col rounded-none sm:rounded-2xl bg-slate-950 border border-slate-800 shadow-2xl overflow-hidden">
+      <div
+        ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="taildeck-setup-title"
+        className="relative w-full sm:max-w-md h-full sm:h-auto sm:max-h-[90vh] flex flex-col rounded-none sm:rounded-2xl bg-slate-950 border border-slate-800 shadow-2xl overflow-hidden"
+      >
         <div className="flex items-center justify-between p-4 border-b border-slate-800 shrink-0">
           <div className="flex items-center gap-2.5">
             <div className="w-8 h-8 rounded-xl bg-sky-500/20 border border-sky-500/30 flex items-center justify-center text-sky-400">
               <RefreshCw className="w-4 h-4" />
             </div>
             <div>
-              <h3 className="font-semibold text-white text-sm leading-tight">Set up this phone</h3>
+              <h3 id="taildeck-setup-title" className="font-semibold text-white text-sm leading-tight">Set up this phone</h3>
               <p className="text-[11px] text-slate-400">Point the camera at a code below</p>
             </div>
           </div>
@@ -212,7 +286,13 @@ export const SetupQrScreen: React.FC<SetupQrScreenProps> = ({ isOpen, onClose, s
             <span className={`text-[10px] font-medium border rounded-full px-2 py-0.5 ${pill.cls}`}>
               {pill.text}
             </span>
-            <button onClick={onClose} className="p-1.5 rounded-xl bg-slate-900 text-slate-400 hover:text-white">
+            <button
+              ref={closeRef}
+              type="button"
+              onClick={onClose}
+              aria-label="Close setup"
+              className="p-1.5 rounded-xl bg-slate-900 text-slate-400 hover:text-white"
+            >
               <X className="w-5 h-5" />
             </button>
           </div>
@@ -246,6 +326,7 @@ export const SetupQrScreen: React.FC<SetupQrScreenProps> = ({ isOpen, onClose, s
           </div>
         )}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 };

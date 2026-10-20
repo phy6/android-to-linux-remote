@@ -5,6 +5,8 @@
 // reads that list to fill the teleprompter, and can also keep its own small set
 // of snippets locally so a script is still there with the laptop offline.
 
+import { apiBase, apiFetch } from './http';
+
 export interface ScriptFile {
   name: string;
   size: number;
@@ -20,27 +22,6 @@ export interface LocalSnippet {
 const LOCAL_KEY = 'taildeck_snippets';
 const DEFAULT_SCRIPT_EXT = '.txt';
 
-/** The host:port the app is connected to, without any scheme. */
-function cleanHost(host: string): string {
-  return host
-    .trim()
-    .replace(/^(wss?|https?):\/\//i, '')
-    .replace(/\/.*$/, '');
-}
-
-/**
- * Base URL for REST calls against the laptop. Prefer https whenever the page
- * itself is secure (so the request is same-origin when the app is served from
- * the laptop), and when the connected host is the https port.
- */
-export function apiBase(host: string): string | null {
-  const clean = cleanHost(host);
-  if (!clean) return null;
-  const pageSecure = typeof location !== 'undefined' && location.protocol === 'https:';
-  const secure = pageSecure || /:8443$/.test(clean);
-  return `${secure ? 'https' : 'http'}://${clean}`;
-}
-
 /** URL a guest can open to install the laptop's CA (guest/iOS WSS trust). */
 export function caUrl(host: string): string | null {
   const base = apiBase(host);
@@ -55,7 +36,7 @@ export async function listScripts(host: string): Promise<ScriptFile[]> {
   const base = apiBase(host);
   if (!base) return [];
   try {
-    const res = await fetch(`${base}/api/scripts`, { cache: 'no-store' });
+    const res = await apiFetch(`${base}/api/scripts`, { cache: 'no-store' });
     if (!res.ok) return [];
     const data = await res.json();
     const raw = Array.isArray(data?.scripts) ? data.scripts : [];
@@ -75,7 +56,7 @@ export async function getScript(host: string, name: string): Promise<string | nu
   const base = apiBase(host);
   if (!base || !isScriptName(name)) return null;
   try {
-    const res = await fetch(`${base}/api/scripts/${encodeURIComponent(name)}`, { cache: 'no-store' });
+    const res = await apiFetch(`${base}/api/scripts/${encodeURIComponent(name)}`, { cache: 'no-store' });
     if (!res.ok) return null;
     const data = await res.json();
     return typeof data?.text === 'string' ? data.text : null;
@@ -88,7 +69,7 @@ export async function saveScript(host: string, name: string, text: string): Prom
   const base = apiBase(host);
   if (!base || !isScriptName(name)) return false;
   try {
-    const res = await fetch(`${base}/api/scripts/${encodeURIComponent(name)}`, {
+    const res = await apiFetch(`${base}/api/scripts/${encodeURIComponent(name)}`, {
       method: 'POST',
       // text/plain keeps this a CORS "simple request" - no preflight needed.
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },

@@ -41,6 +41,8 @@ export interface ConnectionStatus {
   hostAddress: string;
   sessionType: SessionType;
   hostOsInfo?: {
+    /** Stable laptop id, independent of address or hostname. */
+    id?: string;
     hostname: string;
     os: string;
     session: 'Wayland' | 'X11' | 'Unknown';
@@ -48,9 +50,24 @@ export interface ConnectionStatus {
     // Reported by the daemon so the app can hand the user every way back to
     // this laptop: LAN addresses (same hotspot only) and the tailnet name.
     addresses?: string[];
+    /** Per-interface reachability, with the transport kind. */
+    interfaces?: HostInterface[];
     tailnet?: string | null;
     ports?: { http: number; https: number };
+    /** SHA-256 of the leaf certificate, for pinning across address changes. */
+    certSha256?: string | null;
+    /** Names the certificate actually covers. */
+    certNames?: string[];
   };
+}
+
+/** One address the laptop says a phone can reach it on. */
+export interface HostInterface {
+  interface: string;
+  address: string;
+  transport: 'wifi' | 'usb' | 'bluetooth' | 'ethernet' | 'network' | 'unknown';
+  netmask?: string;
+  broadcast?: string;
 }
 
 export interface AppWindow {

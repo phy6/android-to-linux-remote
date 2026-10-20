@@ -4,10 +4,21 @@ import { AlertCircle, Check, Wifi, WifiOff, Laptop } from 'lucide-react';
 import { useRegisterSW } from 'virtual:pwa-register/react';
 import { linuxClient } from './services/linuxClient';
 import { LOCAL_HOST, IS_LOCAL_MODE, describeRoute, servedByLabel, isNativeShell } from './services/localMode';
-import { rememberLaptop, loadSavedLaptops } from './services/savedLaptops';
+import { rememberLaptop, loadSavedLaptops, mergeSavedLaptops, readShellSavedLaptops, pushShellLaptop } from './services/savedLaptops';
 import type { SavedLaptop } from './services/savedLaptops';
+import { DEFAULT_HTTPS_PORT, isSecureTarget, parseHostTarget } from './services/netTarget';
+import {
+  bestAddressForSaved,
+  findLaptopForAddress,
+  routeTransportLabel,
+  routesForLaptop,
+  savedIdentityFor,
+} from './services/hostRoutes';
 import { useSpatialLayout } from './hooks/useSpatialLayout';
-import { HostSwitcherModal } from './components/HostSwitcherModal';
+import { deriveShortId } from './services/spatialLayout';
+import { fetchPointer } from './services/displaysClient';
+import { captureDragPayload, transferDragEntries } from './services/dragClient';
+import type { HostWindow, WindowDevice } from './services/windowsClient';
 import { autoconnectOrder, isTailnetIp } from './services/pairing';
 import { ConnectionStatus, RemoteSettings } from './types';
 import {
@@ -25,6 +36,9 @@ import {
 import { FloatingDictationButton } from './components/FloatingDictationButton';
 import { DictationModal } from './components/DictationModal';
 import { SideMenuDrawer } from './components/SideMenuDrawer';
+import { DeviceInfoModal } from './components/DeviceInfoModal';
+import { SpatialLayoutModal } from './components/SpatialLayoutModal';
+import { DisplayLayoutModal } from './components/DisplayLayoutModal';
 import { SetupQrScreen } from './components/SetupQrScreen';
 import { LinuxSimulator } from './components/LinuxSimulator';
 import { DarkOut } from './components/DarkOut';
@@ -84,7 +98,9 @@ export default function App() {
   });
 
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>(linuxClient.getStatus());
-  const [savedLaptops, setSavedLaptops] = useState<SavedLaptop[]>(() => loadSavedLaptops());
+  const [savedLaptops, setSavedLaptops] = useState<SavedLaptop[]>(() =>
+    mergeSavedLaptops(readShellSavedLaptops()),
+  );
   const [activeAppIndex, setActiveAppIndex] = useState(0);
 
   // Live size preview while dragging the resize grip; null means "use the
@@ -94,11 +110,16 @@ export default function App() {
 
   // Side Drawer & Modals
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
-  const [drawerTab, setDrawerTab] = useState<'tailscale' | 'keys' | 'media' | 'settings' | 'help' | undefined>();
+  const [drawerTab, setDrawerTab] = useState<'tailscale' | 'keys' | 'media' | 'files' | 'devices' | 'settings' | 'help' | undefined>();
   const [showSetup, setShowSetup] = useState(false);
   const [isDictationOpen, setIsDictationOpen] = useState(false);
   const [showSimulator, setShowSimulator] = useState(false);
-  const [showHostSwitcher, setShowHostSwitcher] = useState(false);
+  // The deck's laptop chip opens device info; the spatial canvas is a layer
+  // below it (z-40), so the info sheet can sit on top without a second route.
+  const [showDeviceInfo, setShowDeviceInfo] = useState(false);
+  const [showSpatial, setShowSpatial] = useState(false);
+  // Per-screen arrangement (xrandr --pos/--rotate) for the connected laptop.
+  const [showDisplays, setShowDisplays] = useState(false);
   const [darkOut, setDarkOut] = useState(false);
   const [isPttActive, setIsPttActive] = useState(false);
   // Mirrors isPttActive for callbacks that must not offer Return/Delete while a
@@ -119,31 +140,99 @@ export default function App() {
   // Spatial multi-host layout: which saved laptop sits on each side of the one
   // we're driving right now, so the trackpad can hand control off at the edge.
   const activeHost = connectionStatus.hostAddress || '';
-  const spatial = useSpatialLayout(savedLaptops, activeHost);
-  const adjacentDirections = (['left', 'right', 'top', 'bottom'] as const).filter(
-    (direction) => !!spatial.getHostByDirection(direction),
+  const spatial = useSpatialLayout(
+    savedLaptops,
+    activeHost,
+    connectionStatus.hostOsInfo,
+    connectionStatus.connected || connectionStatus.connecting,
+    connectionStatus.connected,
   );
 
-  // Register the service worker once, at the root, so an update is noticed even
-  // if the drawer is never opened. The Settings tab's Updates card reads this.
-  const {
-    needRefresh: [appUpdateReady],
-    updateServiceWorker,
-  } = useRegisterSW();
+  // Preview each neighbour's own desk only while a sheet that shows it is open.
+  // The hook caches for a minute and dedupes in-flight requests, so reopening a
+  // sheet is cheap; the 15s availability probe never fetches neighbour geometry.
+  const refreshNeighbourMonitors = spatial.refreshNeighbourMonitors;
+  useEffect(() => {
+    if (showDeviceInfo || showSpatial) void refreshNeighbourMonitors();
+  }, [showDeviceInfo, showSpatial, refreshNeighbourMonitors]);
+
+  // The screen editor changes geometry on the laptop; re-read it when opening so
+  // it never starts from a stale drawing (e.g. a monitor was just plugged in).
+  const refreshMonitors = spatial.refreshMonitors;
+  useEffect(() => {
+    if (showDisplays) void refreshMonitors();
+  }, [showDisplays, refreshMonitors]);
+
+  const adjacentDirections = spatial.passOffDirections();
+
+  // The wheel merges the real Alt+Tab list from every online laptop. Keep the
+  // active one first so its current window is the initial centre, then add the
+  // rest; the badge is the same compact id used by the host pills.
+  const wheelDevices: WindowDevice[] = [];
+  const seenWheelHosts = new Set<string>();
+  const addWheelDevice = (device: WindowDevice) => {
+    if (!device.host || seenWheelHosts.has(device.host)) return;
+    seenWheelHosts.add(device.host);
+    wheelDevices.push(device);
+  };
+  const activeSpatial = Object.values(spatial.configs).find((c) => c.host === activeHost);
+  const activeSaved = savedLaptops.find((l) => l.host === activeHost);
+  const activeDeviceName =
+    activeSpatial?.name ||
+    connectionStatus.hostOsInfo?.hostname ||
+    activeSaved?.name ||
+    activeHost;
+  if (activeHost) {
+    const activeName = activeSpatial?.name || activeSaved?.name || activeHost;
+    addWheelDevice({
+      host: activeHost,
+      name: activeName,
+      label: activeSpatial?.shortId || deriveShortId(activeName, activeHost),
+      active: true,
+    });
+  }
+  Object.values(spatial.configs)
+    .filter((c) => c.host !== activeHost && c.isOnline)
+    .forEach((c) => {
+      addWheelDevice({
+        host: c.host,
+        name: c.name || c.host,
+        label: c.shortId || deriveShortId(c.name, c.host),
+        active: false,
+      });
+    });
+
+  // The native shell always loads the deck from the laptop's own daemon, so a
+  // service worker there only ever serves a bundle older than the webroot after
+  // a deploy. Skip registration in the shell; the browser copy keeps it for
+  // offline use from GitHub Pages. The Settings tab's Updates card reads this.
+  const nativeShell = isNativeShell();
+  const [appUpdateReady, setAppUpdateReady] = useState(false);
+  const updateServiceWorkerRef = useRef<((reloadPage?: boolean) => Promise<void>) | null>(null);
+
+  const onPwaState = useCallback(
+    (ready: boolean, update: ((reloadPage?: boolean) => Promise<void>) | null) => {
+      setAppUpdateReady(ready);
+      updateServiceWorkerRef.current = update;
+    },
+    [],
+  );
 
   const applyAppUpdate = useCallback(async () => {
-    if (appUpdateReady) {
-      await updateServiceWorker(true);
+    if (appUpdateReady && updateServiceWorkerRef.current) {
+      await updateServiceWorkerRef.current(true);
       return;
     }
     try {
       const regs = (await navigator.serviceWorker?.getRegistrations?.()) ?? [];
       await Promise.all(regs.map((r) => r.unregister()));
+      const cacheNames = (await caches?.keys?.()) ?? [];
+      await Promise.all(cacheNames.map((name) => caches.delete(name)));
     } catch {
       // Fall through to the reload.
     }
     location.reload();
-  }, [appUpdateReady, updateServiceWorker]);
+  }, [appUpdateReady]);
 
   // Surface speech failures on the deck itself, otherwise a blocked microphone
   // makes push-to-talk fail with no visible reason.
@@ -188,6 +277,23 @@ export default function App() {
   // text on the phone is the only confirmation available when the phone is
   // being used away from the screen.
   useEffect(() => {
+    // The host identity in the native status bar is the single way in: it
+    // opens the device info sheet, whose "Spatial layout" button opens the
+    // canvas one layer below. Keep the old bridge name because installed
+    // shells still call it from the laptop icon + host name.
+    const openDeviceInfo = () => {
+      setShowSpatial(false);
+      setShowDeviceInfo(true);
+    };
+    window.__taildeckOpenDeviceInfo = openDeviceInfo;
+    window.__taildeckOpenSpatial = openDeviceInfo;
+    return () => {
+      delete window.__taildeckOpenDeviceInfo;
+      delete window.__taildeckOpenSpatial;
+    };
+  }, []);
+
+  useEffect(() => {
     return linuxClient.onDictationText((heard) => {
       clearTranscriptTimer();
       setPttPartial(null);
@@ -230,6 +336,22 @@ export default function App() {
     }
     toastTimerRef.current = window.setTimeout(() => setToast(null), 4000);
   }, []);
+
+  // A wheel step can focus a window on another laptop. Input still follows the
+  // active host until the user passes control over, so say which laptop moved.
+  const handleWheelWindowSelect = useCallback(
+    (item: HostWindow, ok: boolean) => {
+      const label = item.deviceLabel || item.deviceName;
+      if (!ok) {
+        showToast(`Could not focus ${item.appName} on ${label}`, 'warn');
+        return;
+      }
+      if (!item.deviceActive) {
+        showToast(`Focused ${item.appName} on ${label}`, 'ok');
+      }
+    },
+    [showToast],
+  );
 
   useEffect(
     () => () => {
@@ -492,11 +614,45 @@ export default function App() {
   // Switch the driving socket to another saved laptop. Reuses the same connect
   // path as a launch, so the address is remembered for next time too.
   const handleSelectHost = (host: string) => {
-    if (!host || host === connectionStatus.hostAddress) {
+    const pairing = linuxClient.hasPendingPairCode();
+    // A saved identity and the live socket route can differ (hotspot vs
+    // tailnet). Compare identities so tapping the laptop we already drive does
+    // not force a reconnect through a different route.
+    const currentIdentity = savedIdentityFor(
+      connectionStatus.hostAddress,
+      savedLaptops,
+      connectionStatus.hostOsInfo,
+    );
+    // Ignore a repeat tap on the laptop we are already driving, but allow a
+    // reconnect to the same address when the last attempt failed (for example
+    // a 4401 before pairing) — otherwise the retry would be swallowed.
+    if (!host || (host === currentIdentity && connectionStatus.connected && !pairing)) {
       window.TailDeckNative?.log?.(`selectHost ignored "${host}" (connected=${connectionStatus.hostAddress})`);
-      setShowHostSwitcher(false);
       return;
     }
+
+    // Resolve the identity to its best usable address before switching. This
+    // prefers a direct route (USB/Ethernet/LAN before the tailnet) and moves a
+    // plain-http address to the daemon's TLS port on an https page.
+    const laptop = findLaptopForAddress(host, savedLaptops);
+    // Try concrete addresses (last-good/USB/LAN/tailnet) before a generated
+    // mDNS name: Android WebView often cannot resolve `.local`, and a manual
+    // switch should fall through instead of retrying that one name forever.
+    const routeList = laptop
+      ? routesForLaptop(laptop)
+          .slice()
+          .sort((a, b) => Number(a.transport === 'mdns') - Number(b.transport === 'mdns'))
+      : [];
+    const route = routeList[0] ?? null;
+    const targetAddress = route?.host ?? host;
+    const target = parseHostTarget(targetAddress);
+    const hostname = target?.host ?? targetAddress;
+    const port = target?.port ?? DEFAULT_HTTPS_PORT;
+    const isHttps = target ? isSecureTarget(target) : true;
+    const via = route ? ` via ${routeTransportLabel(route)}` : '';
+    const candidates = Array.from(
+      new Set([...routeList.map((item) => item.host), targetAddress, host].filter(Boolean)),
+    );
 
     // Inside the native shell the page is served *by* the active laptop, so a
     // cross-origin socket to the next one leaves the WebView on the old origin.
@@ -504,43 +660,109 @@ export default function App() {
     // persists the host. Older shells have no bridge method — and a page-initiated
     // navigation is reverted by the shell's AndroidView update — so there we keep
     // the direct socket, refusing the one combination the browser forbids.
-    if (isNativeShell()) {
-      const split = host.lastIndexOf(':');
-      const hostname = split > 0 ? host.slice(0, split) : host;
-      const portText = split > 0 ? host.slice(split + 1) : '';
-      const port = /^\d+$/.test(portText) ? Number(portText) : 8443;
-      const isHttps = port !== 8080;
+    // A pairing code lives in this page (and its sessionStorage); reloading the
+    // WebView at a new origin would lose it. Pair over the current socket and
+    // let the shell reload on the next ordinary host switch instead.
+    if (isNativeShell() && !linuxClient.hasPendingPairCode()) {
       const switchNative = window.TailDeckNative?.switchHost;
       window.TailDeckNative?.log?.(
-        `selectHost ${host} -> ${hostname}:${port} https=${isHttps} bridge=${typeof switchNative} from=${connectionStatus.hostAddress}`,
+        `selectHost ${host} -> ${targetAddress} https=${isHttps} via=${route?.transport ?? 'saved'} bridge=${typeof switchNative} from=${connectionStatus.hostAddress}`,
       );
       if (typeof switchNative === 'function') {
         switchNative.call(window.TailDeckNative, hostname, port, isHttps);
-        setShowHostSwitcher(false);
-        showToast(`Switching to ${hostname}`, 'ok');
+        showToast(`Switching to ${laptop?.name || hostname}${via}`, 'ok');
         return;
       }
       if (!isHttps && location.protocol === 'https:') {
         // A secure page cannot open ws:// (mixed content). Point the user at
         // the laptop's TLS port instead of failing silently.
-        setShowHostSwitcher(false);
-        showToast(`Use ${hostname}:8443 — plain http can't be reached from a secure page`, 'warn');
+        showToast(`Use ${hostname}:${DEFAULT_HTTPS_PORT} — plain http can't be reached from a secure page`, 'warn');
         return;
       }
     }
 
-    linuxClient.connect(host);
+    // A route can be stale (unplugged USB, old hotspot IP). Use the same
+    // short attempt chain as launch so a failed address hands off to the next
+    // one instead of holding the old laptop's active socket forever.
+    connectPreferred(candidates);
+    // Keep the identity address in settings: it is how the saved laptop is
+    // found on the next launch, even though this connect used a route.
     handleUpdateSettings({ tailscaleIp: host });
-    setShowHostSwitcher(false);
-    showToast(`Switched to ${host}`, 'ok');
+    showToast(`Switched to ${laptop?.name || targetAddress}${via}`, 'ok');
   };
 
-  // Trackpad pushed off an edge: hand control to whatever laptop sits there.
-  const handleTrackpadPassOff = (direction: 'left' | 'right' | 'top' | 'bottom') => {
-    const target = spatial.getHostByDirection(direction);
+  // Trackpad pushed off an edge: resolve the physical screen touching the edge
+  // of the screen under the pointer. Crossing a seam between two screens of the
+  // same laptop returns null, so the local compositor can move there normally.
+  //
+  // When the push happens during a press-and-hold drag, the source laptop still
+  // owns an XDND selection. Capture it before releasing the button, broker the
+  // bytes to the target, then switch the input socket.
+  const handleTrackpadPassOff = async (
+    direction: 'left' | 'right' | 'top' | 'bottom',
+    dragging = false,
+  ) => {
+    // Null means the laptop cannot say which output holds the pointer (Wayland,
+    // no xdotool); the layout resolver then falls back to any remote edge.
+    const pointer = activeHost ? await fetchPointer(activeHost) : null;
+    const target = spatial.resolvePassOff(direction, pointer);
     if (!target) return;
-    showToast(`Passing control to ${target.name}`, 'ok');
-    handleSelectHost(target.host);
+
+    const targetHost = target.host;
+    const targetName =
+      spatial.configs[targetHost]?.name ||
+      savedLaptops.find((l) => l.host === targetHost)?.name ||
+      targetHost;
+
+    if (dragging && activeHost) {
+      const sourceHost = activeHost;
+      const sourceIdentity = savedIdentityFor(
+        sourceHost,
+        savedLaptops,
+        connectionStatus.hostOsInfo,
+      );
+      const sourceName =
+        spatial.configs[sourceIdentity]?.name ||
+        savedLaptops.find((l) => l.host === sourceIdentity)?.name ||
+        sourceHost;
+      showToast(`Capturing drag from ${sourceName}…`, 'ok');
+      const payload = await captureDragPayload(sourceHost);
+      // End the local drag even when nothing was captured, so the source file
+      // manager does not keep a pointer grab after control moves.
+      linuxClient.sendClick('left', 'up');
+      if (payload.entries.length === 0) {
+        showToast(
+          payload.error
+            ? `Could not read the dragged item: ${payload.error}`
+            : 'No file was captured — hold a folder/file and push across again',
+          'warn',
+        );
+        handleSelectHost(targetHost);
+        return;
+      }
+      const targetAddress = bestAddressForSaved(targetHost, savedLaptops);
+      const result = await transferDragEntries(sourceHost, targetAddress, payload.entries);
+      if (result.ok) {
+        showToast(
+          `Copied ${result.files + result.folders} item${
+            result.files + result.folders === 1 ? '' : 's'
+          } to ${targetName}${result.destination ? ` (${result.destination})` : ''}`,
+          'ok',
+        );
+      } else {
+        showToast(
+          `Could not copy to ${targetName}: ${
+            result.error || `${result.skipped} item(s) skipped`
+          }`,
+          'warn',
+        );
+      }
+      handleSelectHost(targetHost);
+      return;
+    }
+
+    showToast(`Passing control to ${targetName}`, 'ok');
+    handleSelectHost(targetHost);
   };
 
   useEffect(() => {
@@ -583,7 +805,8 @@ export default function App() {
     }
     chain.index += 1;
     const host = chain.hosts[chain.index];
-    linuxClient.connect(host);
+    // A candidate that does not answer must hand off, not retry forever.
+    linuxClient.connect(host, 'auto', false);
     armConnectTimer(host);
   };
 
@@ -591,7 +814,7 @@ export default function App() {
     const list = hosts.map((h) => h.trim()).filter(Boolean);
     if (!list.length) return;
     connectChainRef.current = { hosts: list, index: 0 };
-    linuxClient.connect(list[0]);
+    linuxClient.connect(list[0], 'auto', false);
     armConnectTimer(list[0]);
   };
 
@@ -599,19 +822,28 @@ export default function App() {
     if (didAutoConnectRef.current) return;
     didAutoConnectRef.current = true;
     if (!settings.autoConnect) return;
+    const savedList = loadSavedLaptops();
     const saved =
-      loadSavedLaptops().find((l) => l.host === settings.tailscaleIp) ??
-      loadSavedLaptops()[0] ??
-      null;
+      findLaptopForAddress(settings.tailscaleIp, savedList) ?? savedList[0] ?? null;
     const hosts = autoconnectOrder({
       localHost: LOCAL_HOST,
       saved,
+      routes: saved ? routesForLaptop(saved).map((route) => route.host) : [],
       fallbackHost: settings.tailscaleIp,
       preferLocal: settings.preferLocal,
     });
     if (hosts.length) connectPreferred(hosts);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings.autoConnect, settings.tailscaleIp, settings.preferLocal]);
+
+  // Keep the proven route alive. This is separate from the candidate chain: a
+  // successful connection may come from the chain or from a manual choice, and
+  // it must always re-arm retries. The chain effect below can run in the same
+  // commit as the first connect, before its "connecting" status renders, so it
+  // must not be the only place that arms retries.
+  useEffect(() => {
+    if (connectionStatus.connected) linuxClient.setAutoReconnect(true);
+  }, [connectionStatus.connected]);
 
   // Let a failed attempt (or a hung one) hand off to the next candidate. A host
   // we never asked for means the user connected by hand, so the chain stands down.
@@ -624,6 +856,9 @@ export default function App() {
       return;
     }
     if (connectionStatus.connecting) return;
+    // Before the first connect has rendered its own status there is no host to
+    // judge; an empty address is not a failed candidate.
+    if (!connectionStatus.hostAddress) return;
     if (!chain.hosts.includes(connectionStatus.hostAddress)) {
       connectChainRef.current = null;
       clearConnectTimer();
@@ -742,19 +977,46 @@ export default function App() {
     if (!connectionStatus.connected || !connectionStatus.hostAddress) return;
     const info = connectionStatus.hostOsInfo;
     const httpsPort = info?.ports?.https ?? 8443;
-    const alt = (info?.addresses ?? [])
-      .filter((ip) => !isTailnetIp(ip))
-      .map((ip) => `${ip}:${httpsPort}`);
-    setSavedLaptops(
-      rememberLaptop(connectionStatus.hostAddress, info?.hostname ?? '', {
-        alt,
-        tailnet: info?.tailnet ?? null,
-      }),
+    const interfaces = info?.interfaces ?? [];
+    const alt = Array.from(
+      new Set([
+        ...interfaces
+          .map((link) => link?.address ?? '')
+          .filter((ip) => ip && !isTailnetIp(ip))
+          .map((ip) => `${ip}:${httpsPort}`),
+        ...(info?.addresses ?? [])
+          .filter((ip) => !isTailnetIp(ip))
+          .map((ip) => `${ip}:${httpsPort}`),
+      ]),
     );
+    const target = parseHostTarget(connectionStatus.hostAddress);
+    const connectedIp = target?.host ?? '';
+    const link = interfaces.find((entry) => entry.address === connectedIp);
+    const lastGood = target
+      ? {
+          host: connectionStatus.hostAddress,
+          port: target.port,
+          scheme: (isSecureTarget(target) ? 'https' : 'http') as 'http' | 'https',
+          at: Date.now(),
+        }
+      : undefined;
+    const next = rememberLaptop(connectionStatus.hostAddress, info?.hostname ?? '', {
+      alt,
+      tailnet: info?.tailnet ?? null,
+      id: info?.id,
+      certSha256: info?.certSha256 ?? null,
+      transport: link?.transport,
+      lastGood,
+    });
+    setSavedLaptops(next);
+    // Mirror the freshly-reached laptop into the shell's origin-independent roster.
+    const entry = next.find((l) => l.host === connectionStatus.hostAddress);
+    if (entry) pushShellLaptop(entry);
   }, [
     connectionStatus.connected,
     connectionStatus.hostAddress,
     connectionStatus.hostOsInfo?.hostname,
+    connectionStatus.hostOsInfo?.id,
   ]);
 
   const handleAppSwitch = (direction: 'prev' | 'next') => {
@@ -787,6 +1049,7 @@ export default function App() {
       className="flex flex-col h-[100dvh] w-full bg-slate-950 text-slate-100 font-sans select-none overflow-hidden touch-none relative"
       style={{ '--td-scale': effectiveButtonScale } as CSSProperties}
     >
+      {!nativeShell && <PwaUpdateWatcher onChange={onPwaState} />}
       {/* Main Remote Deck (Clean, Unmarked, Edge-to-Edge) */}
       <main className="flex-1 flex flex-col h-full w-full bg-slate-950">
         {/* Top: Unmarked Minimal Horizontal Scroll Wheel (left = Shift+Tab, right = Tab) */}
@@ -795,26 +1058,47 @@ export default function App() {
             hapticsEnabled={settings.hapticFeedback}
             soundEnabled={settings.soundFeedback}
             sensitivity={settings.wheelSensitivity}
+            host={connectionStatus.hostAddress}
+            devices={wheelDevices}
             onAppSwitch={handleAppSwitch}
+            onWindowSelect={handleWheelWindowSelect}
           />
         </div>
 
-        {/* Floating host switcher: shows live link state and how many saved
-            laptops are reachable. Opens the spatial layout canvas. */}
-        <button
-          type="button"
-          onClick={() => setShowHostSwitcher(true)}
-          title="Switch laptop / spatial layout"
-          className="fixed top-3 right-3 z-30 flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-slate-900/85 border border-slate-700 text-slate-200 backdrop-blur-sm shadow-lg shadow-black/40 active:scale-95 transition"
-        >
-          <span
-            className={`w-2 h-2 rounded-full ${connectionStatus.connected ? 'bg-emerald-400' : 'bg-slate-600'}`}
-          />
-          <Laptop className="w-4 h-4" />
-          {spatial.onlineCount > 0 && (
-            <span className="text-[10px] font-bold text-sky-300">{spatial.onlineCount}</span>
-          )}
-        </button>
+        {/* Device info is opened from the host identity at the uppermost left.
+            In the native shell that is the laptop icon + host name in the
+            Android status bar (it asks the page via __taildeckOpenDeviceInfo),
+            so the web chip would be a second, duplicate menu. The PWA has no
+            native bar, so it keeps the chip as its top-left host identity. */}
+        {!nativeShell && (
+          <button
+            type="button"
+            onClick={() => setShowDeviceInfo(true)}
+            title="Device info / spatial layout"
+            className="fixed top-3 left-3 z-30 flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-slate-900/85 border border-slate-700 text-slate-200 backdrop-blur-sm shadow-lg shadow-black/40 active:scale-95 transition"
+          >
+            <span
+              className={`w-2 h-2 shrink-0 rounded-full ${connectionStatus.connected ? 'bg-emerald-400' : 'bg-slate-600'}`}
+            />
+            <Laptop className="w-4 h-4 shrink-0" />
+            <span className="text-[11px] font-semibold truncate max-w-[88px]">
+              {activeHost ? activeDeviceName : 'No laptop'}
+            </span>
+            {Object.values(spatial.configs)
+              .sort((a, b) => Number(!!b.isOnline) - Number(!!a.isOnline))
+              .slice(0, 4)
+              .map((c) => (
+                <span
+                  key={c.host}
+                  className={`text-[10px] font-bold leading-none px-1 py-0.5 rounded ${
+                    c.isOnline ? 'text-sky-300 bg-sky-500/10' : 'text-slate-500 bg-slate-700/40'
+                  }`}
+                >
+                  {c.shortId}
+                </span>
+              ))}
+          </button>
+        )}
 
         {/* 3/5 Screen: Pure Unmarked Glass Trackpad */}
         <div className="flex-1 relative min-h-0 flex flex-col">
@@ -874,20 +1158,62 @@ export default function App() {
           handleSelectHost(host);
           setIsDrawerOpen(false);
         }}
+        spatialConfigs={spatial.configs}
+        monitors={spatial.monitors}
+        onOpenSpatial={() => {
+          setIsDrawerOpen(false);
+          setShowSpatial(true);
+        }}
+        onOpenDisplays={() => {
+          setIsDrawerOpen(false);
+          setShowDisplays(true);
+        }}
       />
 
-      {/* Spatial multi-host switcher: position laptops around the primary
-          screen so trackpad edge pass-off and one-tap control work. */}
-      <HostSwitcherModal
-        isOpen={showHostSwitcher}
-        onClose={() => setShowHostSwitcher(false)}
+      {/* Device info sheet (z-50) and the spatial canvas one layer below (z-40).
+          The sheet's link swaps to the canvas, so the two never fight for the
+          same surface. */}
+      <SpatialLayoutModal
+        isOpen={showSpatial}
+        onClose={() => setShowSpatial(false)}
         connectionStatus={connectionStatus}
         savedLaptops={savedLaptops}
         spatialConfigs={spatial.configs}
-        onUpdatePosition={spatial.updatePosition}
-        onUpdateRotation={spatial.updateRotation}
+        screenLayout={spatial.screenLayout}
+        monitors={spatial.monitors}
+        monitorsByHost={spatial.monitorsByHost}
         onUpdateShortId={spatial.updateShortId}
+        onUpdateScreenPosition={spatial.updateScreenPosition}
+        onAutoArrange={spatial.autoArrangeScreens}
         onSelectHost={handleSelectHost}
+        onOpenDisplays={() => setShowDisplays(true)}
+      />
+
+      <DeviceInfoModal
+        isOpen={showDeviceInfo}
+        onClose={() => setShowDeviceInfo(false)}
+        connectionStatus={connectionStatus}
+        savedLaptops={savedLaptops}
+        spatialConfigs={spatial.configs}
+        monitors={spatial.monitors}
+        neighbourMonitors={spatial.monitorsByHost}
+        onOpenSpatial={() => {
+          setShowDeviceInfo(false);
+          setShowSpatial(true);
+        }}
+        onOpenDisplays={() => setShowDisplays(true)}
+        onSelectHost={handleSelectHost}
+      />
+
+      {/* Per-screen xrandr editor, above both sheets (z-[60]). Only the
+          connected laptop is editable; a neighbour's desk is read-only. */}
+      <DisplayLayoutModal
+        isOpen={showDisplays}
+        onClose={() => setShowDisplays(false)}
+        host={activeHost}
+        monitors={spatial.monitors}
+        connected={connectionStatus.connected}
+        onApplied={() => void spatial.refreshMonitors()}
       />
 
       {/* Setup / QR: the whole way in, on one screen. Opens itself when the app
@@ -1090,4 +1416,26 @@ export default function App() {
       <DarkOut active={darkOut} onExit={() => setDarkOut(false)} />
     </div>
   );
+}
+
+/**
+ * The only place `useRegisterSW` is called. Mounted only for the browser copy;
+ * the native shell deliberately has no service worker, so the bundle it loads
+ * always matches the daemon's current webroot.
+ */
+function PwaUpdateWatcher({
+  onChange,
+}: {
+  onChange: (ready: boolean, update: ((reloadPage?: boolean) => Promise<void>) | null) => void;
+}) {
+  const {
+    needRefresh: [needRefresh],
+    updateServiceWorker,
+  } = useRegisterSW();
+
+  useEffect(() => {
+    onChange(needRefresh, updateServiceWorker);
+  }, [needRefresh, updateServiceWorker, onChange]);
+
+  return null;
 }

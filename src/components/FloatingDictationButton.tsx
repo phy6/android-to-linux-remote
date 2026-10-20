@@ -481,11 +481,11 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
           </>
         )}
 
-        {/* Direction hints: two curved wedges hugging the inside of the mic rim,
-            their arcs following the rim and their points aimed at the centre.
-            Up opens the commands, down opens the app shortcuts. Each is its own
-            target, so the rest of the mic still takes a press. They hide as soon
-            as a panel opens, so they never draw over its buttons. */}
+        {/* Direction hints: two thin arcs tracking just inside the mic rim, as
+            thick as the mic's own outline. Up opens the commands, down opens the
+            app shortcuts. Each is its own target, so the rest of the mic still
+            takes a press. They hide as soon as a panel opens, so they never draw
+            over its buttons. */}
         {!enterMode && !active && !openPanel && (
           <svg
             className="pointer-events-none absolute inset-0 z-10 h-full w-full"
@@ -493,7 +493,7 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
             aria-hidden="false"
           >
             <path
-              d="M 52 25 Q 52 11 41.604 3.093 A 50 50 0 0 1 62.396 3.093 Q 52 11 52 25 Z"
+              d="M 30.5 8 A 49 49 0 0 1 73.5 8"
               role="button"
               tabIndex={0}
               aria-label="Open commands"
@@ -501,10 +501,12 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
               onKeyDown={(e) => {
                 if (e.key === 'Enter' || e.key === ' ') openCommands();
               }}
-              className="pointer-events-auto cursor-pointer fill-sky-300 transition hover:fill-sky-200 active:fill-sky-100"
+              strokeWidth={1}
+              strokeLinecap="round"
+              className="pointer-events-auto cursor-pointer fill-none stroke-sky-300 transition hover:stroke-sky-200 active:stroke-sky-100"
             />
             <path
-              d="M 52 79 Q 52 93 41.604 100.907 A 50 50 0 0 0 62.396 100.907 Q 52 93 52 79 Z"
+              d="M 30.5 96 A 49 49 0 0 0 73.5 96"
               role="button"
               tabIndex={0}
               aria-label="Open app shortcuts"
@@ -512,7 +514,9 @@ export const FloatingDictationButton: React.FC<FloatingDictationButtonProps> = (
               onKeyDown={(e) => {
                 if (e.key === 'Enter' || e.key === ' ') openApps();
               }}
-              className="pointer-events-auto cursor-pointer fill-sky-300 transition hover:fill-sky-200 active:fill-sky-100"
+              strokeWidth={1}
+              strokeLinecap="round"
+              className="pointer-events-auto cursor-pointer fill-none stroke-sky-300 transition hover:stroke-sky-200 active:stroke-sky-100"
             />
           </svg>
         )}

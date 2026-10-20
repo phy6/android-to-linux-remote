@@ -6,7 +6,7 @@
 // absolute paths, '..' and dotfiles, so the phone only ever has to speak in
 // share-relative names like "notes/idea.txt".
 
-import { apiBase } from './scriptsClient';
+import { apiBase, apiFetch } from './http';
 
 export interface ShareEntry {
   name: string;
@@ -43,7 +43,7 @@ export async function listFiles(host: string, dir = ''): Promise<ShareListing | 
   if (!base) return null;
   try {
     const query = dir ? `?dir=${encodeURIComponent(dir)}` : '';
-    const res = await fetch(`${base}/api/files${query}`, { cache: 'no-store' });
+    const res = await apiFetch(`${base}/api/files${query}`, { cache: 'no-store' });
     if (!res.ok) return null;
     const data = await res.json();
     if (!data?.ok) return null;
@@ -63,7 +63,7 @@ export async function downloadFile(host: string, path: string): Promise<Blob | n
   const base = apiBase(host);
   if (!base) return null;
   try {
-    const res = await fetch(`${base}/api/files/download?path=${encodeURIComponent(path)}`, {
+    const res = await apiFetch(`${base}/api/files/download?path=${encodeURIComponent(path)}`, {
       cache: 'no-store',
     });
     if (!res.ok) return null;
@@ -81,7 +81,7 @@ export async function uploadFile(host: string, dir: string, file: File): Promise
   if (!name) return false;
   const target = [dir, name].filter(Boolean).join('/');
   try {
-    const res = await fetch(`${base}/api/files/upload?path=${encodeURIComponent(target)}`, {
+    const res = await apiFetch(`${base}/api/files/upload?path=${encodeURIComponent(target)}`, {
       method: 'POST',
       // text/plain keeps this a CORS "simple request" - no preflight needed.
       // The daemon writes the raw body and ignores the declared type.
@@ -121,7 +121,7 @@ export async function transferFileViaPhone(
   const base = apiBase(sourceHost);
   if (!base) return { ok: false, filename, bytesTransferred: 0, error: 'source unreachable' };
   try {
-    const res = await fetch(`${base}/api/files/download?path=${encodeURIComponent(filePath)}`, {
+    const res = await apiFetch(`${base}/api/files/download?path=${encodeURIComponent(filePath)}`, {
       cache: 'no-store',
     });
     if (!res.ok) return { ok: false, filename, bytesTransferred: 0, error: 'source file unavailable' };

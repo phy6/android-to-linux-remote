@@ -2,8 +2,9 @@ import React, { useState, useRef, useEffect } from 'react';
 import { ConnectionStatus, RemoteSettings, SessionType, MediaAction, NowPlaying } from '../types';
 import { linuxClient } from '../services/linuxClient';
 import { LOCAL_HOST, IS_LOCAL_MODE, describeRoute } from '../services/localMode';
-import { useSavedLaptops } from '../services/savedLaptops';
+import { useSavedLaptops, type SavedLaptop } from '../services/savedLaptops';
 import { decodePairing } from '../services/pairing';
+import { savedIdentityFor } from '../services/hostRoutes';
 import { useHaptics } from '../hooks/useHaptics';
 import { PWAInstallButton } from './PWAInstallButton';
 import { PairingCodeModal } from './PairingCodeModal';
@@ -65,7 +66,13 @@ import {
   ExternalLink,
   QrCode,
   ScanLine,
+  Laptop,
 } from 'lucide-react';
+import {
+  type Monitor as HostMonitor,
+  type HostSpatialConfig,
+  deriveShortId,
+} from '../services/spatialLayout';
 
 const ToggleRow: React.FC<{
   icon?: React.ReactNode;
@@ -106,7 +113,7 @@ const SectionTitle: React.FC<{ children: React.ReactNode }> = ({ children }) => 
   <h4 className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">{children}</h4>
 );
 
-export type SideMenuTab = 'tailscale' | 'keys' | 'media' | 'files' | 'settings' | 'help';
+export type SideMenuTab = 'tailscale' | 'keys' | 'media' | 'files' | 'devices' | 'settings' | 'help';
 
 const MediaNowCard: React.FC<{ now: NowPlaying | null }> = ({ now }) => {
   const title = now?.title ?? '';
@@ -169,6 +176,15 @@ interface SideMenuDrawerProps {
   onEnterDarkOut: () => void;
   appUpdateReady: boolean;
   onApplyAppUpdate: () => void;
+  /**
+   * Roster state for the Devices tab. The tab is a summary only; the canvas
+   * itself lives one layer below, opened through `onOpenSpatial`.
+   */
+  spatialConfigs?: Record<string, HostSpatialConfig>;
+  monitors?: HostMonitor[];
+  onOpenSpatial?: () => void;
+  /** Open the per-screen xrandr arrangement editor for this laptop. */
+  onOpenDisplays?: () => void;
 }
 
 export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
@@ -188,6 +204,10 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
   onEnterDarkOut,
   appUpdateReady,
   onApplyAppUpdate,
+  spatialConfigs,
+  monitors,
+  onOpenSpatial,
+  onOpenDisplays,
 }) => {
   const { triggerClick } = useHaptics(settings.hapticFeedback, settings.soundFeedback);
   const pressMedia = (action: MediaAction) => {
@@ -200,6 +220,10 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
     forget: forgetSavedLaptop,
   } = useSavedLaptops();
   const [tailscaleIp, setTailscaleIp] = useState(connectionStatus.hostAddress || '');
+  // Optional one-time code from the laptop's pairing screen. Needed when a
+  // phone connects to a daemon that has device auth for the first time, or
+  // when the camera cannot scan the QR (USB/headless testing).
+  const [pairCode, setPairCode] = useState('');
   const [alertPermission, setAlertPermission] = useState<AlertPermission>(notificationSupport());
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<SideMenuTab>('keys');
@@ -257,6 +281,61 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
 
   // Drag handle gesture refs
   const drawerRef = useRef<HTMLDivElement>(null);
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
+
+  // Move focus into the sheet when it opens and hand it back to the handle when
+  // it closes, so a keyboard or screen-reader user is never stranded in an
+  // off-screen panel.
+  useEffect(() => {
+    if (isOpen) {
+      // The handle unmounts as the drawer opens, so the browser may already
+      // have parked focus on <body>; saving that would make Escape drop the
+      // user at the top of the page.
+      const active = document.activeElement;
+      restoreFocusRef.current =
+        active instanceof HTMLElement && active !== document.body ? active : null;
+      drawerRef.current?.focus();
+      return;
+    }
+    const saved = restoreFocusRef.current;
+    restoreFocusRef.current = null;
+    const fallback = document.querySelector<HTMLElement>('button[aria-controls="taildeck-menu"]');
+    const target = saved && document.contains(saved) ? saved : fallback;
+    target?.focus();
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== 'Tab' || !drawerRef.current) return;
+      const focusable = Array.from(
+        drawerRef.current.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((el) => el.getClientRects().length > 0);
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const active = document.activeElement;
+      const atStart =
+        active === first || active === drawerRef.current || !drawerRef.current.contains(active);
+      if (event.shiftKey && atStart) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && active === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [isOpen, onClose]);
+
   const dragStartXRef = useRef<number | null>(null);
   const currentDragXRef = useRef<number>(0);
   const [dragProgress, setDragProgress] = useState<number | null>(null); // 0 to 1
@@ -271,7 +350,11 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
   const handleConnect = (e: React.FormEvent) => {
     e.preventDefault();
     triggerClick();
+    // A code supplied here is spent on this connection exactly like a scanned
+    // one; a blank field clears any stale pending code.
+    linuxClient.setPendingPairCode(pairCode.trim() || undefined);
     connectToHost(tailscaleIp);
+    setPairCode('');
   };
 
   const handleDisconnect = () => {
@@ -286,6 +369,9 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
     if (!payload) return false;
     triggerClick();
     setPairMode(null);
+    // A v2 code is exchanged for a per-phone device token on the first frame.
+    // A v1 code still connects, but the daemon will ask for a fresh pairing.
+    linuxClient.setPendingPairCode(payload.c);
     connectToHost(payload.h);
     onClose();
     return true;
@@ -399,28 +485,60 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
     };
   }, [isOpen, onOpen, onClose, drawerSide]);
 
+  // The Devices tab is a roster summary: active laptop first, then online
+  // machines, then the rest. The spatial canvas lives one layer down.
+  // A connected socket can use a route that differs from the saved identity.
+  // The roster is keyed by identity so the active laptop is not duplicated.
+  const activeHost = savedIdentityFor(
+    connectionStatus.hostAddress,
+    savedLaptops,
+    connectionStatus.hostOsInfo,
+  );
+  const deviceEntries: SavedLaptop[] = [...savedLaptops];
+  if (activeHost && !deviceEntries.some((l) => l.host === activeHost)) {
+    deviceEntries.unshift({
+      host: activeHost,
+      name: connectionStatus.hostOsInfo?.hostname || activeHost,
+      last: Date.now(),
+    });
+  }
+  const isOnline = (laptop: SavedLaptop) =>
+    laptop.host === activeHost
+      ? connectionStatus.connected
+      : !!spatialConfigs?.[laptop.host]?.isOnline;
+  deviceEntries.sort((a, b) => {
+    if (a.host === activeHost) return -1;
+    if (b.host === activeHost) return 1;
+    return Number(isOnline(b)) - Number(isOnline(a)) || (b.last ?? 0) - (a.last ?? 0);
+  });
+  const onlineCount = deviceEntries.filter(isOnline).length;
+
   return (
     <>
       {/* Edge Handle Tab (visible on the drawer's side for convenient pull/tap) */}
       {!isOpen && (
-        <div
+        <button
+          type="button"
           onClick={() => {
             triggerClick();
             onOpen();
           }}
-          className={`fixed top-1/2 -translate-y-1/2 z-30 flex items-center justify-center w-5 h-16 bg-slate-900/90 shadow-lg text-slate-400 hover:text-white cursor-pointer active:scale-95 transition-all select-none touch-none backdrop-blur-md opacity-40 hover:opacity-100 ${
+          aria-label="Open menu"
+          aria-expanded={false}
+          aria-controls="taildeck-menu"
+          title="Drag or tap to open menu & Tailscale settings"
+          className={`fixed top-1/2 -translate-y-1/2 z-30 flex items-center justify-center w-5 h-16 bg-slate-900/90 shadow-lg text-sky-400 hover:text-sky-200 cursor-pointer active:scale-95 transition-all select-none touch-none backdrop-blur-md opacity-40 hover:opacity-100 ${
             drawerSide === 'right'
               ? 'right-0 rounded-l-xl border-l border-y border-slate-700/80'
               : 'left-0 rounded-r-xl border-r border-y border-slate-700/80'
           }`}
-          title="Drag or tap to open menu & Tailscale settings"
         >
           {drawerSide === 'right' ? (
             <ChevronLeft className="w-3.5 h-3.5" />
           ) : (
             <ChevronRight className="w-3.5 h-3.5" />
           )}
-        </div>
+        </button>
       )}
 
       {/* Backdrop */}
@@ -434,6 +552,13 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
       {/* Slide-in Menu Drawer */}
       <div
         ref={drawerRef}
+        id="taildeck-menu"
+        role={isOpen ? 'dialog' : undefined}
+        aria-modal={isOpen ? true : undefined}
+        aria-label="TailDeck menu"
+        aria-hidden={isOpen ? undefined : true}
+        inert={!isOpen}
+        tabIndex={-1}
         className={`fixed inset-y-0 z-50 w-full max-w-sm bg-slate-950 border-slate-800 shadow-2xl flex flex-col transition-transform duration-300 ease-out select-none ${
           drawerSide === 'right'
             ? 'right-0 border-l translate-x-full'
@@ -453,7 +578,9 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
           </div>
 
           <button
+            type="button"
             onClick={onClose}
+            aria-label="Close menu"
             className="p-1.5 rounded-xl bg-slate-900 text-slate-400 hover:text-white"
           >
             <X className="w-5 h-5" />
@@ -462,21 +589,52 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
 
         {/* Navigation Tabs: full width and tall, with the icon above the
             label, so they can be hit by feel without reading them. */}
-        <div className="flex border-b border-slate-800 bg-slate-900/40">
+        <div
+          role="tablist"
+          aria-label="Menu sections"
+          className="flex border-b border-slate-800 bg-slate-900/40 overflow-x-auto"
+          onKeyDown={(event) => {
+            if (event.key === 'Home' || event.key === 'End') {
+              event.preventDefault();
+              const target = event.key === 'Home' ? 'keys' : 'help';
+              setActiveTab(target);
+              document.getElementById(`taildeck-tab-${target}`)?.focus();
+              return;
+            }
+            if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+            const tabs = Array.from(
+              event.currentTarget.querySelectorAll<HTMLElement>('[role="tab"]'),
+            );
+            const index = tabs.indexOf(document.activeElement as HTMLElement);
+            if (index < 0) return;
+            event.preventDefault();
+            const delta = event.key === 'ArrowRight' ? 1 : -1;
+            const next = tabs[(index + delta + tabs.length) % tabs.length];
+            next.focus();
+            next.click();
+          }}
+        >
           {(
             [
               { id: 'keys', label: 'Keyboard', Icon: Keyboard },
               { id: 'media', label: 'Media', Icon: Music },
               { id: 'files', label: 'Files', Icon: Folder },
               { id: 'tailscale', label: 'Connection', Icon: Wifi },
+              { id: 'devices', label: 'Devices', Icon: Laptop },
               { id: 'settings', label: 'Settings', Icon: Sliders },
               { id: 'help', label: 'Help', Icon: HelpCircle },
             ] as const
           ).map(({ id, label, Icon }) => (
             <button
               key={id}
+              type="button"
+              role="tab"
+              id={`taildeck-tab-${id}`}
+              aria-selected={activeTab === id}
+              aria-controls={`taildeck-panel-${id}`}
+              tabIndex={activeTab === id ? 0 : -1}
               onClick={() => setActiveTab(id)}
-              className={`flex-1 flex flex-col items-center justify-center gap-1 py-3.5 font-medium transition-colors border-b-2 ${
+              className={`shrink-0 flex flex-col items-center justify-center gap-1 px-3 py-3.5 font-medium transition-colors border-b-2 ${
                 activeTab === id
                   ? 'border-sky-400 text-sky-400 bg-sky-500/5'
                   : 'border-transparent text-slate-400 hover:text-slate-200'
@@ -489,7 +647,12 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
         </div>
 
         {/* Drawer Body Content */}
-        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        <div
+          role="tabpanel"
+          id={`taildeck-panel-${activeTab}`}
+          aria-labelledby={`taildeck-tab-${activeTab}`}
+          className="flex-1 overflow-y-auto p-4 space-y-4"
+        >
           {/* TAB 1: TAILSCALE CONNECTION */}
           {activeTab === 'tailscale' && (
             <div className="space-y-4 text-xs">
@@ -557,7 +720,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                   <div className="space-y-1.5">
                     {savedLaptops.map((laptop) => {
                       const isCurrent =
-                        connectionStatus.hostAddress === laptop.host && connectionStatus.connected;
+                        activeHost === laptop.host && connectionStatus.connected;
                       return (
                         <div
                           key={laptop.host}
@@ -714,6 +877,27 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
                     name like <code className="text-sky-400">my-laptop.tailnet.ts.net</code>.
                   </span>
                 </div>
+
+                {!connectionStatus.connected && (
+                  <div>
+                    <label className="text-xs font-semibold text-slate-300 block mb-1">
+                      Pairing code (optional):
+                    </label>
+                    <input
+                      type="text"
+                      value={pairCode}
+                      onChange={(e) => setPairCode(e.target.value)}
+                      placeholder="Code shown on the laptop"
+                      autoCapitalize="none"
+                      autoCorrect="off"
+                      spellCheck={false}
+                      className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-3.5 py-2.5 text-sm text-white font-mono placeholder-slate-600 focus:outline-none focus:border-emerald-500"
+                    />
+                    <span className="text-[10px] text-slate-500 mt-1 block">
+                      Needed once after a daemon update, or when a camera cannot scan the QR.
+                    </span>
+                  </div>
+                )}
 
                 {LOCAL_HOST && (
                   <button
@@ -908,10 +1092,12 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
               <div className="space-y-1">
                 <input
                   ref={quickInputRef}
+                  id="taildeck-quick-input"
                   type="text"
                   value={quickInput}
                   onChange={handleQuickInput}
                   onKeyDown={handleQuickKeyDown}
+                  aria-label="Type to send to the laptop"
                   autoComplete="off"
                   autoCorrect="off"
                   autoCapitalize="off"
@@ -1155,9 +1341,133 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
             <FilesTab
               host={connectionStatus.hostAddress}
               otherHosts={savedLaptops
-                .filter((l) => l.host !== connectionStatus.hostAddress)
+                .filter((l) => l.host !== activeHost)
                 .map((l) => ({ host: l.host, name: l.name }))}
             />
+          )}
+
+          {/* TAB: DEVICES — a roster summary. The spatial canvas is its own
+              layer (opened from here or from the deck's device info sheet),
+              so this tab stays readable instead of embedding the full editor. */}
+          {activeTab === 'devices' && (
+            <div className="space-y-4 text-xs">
+              <div className="p-3.5 rounded-2xl bg-slate-900 border border-slate-800 space-y-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <span className="text-xs font-semibold text-slate-200 block">Known laptops</span>
+                    <p className="text-[11px] text-slate-500 mt-0.5">
+                      {onlineCount} of {deviceEntries.length} online
+                      {monitors && monitors.length > 0
+                        ? ` · ${monitors.length} screen${monitors.length === 1 ? '' : 's'} on this laptop`
+                        : ''}
+                    </p>
+                  </div>
+                  <div className="shrink-0 flex flex-col gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        triggerClick();
+                        onOpenSpatial?.();
+                      }}
+                      className="flex items-center justify-center gap-1 px-3 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-[11px] font-semibold active:scale-95 transition"
+                    >
+                      <Layers className="w-3.5 h-3.5" />
+                      <span>Spatial</span>
+                      <ChevronRight className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        triggerClick();
+                        onOpenDisplays?.();
+                      }}
+                      className="flex items-center justify-center gap-1 px-3 py-2 rounded-xl bg-slate-950 border border-slate-700 hover:border-sky-500 text-slate-200 text-[11px] font-semibold active:scale-95 transition"
+                    >
+                      <Monitor className="w-3.5 h-3.5 text-sky-300" />
+                      <span>Arrange screens</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  {deviceEntries.map((laptop) => {
+                    const cfg = spatialConfigs?.[laptop.host];
+                    const online = isOnline(laptop);
+                    const active = laptop.host === activeHost;
+                    return (
+                      <button
+                        key={laptop.host}
+                        type="button"
+                        disabled={active}
+                        onClick={() => {
+                          triggerClick();
+                          connectToHost(laptop.host);
+                          onClose();
+                        }}
+                        className={`w-full flex items-center gap-3 p-2.5 rounded-xl border text-left transition ${
+                          active
+                            ? 'bg-sky-500/10 border-sky-500/40'
+                            : 'bg-slate-950 border-slate-800 hover:border-slate-700 active:scale-[0.99]'
+                        }`}
+                      >
+                        <span
+                          className={`w-9 h-9 rounded-xl flex items-center justify-center text-[10px] font-bold shrink-0 border ${
+                            active
+                              ? 'bg-sky-500/15 border-sky-500/30 text-sky-300'
+                              : 'bg-slate-900 border-slate-800 text-slate-300'
+                          }`}
+                        >
+                          {cfg?.shortId || deriveShortId(laptop.name, laptop.host)}
+                        </span>
+                        <span className="min-w-0 flex-1">
+                          <span className="flex items-center gap-1.5">
+                            <span className="text-xs font-semibold text-slate-100 truncate">
+                              {laptop.name || laptop.host}
+                            </span>
+                            {active && (
+                              <span className="text-[9px] font-bold uppercase tracking-wide text-sky-300 bg-sky-500/15 border border-sky-500/30 rounded px-1 py-0.5">
+                                Active
+                              </span>
+                            )}
+                          </span>
+                          <span className="block text-[10px] font-mono text-slate-500 truncate">
+                            {laptop.host}
+                          </span>
+                        </span>
+                        <span className="flex flex-col items-end gap-0.5 shrink-0">
+                          <span className="flex items-center gap-1 text-[10px]">
+                            <span
+                              className={`w-1.5 h-1.5 rounded-full ${
+                                online ? 'bg-emerald-400' : 'bg-slate-600'
+                              }`}
+                            />
+                            <span className={online ? 'text-emerald-300' : 'text-slate-500'}>
+                              {online ? 'Online' : 'Offline'}
+                            </span>
+                          </span>
+                          <span className="text-[9px] text-slate-500">
+                            {active
+                              ? 'Active input'
+                              : cfg?.linked
+                                ? cfg.latencyMs != null
+                                  ? `Linked · ${Math.round(cfg.latencyMs)} ms`
+                                  : 'Linked · standby'
+                                : cfg?.isOnline && cfg.latencyMs != null
+                                  ? `${Math.round(cfg.latencyMs)} ms`
+                                  : 'Saved laptop'}
+                          </span>
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <p className="text-[11px] text-slate-500 px-1">
+                Each screen is laid out independently in the spatial layer. Open it from the
+                button above or by tapping the laptop icon on the deck.
+              </p>
+            </div>
           )}
 
           {/* TAB 3: SETTINGS */}
@@ -1573,6 +1883,7 @@ export const SideMenuDrawer: React.FC<SideMenuDrawerProps> = ({
           <PWAInstallButton />
           <button
             onClick={onClose}
+            aria-label="Close menu"
             className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium transition"
           >
             Close

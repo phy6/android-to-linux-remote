@@ -31,9 +31,12 @@ export interface PairingRoute {
 
 export interface PairingPayload {
   t: 'taildeck';
-  v: 1;
+  /** 1 = address only (legacy), 2 = address + one-time pairing code. */
+  v: 1 | 2;
   h: string;
   n?: string;
+  /** One-time code the daemon exchanges for a per-phone device token. */
+  c?: string;
 }
 
 /**
@@ -81,24 +84,62 @@ export function pairingRoutes(status: ConnectionStatus, originHost?: string): Pa
   }
 
   const httpsPort = info?.ports?.https ?? 8443;
-  for (const ip of info?.addresses ?? []) {
-    if (isTailnetIp(ip)) continue;
-    add(
-      `lan-${ip}`,
-      'Same Wi-Fi / hotspot',
-      'Self-signed certificate: the phone accepts the warning once.',
-      `${ip}:${httpsPort}`,
-    );
+  const transportLabel: Record<string, string> = {
+    usb: 'USB tether',
+    bluetooth: 'Bluetooth tether',
+    wifi: 'Same Wi-Fi / hotspot',
+    ethernet: 'Same network (cable)',
+    network: 'Same network',
+  };
+  const transportHint: Record<string, string> = {
+    usb: 'Wired, charging, lowest latency.',
+    bluetooth: 'Low power; good for typing and dictation.',
+    wifi: 'Self-signed certificate on the hotspot.',
+    ethernet: 'Wired LAN.',
+    network: 'Direct link.',
+  };
+
+  // Prefer the daemon's per-interface view: it already excludes container
+  // bridges and tunnels, so every entry here is a route a phone might use.
+  if (info?.interfaces?.length) {
+    for (const link of info.interfaces) {
+      if (!link?.address || isTailnetIp(link.address)) continue;
+      const kind = link.transport || 'network';
+      add(
+        `${kind}-${link.address}`,
+        transportLabel[kind] ?? transportLabel.network,
+        transportHint[kind] ?? transportHint.network,
+        `${link.address}:${httpsPort}`,
+      );
+    }
+  } else {
+    for (const ip of info?.addresses ?? []) {
+      if (isTailnetIp(ip)) continue;
+      add(
+        `lan-${ip}`,
+        'Same Wi-Fi / hotspot',
+        'Self-signed certificate: the phone accepts the warning once.',
+        `${ip}:${httpsPort}`,
+      );
+    }
   }
 
-  // By name, so it keeps working when the laptop's ip moves under it.
-  const byName = mdnsHost(info?.hostname, httpsPort);
-  if (byName) {
+  // Names are only useful when the certificate covers them; advertising a
+  // name that is absent from the SAN is what made `<hostname>.local` fail.
+  const certNames = new Set((info?.certNames ?? []).map((name) => name.toLowerCase()));
+  const candidates = new Set<string>();
+  const byHost = mdnsHost(info?.hostname, httpsPort);
+  if (byHost) candidates.add(byHost);
+  const taildeckName = `taildeck.local:${httpsPort}`;
+  candidates.add(taildeckName);
+  for (const candidate of candidates) {
+    const bare = candidate.replace(/:\d+$/, '').toLowerCase();
+    if (!certNames.has(bare)) continue;
     add(
-      'lan-name',
+      `lan-name-${bare}`,
       'Same Wi-Fi, by name',
-      'Follows the laptop when its ip changes (needs .local / mDNS resolution).',
-      byName,
+      'Follows the laptop when its address changes.',
+      candidate,
     );
   }
 
@@ -120,11 +161,23 @@ export function pairingRoutes(status: ConnectionStatus, originHost?: string): Pa
  */
 export function autoconnectOrder(opts: {
   localHost?: string;
-  saved?: { host?: string; alt?: string[]; tailnet?: string | null; name?: string } | null;
+  saved?: {
+    host?: string;
+    alt?: string[];
+    tailnet?: string | null;
+    name?: string;
+    lastGood?: { host?: string };
+  } | null;
   fallbackHost?: string;
   preferLocal: boolean;
   /** HTTPS port for the remembered `.local` name; defaults to 8443. */
   httpsPort?: number;
+  /**
+   * Pre-resolved addresses from `hostRoutes.routesForLaptop`, already ordered
+   * most-direct-first and safe for the page's scheme. When present they lead
+   * the list, so USB/LAN beats a stale last-good tailnet route.
+   */
+  routes?: string[];
 }): string[] {
   const out: string[] = [];
   const add = (h?: string | null) => {
@@ -133,17 +186,30 @@ export function autoconnectOrder(opts: {
   };
   add(opts.localHost);
   if (opts.preferLocal) {
+    // Resolved routes are already most-direct-first (USB, Ethernet, Wi-Fi,
+    // mDNS, tailnet) and have had mixed content removed.
+    (opts.routes ?? []).forEach(add);
+    // The route that actually answered last is the strongest signal; the
+    // alternates and the stable name follow.
+    add(opts.saved?.lastGood?.host);
     (opts.saved?.alt ?? []).forEach(add);
     add(mdnsHost(opts.saved?.name, opts.httpsPort ?? 8443));
+    add(opts.saved?.tailnet);
+  } else {
+    // The tailnet-first preference is deliberate (real certificate, works
+    // away from the hotspot); direct routes are the fallback.
+    add(opts.saved?.tailnet);
+    (opts.routes ?? []).forEach(add);
   }
-  add(opts.saved?.tailnet);
   add(opts.fallbackHost);
   add(opts.saved?.host);
   return out;
 }
 
-export function encodePairing(host: string, name?: string): string {
-  const payload: PairingPayload = { t: 'taildeck', v: 1, h: host };
+export function encodePairing(host: string, name?: string, code?: string): string {
+  const payload: PairingPayload = code
+    ? { t: 'taildeck', v: 2, h: host, c: code }
+    : { t: 'taildeck', v: 1, h: host };
   if (name) payload.n = name;
   return JSON.stringify(payload);
 }
@@ -161,11 +227,13 @@ export function decodePairing(raw: string): PairingPayload | null {
       const obj = JSON.parse(text) as Record<string, unknown>;
       const host = typeof obj.h === 'string' ? obj.h.trim() : '';
       if (obj.t === 'taildeck' && host) {
+        const code = typeof obj.c === 'string' ? obj.c.trim() : '';
         return {
           t: 'taildeck',
-          v: 1,
+          v: code ? 2 : 1,
           h: host,
           n: typeof obj.n === 'string' ? obj.n : undefined,
+          c: code || undefined,
         };
       }
     } catch {

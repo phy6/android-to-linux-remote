@@ -3,6 +3,7 @@ import QRCode from 'qrcode';
 import { X, Copy, Check, Smartphone, Wifi } from 'lucide-react';
 import { ConnectionStatus } from '../types';
 import { PairingRoute, encodePairing, pairingRoutes } from '../services/pairing';
+import { apiBase, apiFetch } from '../services/http';
 
 interface PairingCodeModalProps {
   isOpen: boolean;
@@ -26,6 +27,8 @@ export const PairingCodeModal: React.FC<PairingCodeModalProps> = ({
   const [routeId, setRouteId] = useState('');
   const [dataUrl, setDataUrl] = useState('');
   const [copied, setCopied] = useState(false);
+  const [pairCode, setPairCode] = useState('');
+  const [codeError, setCodeError] = useState('');
 
   const activeRoute: PairingRoute | undefined =
     routes.find((r) => r.id === routeId) ?? routes[0];
@@ -36,10 +39,45 @@ export const PairingCodeModal: React.FC<PairingCodeModalProps> = ({
     }
   }, [routes, routeId]);
 
+  // Mint a one-time code for the QR. It is spent when the phone pairs, so it is
+  // refreshed every time the sheet opens. A connected laptop (or localhost)
+  // can mint one; a first-run page that has not paired yet falls back to a v1
+  // code and the hint below explains how to get a code.
   useEffect(() => {
     if (!isOpen || !activeRoute) return;
     let cancelled = false;
-    const text = encodePairing(activeRoute.host, hostname);
+    setPairCode('');
+    setCodeError('');
+    const base = apiBase(activeRoute.host);
+    if (!base) return;
+    apiFetch(`${base}/api/pair/new`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: 'phone' }),
+    })
+      .then(async (res) => {
+        const data = await res.json().catch(() => ({}));
+        if (cancelled) return;
+        if (res.ok && typeof data?.code === 'string' && data.code) {
+          setPairCode(data.code);
+        } else {
+          setCodeError('Open this page on the laptop itself (localhost) once to mint a code.');
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setCodeError('Could not reach the daemon to mint a pairing code.');
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, activeRoute?.host]);
+
+  useEffect(() => {
+    if (!isOpen || !activeRoute) return;
+    let cancelled = false;
+    const text = encodePairing(activeRoute.host, hostname, pairCode || undefined);
     QRCode.toDataURL(text, { margin: 1, width: 260, errorCorrectionLevel: 'M' })
       .then((url) => {
         if (!cancelled) setDataUrl(url);
@@ -50,7 +88,7 @@ export const PairingCodeModal: React.FC<PairingCodeModalProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [isOpen, activeRoute, hostname]);
+  }, [isOpen, activeRoute, hostname, pairCode]);
 
   useEffect(() => {
     setCopied(false);
@@ -139,9 +177,13 @@ export const PairingCodeModal: React.FC<PairingCodeModalProps> = ({
                 <span className="font-mono">{activeRoute?.host}</span>
               </button>
 
+              {codeError && (
+                <p className="text-[11px] text-amber-400/90 text-center leading-snug">{codeError}</p>
+              )}
+
               <p className="text-[11px] text-slate-500 text-center leading-snug">
                 In the app, open <span className="text-slate-300">Connection → Scan a code</span>, then point the
-                phone at this screen.
+                phone at this screen. This code works once and expires in five minutes.
               </p>
             </div>
           </div>

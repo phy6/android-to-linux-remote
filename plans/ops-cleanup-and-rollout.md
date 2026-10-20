@@ -56,6 +56,22 @@ Replicate the dictation service so the other laptop behaves identically:
 7. Verify `heard:` lines in `~/.local/share/vosk-dictation/log` and that the phone's live
    preview + final text work against this laptop.
 
+## 5. Deploy the device-auth daemon (breaking change)
+
+The daemon now requires a per-phone token on the websocket and every `/api/*` call;
+see [`security-hardening.md`](security-hardening.md). Roll it out **with** the web build:
+
+1. Apply the web build and the new `taildeck-daemon.py`, then restart
+   `systemctl --user restart taildeck.service`.
+2. Open `http://localhost:8080` **on the laptop** once. Loopback is the only
+   unauthenticated path (and a foreign `Origin` is rejected even there).
+3. Menu → Connection → Pair a phone; scan the `v:2` QR on each phone. Old phones
+   will get close code 4401 until re-paired.
+4. Confirm `~/.config/taildeck/devices.json` exists with mode 0600 and contains
+   hashes only.
+5. Revoke a lost phone with `DELETE /api/devices/<id>` (list via `GET /api/devices`);
+   a UI for this is still open.
+
 ## Files
 
 - `src/services/audioCapture.ts`, `src/services/linuxClient.ts`, `public/taildeck-daemon.py`,

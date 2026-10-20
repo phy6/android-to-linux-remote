@@ -6,7 +6,7 @@
 // written at build time. The phone compares that against its own build stamp and
 // against the daemon's /api/version to decide what, if anything, is out of date.
 
-import { apiBase } from './scriptsClient';
+import { apiBase, apiFetch } from './http';
 
 export const RELEASE_URL = 'https://phy6.github.io/android-to-linux-remote';
 export const APP_VERSION = __APP_VERSION__;
@@ -80,7 +80,7 @@ export async function fetchLaptopVersion(host: string): Promise<LaptopVersion | 
   const base = apiBase(host);
   if (!base) return null;
   try {
-    const res = await fetch(`${base}/api/version`, { cache: 'no-store' });
+    const res = await apiFetch(`${base}/api/version`, { cache: 'no-store' });
     if (!res.ok) return null;
     return (await res.json()) as LaptopVersion;
   } catch {
@@ -106,7 +106,7 @@ export async function updateLaptop(
   const base = apiBase(host);
   if (!base) return { ok: false, error: 'not connected to a laptop' };
   try {
-    const res = await fetch(`${base}/api/update`, {
+    const res = await apiFetch(`${base}/api/update`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(opts),

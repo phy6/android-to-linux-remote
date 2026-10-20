@@ -9,6 +9,7 @@ import sys
 import os
 import io
 import json
+import difflib
 import wave
 import time
 import socket
@@ -31,7 +32,7 @@ import re
 import pwd
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-DAEMON_VERSION = "1.9.0"
+DAEMON_VERSION = "1.11.0"
 
 PORT = int(os.environ.get("TAILDECK_PORT", 8080))
 DICTATE_HOST = os.environ.get("TAILDECK_DICTATE_HOST", "127.0.0.1")
@@ -857,6 +858,35 @@ PAM_KEY_FILE = os.environ.get(
 )
 AUTH_GRANTS = {}
 
+# --- Device auth ------------------------------------------------------------
+#
+# The websocket and every mutating API used to be open to anyone who could
+# reach the port. A phone now holds a device token, issued once from a pairing
+# code and stored only as a hash here. Local (loopback) requests are exempt so
+# the laptop can still pair itself from http://localhost:<PORT>; a proxied
+# request is never local (X-Forwarded-For present). See plans/security-hardening.md.
+DEVICES_FILE = os.environ.get(
+    "TAILDECK_DEVICES_FILE",
+    os.path.join(os.path.expanduser("~"), ".config", "taildeck", "devices.json"),
+)
+DEVICE_TOKEN_ENV = os.environ.get("TAILDECK_DEVICE_TOKEN", "")
+ALLOWED_ORIGINS_ENV = [
+    item.strip().rstrip("/")
+    for item in os.environ.get("TAILDECK_ALLOWED_ORIGINS", "").split(",")
+    if item.strip()
+]
+PAIRING_TTL = int(os.environ.get("TAILDECK_PAIRING_TTL", 300))
+PAIRING_PENDING = {}
+PAIRING_LOCK = threading.Lock()
+# Read-modify-write of the device store happens from request and websocket
+# threads; without this a lastSeen write could clobber a concurrent revoke.
+DEVICES_LOCK = threading.Lock()
+_LAST_SEEN_SAVED = {}
+ALLOWED_ORIGINS_CACHE = {"at": 0.0, "items": set()}
+# _http has no request object, and a socket cannot carry attributes, so the
+# current request's Origin rides on the handler thread.
+REQUEST_ORIGIN = threading.local()
+
 MIME_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
@@ -892,17 +922,23 @@ MIME_TYPES = {
 
 
 def _http(conn, status, ctype, body, cache="no-cache", extra=""):
+    # The app may be served from GitHub Pages while the daemon sits on the
+    # laptop, so some responses are cross-origin. Echo only origins that belong
+    # to this app; a wildcard here would let any visited page call the daemon.
+    origin = getattr(REQUEST_ORIGIN, "origin", "")
+    cors = "Vary: Origin\r\n"
+    if origin and _origin_allowed(origin):
+        cors += (
+            f"Access-Control-Allow-Origin: {origin}\r\n"
+            "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Authorization, Content-Type\r\n"
+        )
     head = (
         f"HTTP/1.1 {status}\r\n"
         f"Content-Type: {ctype}\r\n"
         f"Content-Length: {len(body)}\r\n"
         f"Cache-Control: {cache}\r\n"
-        # The app may be served from GitHub Pages while the daemon sits on the
-        # laptop, so the scripts API is cross-origin. These are read-mostly text
-        # endpoints with no credentials; a wildcard origin is deliberate.
-        "Access-Control-Allow-Origin: *\r\n"
-        "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n"
-        "Access-Control-Allow-Headers: Content-Type\r\n"
+        f"{cors}"
         f"{extra}"
         "Connection: close\r\n\r\n"
     )
@@ -1065,6 +1101,7 @@ APP_DIRS = [
     "/usr/share/applications",
     "/var/lib/flatpak/exports/share/applications",
     os.path.expanduser("~/.local/share/flatpak/exports/share/applications"),
+    "/var/lib/snapd/desktop/applications",
 ]
 
 
@@ -1089,6 +1126,24 @@ def _desktop_entry(path):
     except Exception:
         return None
     return fields or None
+
+
+def _exec_basename(exec_line):
+    """The program name in an Exec line, used to match WM_CLASS values.
+
+    Desktop entries often launch a differently-named binary than their id
+    (org.gnome.TextEditor -> gnome-text-editor), so keep this alias for window
+    icon matching. Returns "" for an unusable line.
+    """
+    try:
+        argv = shlex.split(_strip_exec_field_codes(exec_line or ""))
+    except Exception:
+        argv = (exec_line or "").split()
+    for part in argv:
+        if not part or "=" in part:
+            continue
+        return os.path.basename(part)
+    return ""
 
 
 def _list_apps():
@@ -1126,6 +1181,8 @@ def _list_apps():
                 "icon": icon,
                 "iconPath": resolved or "",
                 "iconVersion": _icon_version(resolved),
+                "wmClass": (fields.get("StartupWMClass") or "").strip(),
+                "execName": _exec_basename(fields.get("Exec", "")),
                 "path": os.path.join(directory, name),
             }
     return sorted(found.values(), key=lambda a: a["name"].lower())
@@ -1323,6 +1380,248 @@ def _focus_window(match):
     return (rc == 0), ("ok" if rc == 0 else err)
 
 
+# --- Window list: the real Alt+Tab entries -----------------------------------
+#
+# X11 exposes the window manager's stacking list. Reversed, top-most first, it
+# is the same order xfwm4/Openbox/etc. cycle with Alt+Tab (verified against the
+# xfwm4 switcher overlay on the HP). Filtering out docks, panels, desktops and
+# notifications leaves the entries a user expects. Wayland compositors do not
+# expose an equivalent standard list, so the phone falls back to app_switch.
+
+_WINDOWS_CACHE = {"at": 0.0, "data": None}
+_WINDOWS_CACHE_LOCK = threading.Lock()
+_WINDOW_APP_CACHE = {"at": 0.0, "index": {}}
+_WINDOW_APP_CACHE_LOCK = threading.Lock()
+_WINDOW_TYPES_SKIP = (
+    "DOCK", "DESKTOP", "SPLASH", "NOTIFICATION", "TOOLTIP",
+    "MENU", "DROPDOWN", "POPUP", "COMBO", "TOOLBAR",
+)
+
+
+def _parse_xprop_lines(out):
+    """Parse xprop output, which uses `=` for strings and `:` for id lists."""
+    props = {}
+    for line in out.splitlines():
+        separator = "=" if "=" in line else (":" if ":" in line else "")
+        if not separator:
+            continue
+        key, _, value = line.partition(separator)
+        atom = key.split("(", 1)[0].strip()
+        value = value.strip()
+        if not atom or value == "not found.":
+            continue
+        props[atom] = value
+    return props
+
+
+def _xprop_props(wid, names, env):
+    """Read selected xprop atoms for one window as {atom: raw value}."""
+    rc, out, _err = _run(["xprop", "-id", wid, *names], timeout=4, env=env)
+    if rc != 0:
+        return {}
+    return _parse_xprop_lines(out)
+
+
+def _xprop_string(value):
+    """Unquote an xprop string value, preserving spaces and escapes."""
+    text = (value or "").strip()
+    if not text:
+        return ""
+    try:
+        parts = shlex.split(text)
+    except Exception:
+        return text.strip('"')
+    return " ".join(parts)
+
+
+def _norm_window_token(value):
+    return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
+
+
+def _window_app_index():
+    """Alias buckets -> desktop entry, cached so polling the wheel stays cheap.
+
+    Separate buckets matter: a Chrome PWA can share the `google-chrome` Exec
+    name with the browser itself. Matching the class against ids and
+    StartupWMClass first keeps the real Chrome window on Chrome, not on whichever
+    PWA happens to sort first alphabetically.
+    """
+    now = time.time()
+    with _WINDOW_APP_CACHE_LOCK:
+        cached = _WINDOW_APP_CACHE.get("index") or {}
+        if cached and now - _WINDOW_APP_CACHE["at"] < 30:
+            return cached
+    index = {"wmClass": {}, "id": {}, "name": {}, "exec": {}}
+    for app in _list_apps():
+        for bucket, alias in (
+            ("wmClass", app.get("wmClass")),
+            ("id", app.get("id")),
+            ("name", app.get("name")),
+            ("exec", app.get("execName")),
+        ):
+            key = _norm_window_token(alias)
+            if key and key not in index[bucket]:
+                index[bucket][key] = app
+    with _WINDOW_APP_CACHE_LOCK:
+        _WINDOW_APP_CACHE["at"] = now
+        _WINDOW_APP_CACHE["index"] = index
+    return index
+
+
+def _match_window_app(index, instance, wm_class):
+    """Best desktop entry for a WM_CLASS pair, or None for an unknown app."""
+    if not index:
+        return None
+    for raw in (wm_class, instance):
+        key = _norm_window_token(raw)
+        if not key:
+            continue
+        for bucket in ("wmClass", "id", "name", "exec"):
+            hit = index[bucket].get(key)
+            if hit:
+                return hit
+    # Unknown vendored apps: stay conservative. Only consider identity aliases,
+    # never Exec (where browser web-apps would win a near-match).
+    candidates = {}
+    for bucket in ("wmClass", "id", "name"):
+        candidates.update(index[bucket])
+    for raw in (wm_class, instance):
+        key = _norm_window_token(raw)
+        if len(key) < 5:
+            continue
+        match = difflib.get_close_matches(key, candidates.keys(), n=1, cutoff=0.9)
+        if match:
+            return candidates[match[0]]
+    return None
+
+
+def _list_windows():
+    """The current Alt+Tab entries, top-most first. X11 only."""
+    if "x11" not in SESSION_TYPE or not _has_command("xprop"):
+        return {
+            "supported": False,
+            "reason": "Alt+Tab window listing needs an X11 session and xprop",
+            "windows": [],
+        }
+
+    now = time.time()
+    with _WINDOWS_CACHE_LOCK:
+        data = _WINDOWS_CACHE.get("data")
+        if data is not None and now - _WINDOWS_CACHE["at"] < 1.5:
+            return data
+
+    env = _session_env()
+    rc, root_out, _err = _run(
+        ["xprop", "-root", "_NET_CLIENT_LIST_STACKING", "_NET_ACTIVE_WINDOW", "_NET_CURRENT_DESKTOP"],
+        timeout=4, env=env,
+    )
+    root_props = _parse_xprop_lines(root_out)
+
+    stacking = re.findall(
+        r"0x[0-9a-fA-F]+", root_props.get("_NET_CLIENT_LIST_STACKING", "")
+    )
+    if rc != 0 or not stacking:
+        result = {
+            "supported": False,
+            "reason": "window manager does not expose _NET_CLIENT_LIST_STACKING",
+            "windows": [],
+        }
+        with _WINDOWS_CACHE_LOCK:
+            _WINDOWS_CACHE.update(at=now, data=result)
+        return result
+
+    active_ids = re.findall(r"0x[0-9a-fA-F]+", root_props.get("_NET_ACTIVE_WINDOW", ""))
+    active = active_ids[0] if active_ids else ""
+    desktop_match = re.search(r"-?\d+", root_props.get("_NET_CURRENT_DESKTOP", ""))
+    current_desktop = int(desktop_match.group(0)) if desktop_match else None
+
+    index = _window_app_index()
+    items = []
+    seen = set()
+    # Stacking order is bottom-to-top; the switcher presents top-most first.
+    for wid in reversed(stacking):
+        if wid in seen:
+            continue
+        seen.add(wid)
+        props = _xprop_props(
+            wid,
+            ("WM_CLASS", "_NET_WM_NAME", "WM_NAME", "_NET_WM_WINDOW_TYPE",
+             "_NET_WM_STATE", "_NET_WM_DESKTOP"),
+            env,
+        )
+        if not props:
+            continue
+
+        types = props.get("_NET_WM_WINDOW_TYPE", "").upper()
+        if any(("_" + t) in types for t in _WINDOW_TYPES_SKIP):
+            continue
+        states = props.get("_NET_WM_STATE", "").upper()
+        if "_NET_WM_STATE_SKIP_TASKBAR" in states:
+            continue
+        desktop_raw = props.get("_NET_WM_DESKTOP", "")
+        desktop_match = re.search(r"-?\d+", desktop_raw)
+        if current_desktop is not None and desktop_match:
+            desktop = int(desktop_match.group(0))
+            # 4294967295 (0xffffffff) means "on all desktops".
+            if desktop != current_desktop and desktop != 4294967295:
+                continue
+
+        try:
+            classes = shlex.split(props.get("WM_CLASS", ""))
+        except Exception:
+            classes = []
+        instance = classes[0] if classes else ""
+        wm_class = classes[-1] if classes else ""
+        title = _xprop_string(props.get("_NET_WM_NAME", "")) or _xprop_string(
+            props.get("WM_NAME", "")
+        )
+        if not title and not wm_class:
+            continue
+
+        app = _match_window_app(index, instance, wm_class)
+        items.append({
+            "id": wid,
+            "title": title,
+            "appId": app["id"] if app else "",
+            "appName": app["name"] if app else (wm_class or title or "Window"),
+            "wmClass": wm_class or instance,
+            "iconVersion": app["iconVersion"] if app else "",
+            "active": wid == active,
+        })
+        if len(items) >= 40:
+            break
+
+    # The active window is normally top-most already; make that invariant so the
+    # phone can centre it without a second sort.
+    if active:
+        items.sort(key=lambda w: 0 if w["id"] == active else 1)
+
+    result = {"supported": True, "reason": "", "windows": items}
+    with _WINDOWS_CACHE_LOCK:
+        _WINDOWS_CACHE.update(at=now, data=result)
+    return result
+
+
+def _focus_window_id(wid):
+    """Activate one exact window id (rather than a title substring)."""
+    if "x11" not in SESSION_TYPE or not _has_command("xdotool"):
+        return False, "unsupported"
+    value = (wid or "").strip()
+    if not re.fullmatch(r"0x[0-9a-fA-F]+|\d+", value):
+        return False, "bad window id"
+    rc, _out, err = _run(
+        ["xdotool", "windowactivate", "--sync", value], timeout=5, env=_session_env()
+    )
+    if rc == 0:
+        return True, "ok"
+    # Some WMs refuse activate on a window that is already focused; raising it is
+    # still the correct intent and gives the user visible feedback.
+    rc, _out, raise_err = _run(
+        ["xdotool", "windowraise", value], timeout=5, env=_session_env()
+    )
+    return (rc == 0), ("ok" if rc == 0 else (err or raise_err))
+
+
 def _backlight_device():
     """(name, max, current) for the first backlight device, or None."""
     root = "/sys/class/backlight"
@@ -1443,11 +1742,36 @@ def _displays():
             m = re.match(r"^(\S+)\s+(connected|disconnected)", line)
             if not m:
                 continue
-            geometry = re.search(r"(\d+x\d+)\+(\d+)\+(\d+)", line)
+            # xrandr prints offsets with "%dx%d+%d+%d", so a monitor above or
+            # left of the origin appears as "+0+-1080". Match the sign too, or
+            # the whole geometry is dropped and the screen disappears from the
+            # phone's desk model.
+            geometry = re.search(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", line)
+            # The current rotation is the bare word before the parenthetical,
+            # e.g. "1080x1920+0+0 left (normal left inverted right ...)". The
+            # parenthetical itself is the fixed list of supported rotations, so
+            # reading its first word would always report "normal". The WxH above
+            # is already post-rotation; the field lets the phone draw a portrait
+            # screen the right way up.
+            rotation_word = (
+                re.search(r"^\s+(normal|left|right|inverted)\b", line[geometry.end():])
+                if geometry
+                else None
+            )
+            rotation = {"normal": 0, "right": 90, "inverted": 180, "left": 270}.get(
+                rotation_word.group(1) if rotation_word else "normal", 0
+            )
             current = {
                 "output": m.group(1),
                 "connected": m.group(2) == "connected",
-                "current": geometry.group(1) if geometry else None,
+                "current": f"{geometry.group(1)}x{geometry.group(2)}" if geometry else None,
+                # Offsets matter: they are how the client works out which monitor
+                # a pointer is on and which edges are on the desktop's boundary.
+                "width": int(geometry.group(1)) if geometry else None,
+                "height": int(geometry.group(2)) if geometry else None,
+                "x": int(geometry.group(3)) if geometry else None,
+                "y": int(geometry.group(4)) if geometry else None,
+                "rotation": rotation,
                 "modes": [],
             }
             displays.append(current)
@@ -1456,6 +1780,34 @@ def _displays():
             if m and m.group(1) not in current["modes"]:
                 current["modes"].append(m.group(1))
     return displays
+
+
+def _pointer_location():
+    """Pointer position and the output it sits on. X11 via xdotool."""
+    if not _has_command("xdotool"):
+        return None
+    rc, out, _err = _run(["xdotool", "getmouselocation", "--shell"], timeout=3, env=_session_env())
+    if rc != 0:
+        return None
+    x = y = None
+    for line in out.splitlines():
+        try:
+            if line.startswith("X="):
+                x = int(line[2:])
+            elif line.startswith("Y="):
+                y = int(line[2:])
+        except ValueError:
+            continue
+    if x is None or y is None:
+        return None
+    output = None
+    for d in _displays():
+        if d.get("x") is None or not d.get("connected"):
+            continue
+        if d["x"] <= x < d["x"] + d["width"] and d["y"] <= y < d["y"] + d["height"]:
+            output = d["output"]
+            break
+    return {"x": x, "y": y, "output": output}
 
 
 def _set_display_mode(output, mode):
@@ -1468,6 +1820,108 @@ def _set_display_mode(output, mode):
         return False, "bad mode"
     rc, _out, err = _run(["xrandr", "--output", output, "--mode", mode], timeout=8, env=_session_env())
     return (rc == 0), ("ok" if rc == 0 else err)
+
+
+# xrandr names rotations while /api/displays reports degrees clockwise; keep the
+# translation in one place so the editor can send the same numbers it draws.
+_DISPLAY_ROTATION_WORD = {0: "normal", 90: "right", 180: "inverted", 270: "left"}
+_DISPLAY_REFLECTION_WORDS = {"none", "x", "y", "xy"}
+
+
+def _display_rotation_word(value):
+    """Map 0/90/180/270 (or an xrandr word) to an xrandr rotation word."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str) and value in _DISPLAY_ROTATION_WORD.values():
+        return value
+    try:
+        degrees = int(value)
+    except (TypeError, ValueError):
+        return None
+    return _DISPLAY_ROTATION_WORD.get(degrees % 360)
+
+
+def _display_coord(value):
+    """A signed virtual-desktop coordinate, or None when not a plain integer."""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    if abs(number) > 100000:
+        return None
+    return number
+
+
+def _set_display_layout(changes):
+    """Move/rotate one or more outputs, e.g. dragging screens in the phone editor.
+
+    Each change is `{output, x?, y?, rotation?, mode?, reflect?, primary?}`.
+    x/y are post-rotation top-left offsets in the virtual desktop. All changes
+    go to one `xrandr` invocation so the server sees a single new layout rather
+    than a sequence of half-applied ones.
+    """
+    if not _has_command("xrandr"):
+        return False, "unsupported"
+    displays = _displays()
+    known = {d["output"]: d for d in displays if d.get("connected")}
+    if not changes:
+        return False, "no changes"
+    if len(changes) > 16:
+        return False, "too many outputs"
+    args = ["xrandr"]
+    seen = set()
+    primary_seen = False
+    for change in changes:
+        if not isinstance(change, dict):
+            return False, "bad change"
+        output = str(change.get("output") or "")
+        if output not in known:
+            return False, f"unknown output: {output or '(empty)'}"
+        if output in seen:
+            return False, f"duplicate output: {output}"
+        seen.add(output)
+        args += ["--output", output]
+
+        mode = change.get("mode")
+        if mode is not None:
+            mode = str(mode)
+            if not re.match(r"^\d+x\d+$", mode):
+                return False, f"bad mode: {mode}"
+            args += ["--mode", mode]
+
+        has_x = "x" in change
+        has_y = "y" in change
+        if has_x != has_y:
+            return False, f"both x and y are required for {output}"
+        if has_x:
+            x = _display_coord(change.get("x"))
+            y = _display_coord(change.get("y"))
+            if x is None or y is None:
+                return False, f"bad position for {output}"
+            args += ["--pos", f"{x}x{y}"]
+
+        if "rotation" in change:
+            word = _display_rotation_word(change.get("rotation"))
+            if word is None:
+                return False, f"bad rotation for {output}"
+            args += ["--rotate", word]
+
+        if "reflect" in change:
+            reflect = str(change.get("reflect") or "").lower()
+            if reflect not in _DISPLAY_REFLECTION_WORDS:
+                return False, f"bad reflection for {output}"
+            args += ["--reflect", reflect]
+
+        if change.get("primary") is True:
+            if primary_seen:
+                return False, "only one output can be primary"
+            primary_seen = True
+            args += ["--primary"]
+
+    rc, _out, err = _run(args, timeout=12, env=_session_env())
+    return (rc == 0), ("ok" if rc == 0 else (err or "xrandr failed").strip())
 
 
 # --- CLIPBOARD / FILES API --------------------------------------------------
@@ -1697,6 +2151,163 @@ def _list_files(rel_dir=""):
         })
     entries.sort(key=lambda e: (not e["dir"], e["name"].lower()))
     return entries
+
+
+# --- CROSS-LAPTOP DRAG ------------------------------------------------------
+#
+# A real desktop drag cannot cross two X servers by itself: the pointer grab and
+# the XDND selection live on the laptop where the drag started. When the phone
+# carries the pointer over a screen edge with the button held, it asks the
+# source laptop for the payload while the drag is still live, then brokers the
+# bytes to the laptop on the other side. These helpers expose only paths under
+# the user's home directory; the share sandbox is not widened.
+
+
+def _drag_home():
+    return os.path.realpath(os.path.expanduser("~"))
+
+
+def _drag_home_path(raw, must_exist=False):
+    """Resolve an absolute or home-relative path, refusing anything outside $HOME."""
+    text = urllib.parse.unquote(str(raw or "")).strip()
+    if not text or "\x00" in text:
+        return None
+    base = _drag_home()
+    full = text if os.path.isabs(text) else os.path.join(base, text)
+    real = os.path.realpath(full)
+    if real != base and not real.startswith(base + os.sep):
+        return None
+    if must_exist and not os.path.exists(real):
+        return None
+    return real
+
+
+def _drag_entry(full):
+    """One file/folder under home, in the same shape as a share entry."""
+    try:
+        st = os.stat(full)
+    except Exception:
+        return None
+    return {
+        "name": os.path.basename(full),
+        "path": full,
+        "dir": os.path.isdir(full),
+        "size": st.st_size,
+        "modified": int(st.st_mtime),
+    }
+
+
+def _drag_listing(full_dir):
+    """List a directory under home. Returns None for an unsafe/missing path."""
+    if not full_dir or not os.path.isdir(full_dir):
+        return None
+    try:
+        names = os.listdir(full_dir)
+    except Exception:
+        return None
+    entries = []
+    for name in names:
+        if name.startswith("."):
+            continue
+        # A symlink can point outside $HOME or form a loop; copy the real file
+        # only when the drag payload itself resolved it, never by following it
+        # while walking a folder.
+        child = os.path.join(full_dir, name)
+        if os.path.islink(child):
+            continue
+        safe = _drag_home_path(child, must_exist=True)
+        if safe is None:
+            continue
+        entry = _drag_entry(safe)
+        if entry is not None:
+            entries.append(entry)
+    entries.sort(key=lambda e: (not e["dir"], e["name"].lower()))
+    return entries
+
+
+def _drag_uri_paths(text):
+    """Absolute paths from an RFC 2483 text/uri-list, or plain path lines."""
+    paths = []
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Some file managers answer with plain paths instead of URIs.
+        if line.lower().startswith("file://"):
+            parsed = urllib.parse.urlparse(line)
+            if parsed.netloc not in ("", "localhost", socket.gethostname()):
+                continue
+            candidate = urllib.parse.unquote(parsed.path)
+        elif line.startswith(("/", "~")):
+            candidate = os.path.expanduser(urllib.parse.unquote(line))
+        else:
+            continue
+        real = _drag_home_path(candidate, must_exist=True)
+        if real and real not in paths:
+            paths.append(real)
+    return paths
+
+
+def _drag_payload(nudge=False):
+    """Read the live XDND / clipboard payload while the user still holds a drag.
+
+    The source application owns the `XdndSelection` during a drag, but many
+    toolkits only answer a selection request after XDNDDrop. The reliable nudge
+    is the file manager's own copy shortcut: Ctrl+C on the already-selected item
+    publishes `text/uri-list` to CLIPBOARD without ending the gesture. It is
+    only pressed when the phone explicitly asks (`nudge=1`) for a drag handoff.
+    """
+    if not _has_command("xclip"):
+        return {"ok": False, "error": "xclip is not installed on this laptop"}
+    if "x11" not in SESSION_TYPE and not os.environ.get("DISPLAY"):
+        return {"ok": False, "error": "file drag capture needs an X11 session"}
+
+    def read_attempts():
+        attempts = [
+            ("xdnd", ["xclip", "-selection", "XdndSelection", "-t", "text/uri-list", "-o"]),
+            ("clipboard", ["xclip", "-selection", "clipboard", "-t", "text/uri-list", "-o"]),
+            ("primary", ["xclip", "-selection", "primary", "-t", "text/uri-list", "-o"]),
+            ("xdnd", ["xclip", "-selection", "XdndSelection", "-o"]),
+            ("clipboard", ["xclip", "-selection", "clipboard", "-o"]),
+        ]
+        for source, cmd in attempts:
+            rc, out, _err = _run(cmd, timeout=1.2, env=_session_env())
+            if rc != 0 or not out.strip():
+                continue
+            paths = _drag_uri_paths(out)
+            if not paths:
+                continue
+            entries = [e for e in (_drag_entry(p) for p in paths) if e is not None]
+            if entries:
+                return source, paths, entries
+        return None
+
+    found = read_attempts()
+    if found is None and nudge and _has_command("xdotool"):
+        # Ctrl+C goes to the focused drag source; it copies the selected item
+        # without needing the XDND drop handshake. Give the file manager a beat
+        # to claim CLIPBOARD before reading it back.
+        _run(["xdotool", "key", "--clearmodifiers", "ctrl+c"], timeout=2, env=_session_env())
+        time.sleep(0.25)
+        found = read_attempts()
+    if found is not None:
+        source, paths, entries = found
+        return {"ok": True, "source": source, "paths": paths, "entries": entries}
+    return {"ok": True, "source": None, "paths": [], "entries": []}
+
+
+def _drag_default_target():
+    """Home-relative folder a cross-screen drop lands in."""
+    home = _drag_home()
+    for name in ("Desktop", "Downloads"):
+        if os.path.isdir(os.path.join(home, name)):
+            return name
+    share = os.path.abspath(SHARE_DIR)
+    try:
+        os.makedirs(share, exist_ok=True)
+    except Exception:
+        pass
+    return os.path.basename(share) or "taildeck-share"
 
 
 # --- SHARE LINKS ------------------------------------------------------------
@@ -2108,11 +2719,15 @@ def _mjpeg_stream(conn, width=None, fps=None, quality=None):
         fps = SCREEN_STREAM_FPS
     fps = max(0.5, min(15.0, fps))
     boundary = "taildeckframe"
+    stream_origin = getattr(REQUEST_ORIGIN, "origin", "")
+    stream_cors = "Vary: Origin\r\n"
+    if stream_origin and _origin_allowed(stream_origin):
+        stream_cors += f"Access-Control-Allow-Origin: {stream_origin}\r\n"
     head = (
         f"HTTP/1.1 200 OK\r\n"
         f"Content-Type: multipart/x-mixed-replace; boundary={boundary}\r\n"
         f"Cache-Control: no-cache\r\n"
-        f"Access-Control-Allow-Origin: *\r\n"
+        f"{stream_cors}"
         f"Connection: close\r\n\r\n"
     )
     cmd = [
@@ -2357,6 +2972,9 @@ def _capabilities():
     caps = ["media", "dictation", "scripts", "notify", "apps", "power", "record"]
     if _has_command("xrandr"):
         caps.append("displays")
+    # Absolute pointer position; only X11 can be asked, and only via xdotool.
+    if SESSION_TYPE == "x11" and _has_command("xdotool"):
+        caps.append("pointer")
     if _backlight_device():
         caps.append("brightness")
     if _has_command("xclip") or (SESSION_TYPE == "wayland" and _has_command("wl-paste")):
@@ -2700,6 +3318,171 @@ def _consume_grant(user, key):
     return True, "ok"
 
 
+def _load_devices():
+    """Paired-device store, or a fresh one. Only token hashes are kept."""
+    try:
+        with open(DEVICES_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and isinstance(data.get("devices"), list):
+            return data
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    return {"version": 1, "devices": []}
+
+
+def _save_devices(store):
+    try:
+        os.makedirs(os.path.dirname(DEVICES_FILE), exist_ok=True)
+        tmp = DEVICES_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(store, fh, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, DEVICES_FILE)
+        return True
+    except Exception as e:
+        print(f"[TailDeck] could not save devices: {e}", flush=True)
+        return False
+
+
+def _token_hash(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _device_token_ok(token):
+    """Constant-time check against the env override or a paired device hash."""
+    if not token or not isinstance(token, str):
+        return False
+    if DEVICE_TOKEN_ENV:
+        return hmac.compare_digest(token, DEVICE_TOKEN_ENV)
+    digest = _token_hash(token)
+    now = int(time.time())
+    with DEVICES_LOCK:
+        store = _load_devices()
+        for dev in store.get("devices", []):
+            if dev.get("revoked"):
+                continue
+            stored = str(dev.get("tokenHash") or "")
+            if stored and hmac.compare_digest(digest, stored):
+                dev["lastSeen"] = now
+                # Persist at most once a minute per device; the in-memory
+                # update keeps this request's answer correct either way.
+                dev_id = str(dev.get("id") or "")
+                if now - _LAST_SEEN_SAVED.get(dev_id, 0) >= 60:
+                    _LAST_SEEN_SAVED[dev_id] = now
+                    _save_devices(store)
+                return True
+    return False
+
+
+def _session_token(headers):
+    """Bearer token from an HTTP request, or '' when absent/malformed."""
+    value = headers.get("authorization", "")
+    if not value.lower().startswith("bearer "):
+        return ""
+    return value[7:].strip()
+
+
+def _request_is_local(conn, headers):
+    """The laptop's own browser. Never true for a request that came through a
+    reverse proxy, even though the proxy connects from loopback.
+
+    A browser Origin is checked too: without that, any website open on the
+    laptop could drive ws://127.0.0.1 (a loopback peer alone cannot tell the
+    laptop's own page from a page it happens to be visiting)."""
+    if headers.get("x-forwarded-for"):
+        return False
+    origin = headers.get("origin", "")
+    if origin and not _origin_allowed(origin):
+        return False
+    return _peer_is_loopback(conn)
+
+
+def _mint_device(label):
+    """Create a per-phone token. Only the hash is persisted; return plaintext once."""
+    token = secrets.token_urlsafe(32)
+    dev = {
+        "id": secrets.token_hex(8),
+        "label": (str(label or "phone").strip() or "phone")[:64],
+        "tokenHash": _token_hash(token),
+        "created": int(time.time()),
+        "lastSeen": int(time.time()),
+        "revoked": False,
+    }
+    with DEVICES_LOCK:
+        store = _load_devices()
+        store.setdefault("devices", []).append(dev)
+        if not _save_devices(store):
+            return None, None
+    return dev["id"], token
+
+
+def _mint_pair_code(label):
+    now = time.time()
+    code = secrets.token_urlsafe(12)
+    with PAIRING_LOCK:
+        for key, rec in list(PAIRING_PENDING.items()):
+            if now - rec["created"] > PAIRING_TTL * 2:
+                PAIRING_PENDING.pop(key, None)
+        PAIRING_PENDING[_token_hash(code)] = {
+            "created": now,
+            "label": (str(label or "phone").strip() or "phone")[:64],
+        }
+    return code, int(now + PAIRING_TTL)
+
+
+def _consume_pair_code(code):
+    """Spend a pairing code. Returns its label, or None when invalid/expired."""
+    if not code or not isinstance(code, str):
+        return None
+    key = _token_hash(code)
+    now = time.time()
+    with PAIRING_LOCK:
+        rec = PAIRING_PENDING.pop(key, None)
+    if not rec:
+        return None
+    if now - rec["created"] > PAIRING_TTL:
+        return None
+    return rec["label"]
+
+
+def _origin_allowed(origin):
+    """Echo an Origin only when it is one of the app's own surfaces.
+
+    Recomputing interface addresses is not free, so cache briefly. The set is
+    intentionally explicit: wildcard CORS is what let any visited website drive
+    this daemon.
+    """
+    if not origin:
+        return False
+    now = time.time()
+    cache = ALLOWED_ORIGINS_CACHE
+    if now - cache["at"] > 30:
+        allowed = set(ALLOWED_ORIGINS_ENV)
+        allowed.add("https://phy6.github.io")
+        for port in (PORT, TLS_PORT):
+            for host in ("localhost", "127.0.0.1", "[::1]"):
+                allowed.add(f"http://{host}:{port}")
+                allowed.add(f"https://{host}:{port}")
+        for host in ("localhost", "127.0.0.1"):
+            allowed.add(f"http://{host}:3000")
+        try:
+            for item in usable_interfaces():
+                ip = item.get("address")
+                if ip:
+                    allowed.add(f"http://{ip}:{PORT}")
+                    allowed.add(f"https://{ip}:{TLS_PORT}")
+            tailnet = tailnet_dns_name()
+            if tailnet:
+                allowed.add(f"https://{tailnet}")
+        except Exception:
+            pass
+        cache["items"] = allowed
+        cache["at"] = now
+    return origin.rstrip("/") in cache["items"]
+
+
 def _peer_is_loopback(conn):
     try:
         addr = conn.getpeername()[0]
@@ -2720,6 +3503,29 @@ def _http_get(url, timeout=30):
     req = urllib.request.Request(url, headers={"User-Agent": f"TailDeck/{DAEMON_VERSION}"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
+
+
+def _version_key(value):
+    """Numeric parts of a version, so 1.11.0 counts as newer than 1.7.0.
+
+    The release channel can lag a local build. Comparing by inequality would
+    advertise a "downgrade" in that case; only a strictly newer release is an
+    update.
+    """
+    return tuple(int(part) for part in re.findall(r"\d+", value or ""))
+
+
+def _has_newer_release(latest, current):
+    return bool(latest) and _version_key(latest) > _version_key(current)
+
+
+def _installed_app_version():
+    """The app version currently published in WEBROOT, if it can be read."""
+    try:
+        with open(os.path.join(WEBROOT, "version.json"), encoding="utf-8") as fh:
+            return (json.load(fh) or {}).get("app")
+    except Exception:
+        return None
 
 
 def release_manifest(force=False, timeout=8):
@@ -2825,6 +3631,20 @@ def perform_update(dry_run=False):
         "dryRun": bool(dry_run),
         "steps": [],
     }
+
+    # Only move forward. The published channel can lag a local build (a laptop
+    # running ahead of Pages), and a release with neither half newer would turn
+    # "update" into a downgrade.
+    current_app = _installed_app_version()
+    if not (
+        _has_newer_release(target_daemon, DAEMON_VERSION)
+        or _has_newer_release(target_app, current_app)
+    ):
+        report["upToDate"] = True
+        report["steps"].append(
+            f"already up to date (daemon {DAEMON_VERSION}, app {current_app or 'unknown'})"
+        )
+        return True, report
 
     try:
         web_blob = _http_get(f"{RELEASE_URL}/taildeck-web.tar.gz", timeout=60)
@@ -3056,6 +3876,60 @@ def handle_api(conn, raw, request_line):
 
     headers = _parse_headers(raw.decode("utf-8", errors="ignore"))
 
+    # Identity endpoints stay readable so a phone can discover a laptop before
+    # it has paired; everything else is token-gated. Loopback (the laptop's own
+    # browser) is trusted because a local process can already drive the input
+    # devices; proxied requests never count as local.
+    local = _request_is_local(conn, headers)
+    authed = local or _device_token_ok(_session_token(headers))
+    if path not in ("/api/beacon", "/api/version") and not authed:
+        _json(conn, {
+            "ok": False,
+            "error": "pairing required",
+            "code": "unauthorized",
+        }, "401 Unauthorized")
+        return True
+
+    if path == "/api/pair/new" and method in ("POST", "PUT"):
+        body = _read_http_body(conn, raw, headers)
+        try:
+            data = json.loads(body.decode("utf-8", errors="replace") or "{}")
+        except Exception:
+            data = {}
+        code, expires = _mint_pair_code(data.get("label"))
+        _json(conn, {"ok": True, "code": code, "expires": expires})
+        return True
+
+    if path.rstrip("/") == "/api/devices" and method == "GET":
+        _json(conn, {"ok": True, "devices": [
+            {
+                "id": d.get("id"),
+                "label": d.get("label"),
+                "created": d.get("created"),
+                "lastSeen": d.get("lastSeen"),
+                "revoked": bool(d.get("revoked")),
+            }
+            for d in _load_devices().get("devices", [])
+        ]})
+        return True
+
+    if path.startswith("/api/devices/") and method == "DELETE":
+        dev_id = urllib.parse.unquote(path[len("/api/devices/"):]).strip()
+        with DEVICES_LOCK:
+            store = _load_devices()
+            found = False
+            for dev in store.get("devices", []):
+                if dev.get("id") == dev_id:
+                    dev["revoked"] = True
+                    found = True
+            if found:
+                _save_devices(store)
+        if not found:
+            _json(conn, {"ok": False, "error": "not found"}, "404 Not Found")
+            return True
+        _json(conn, {"ok": True})
+        return True
+
     if path == "/api/media/now" and method == "GET":
         _json(conn, now_playing())
         return True
@@ -3247,8 +4121,15 @@ def handle_api(conn, raw, request_line):
             "managed": managed_daemon_path() is not None,
             "latest": (latest or {}).get("daemon"),
             "latestApp": (latest or {}).get("app"),
-            "updateAvailable": bool(latest and latest.get("daemon") and latest["daemon"] != DAEMON_VERSION),
+            "updateAvailable": _has_newer_release((latest or {}).get("daemon"), DAEMON_VERSION),
         })
+        return True
+
+    # HTTPS fallback for discovery: a browser cannot hear a UDP beacon, but it
+    # can ask a remembered host who it is and whether its certificate still
+    # matches.
+    if path == "/api/beacon" and method == "GET":
+        _json(conn, {"ok": True, **discovery_payload()})
         return True
 
     if path == "/api/update" and method in ("POST", "PUT"):
@@ -3319,17 +4200,22 @@ def handle_api(conn, raw, request_line):
         _json(conn, {"ok": ok, "detail": detail}, "200 OK" if ok else "400 Bad Request")
         return True
 
+    if path == "/api/windows" and method == "GET":
+        _json(conn, {"ok": True, **_list_windows()})
+        return True
+
     if path == "/api/windows/focus" and method in ("POST", "PUT"):
         body = _read_http_body(conn, raw, headers)
         try:
             data = json.loads(body.decode("utf-8", errors="replace") or "{}")
         except Exception:
             data = {}
+        wid = str(data.get("id") or "").strip()
         match = str(data.get("match") or "").strip()
-        if not match:
-            _json(conn, {"ok": False, "error": "match required"}, "400 Bad Request")
+        if not wid and not match:
+            _json(conn, {"ok": False, "error": "id or match required"}, "400 Bad Request")
             return True
-        ok, detail = _focus_window(match)
+        ok, detail = _focus_window_id(wid) if wid else _focus_window(match)
         _json(conn, {"ok": ok, "detail": detail}, "200 OK" if ok else "409 Conflict")
         return True
 
@@ -3351,14 +4237,40 @@ def handle_api(conn, raw, request_line):
         _json(conn, {"ok": True, "displays": _displays()})
         return True
 
+    # Which monitor the pointer is on. The spatial layout is phone-side, so only
+    # the daemon can answer "is that laptop's edge the one the pointer is at?".
+    if path == "/api/pointer" and method == "GET":
+        pointer = _pointer_location()
+        if pointer is None:
+            _json(conn, {"ok": False, "error": "unsupported"}, "501 Not Implemented")
+            return True
+        _json(conn, {"ok": True, "pointer": pointer})
+        return True
+
     if path == "/api/displays" and method in ("POST", "PUT"):
         body = _read_http_body(conn, raw, headers)
         try:
             data = json.loads(body.decode("utf-8", errors="replace") or "{}")
         except Exception:
             data = {}
-        ok, detail = _set_display_mode(str(data.get("output") or ""), str(data.get("mode") or ""))
-        _json(conn, {"ok": ok, "detail": detail}, "200 OK" if ok else "400 Bad Request")
+        if not isinstance(data, dict):
+            data = {}
+        outputs = data.get("outputs")
+        if isinstance(outputs, list):
+            ok, detail = _set_display_layout(outputs)
+        elif data.get("output"):
+            # Keep the old `{output, mode}` call working; any layout field routes
+            # to the move/rotate path.
+            layout_fields = ("x", "y", "rotation", "reflect", "primary")
+            if "mode" in data and not any(field in data for field in layout_fields):
+                ok, detail = _set_display_mode(str(data.get("output")), str(data.get("mode") or ""))
+            else:
+                ok, detail = _set_display_layout([data])
+        else:
+            ok, detail = False, "output or outputs required"
+        # Return the refreshed geometry so the editor can redraw from truth.
+        _json(conn, {"ok": ok, "detail": detail, "displays": _displays()},
+              "200 OK" if ok else "400 Bad Request")
         return True
 
     if path == "/api/clipboard" and method == "GET":
@@ -3438,6 +4350,99 @@ def handle_api(conn, raw, request_line):
             return True
         print(f"[TailDeck] file saved: {rel} ({len(data)} bytes)", flush=True)
         _json(conn, {"ok": True, "path": rel.strip("/"), "size": len(data)})
+        return True
+
+    # Cross-laptop drag: the phone captures the live drag payload here, then
+    # streams it into the destination laptop under its home folder.
+    if path == "/api/drag/payload" and method == "GET":
+        _json(conn, _drag_payload(nudge=_query(target).get("nudge") == "1"))
+        return True
+
+    if path == "/api/drag/info" and method == "GET":
+        _json(conn, {
+            "ok": True,
+            "home": _drag_home(),
+            "targetDir": _drag_default_target(),
+        })
+        return True
+
+    if path == "/api/drag/list" and method == "GET":
+        full = _drag_home_path(_query(target).get("path", ""), must_exist=True)
+        entries = _drag_listing(full) if full else None
+        if entries is None:
+            _json(conn, {"ok": False, "error": "bad or missing path"}, "400 Bad Request")
+            return True
+        _json(conn, {"ok": True, "dir": full, "entries": entries})
+        return True
+
+    if path == "/api/drag/download" and method == "GET":
+        full = _drag_home_path(_query(target).get("path", ""), must_exist=True)
+        if full is None or not os.path.isfile(full):
+            _json(conn, {"ok": False, "error": "not found"}, "404 Not Found")
+            return True
+        try:
+            if os.path.getsize(full) > MAX_UPLOAD:
+                _json(conn, {"ok": False, "error": "too large"}, "413 Payload Too Large")
+                return True
+            with open(full, "rb") as fh:
+                data = fh.read()
+        except Exception:
+            _json(conn, {"ok": False, "error": "unreadable"}, "500 Internal Server Error")
+            return True
+        ctype = MIME_TYPES.get(os.path.splitext(full)[1].lower(), "application/octet-stream")
+        filename = os.path.basename(full).replace('"', "").replace("\\", "")
+        _http(conn, "200 OK", ctype, data, "no-cache",
+              extra=f'Content-Disposition: attachment; filename="{filename}"\r\n')
+        return True
+
+    if path == "/api/drag/upload" and method in ("POST", "PUT"):
+        rel_dir = _query(target).get("dir", "")
+        name = urllib.parse.unquote(_query(target).get("name", "")).strip()
+        if not name or name in (".", "..") or "/" in name or "\\" in name or name.startswith("."):
+            _json(conn, {"ok": False, "error": "bad name"}, "400 Bad Request")
+            return True
+        dir_full = _drag_home_path(rel_dir)
+        if dir_full is None:
+            _json(conn, {"ok": False, "error": "bad directory"}, "400 Bad Request")
+            return True
+        full = _drag_home_path(os.path.join(dir_full, name))
+        if full is None:
+            _json(conn, {"ok": False, "error": "bad path"}, "400 Bad Request")
+            return True
+        try:
+            declared = int(headers.get("content-length", "0") or "0")
+        except Exception:
+            declared = 0
+        if declared > MAX_UPLOAD:
+            _json(conn, {"ok": False, "error": "too large"}, "413 Payload Too Large")
+            return True
+        data = _read_http_body(conn, raw, headers)
+        if len(data) > MAX_UPLOAD:
+            _json(conn, {"ok": False, "error": "too large"}, "413 Payload Too Large")
+            return True
+        try:
+            os.makedirs(dir_full, exist_ok=True)
+            with open(full, "wb") as fh:
+                fh.write(data)
+        except Exception:
+            _json(conn, {"ok": False, "error": "unwritable"}, "500 Internal Server Error")
+            return True
+        print(f"[TailDeck] drag drop: {os.path.relpath(full, _drag_home())} ({len(data)} bytes)", flush=True)
+        _json(conn, {"ok": True, "path": full, "size": len(data)})
+        return True
+
+    if path == "/api/drag/mkdir" and method in ("POST", "PUT"):
+        rel_dir = _query(target).get("dir", "")
+        full = _drag_home_path(rel_dir)
+        if full is None:
+            _json(conn, {"ok": False, "error": "bad directory"}, "400 Bad Request")
+            return True
+        try:
+            os.makedirs(full, exist_ok=True)
+        except Exception:
+            _json(conn, {"ok": False, "error": "unwritable"}, "500 Internal Server Error")
+            return True
+        _json(conn, {"ok": True, "path": full})
         return True
 
     if path.rstrip("/") == "/api/shares" and method == "GET":
@@ -3560,22 +4565,336 @@ def handle_api(conn, raw, request_line):
     return True
 
 
+# --------------------------------------------------------------------------
+# Identity and discovery
+#
+# The phone decides where it connects. This side only advertises itself: a
+# stable device id, the interfaces it is actually reachable on, the ports, and
+# the fingerprint of its leaf certificate. The phone builds candidates from
+# those announcements instead of trusting a remembered IP.
+# --------------------------------------------------------------------------
+
+BEACON_PORT = int(os.environ.get("TAILDECK_BEACON_PORT", 47823))
+BEACON_GROUP = "239.255.73.68"
+BEACON_INTERVAL = float(os.environ.get("TAILDECK_BEACON_INTERVAL", 3.0))
+
+# Interfaces that exist on the laptop but cannot be reached from a phone.
+_VIRTUAL_IFACE = re.compile(
+    r"^(lo|docker|veth|br-|virbr|vmnet|vboxnet|tun|tap|wg|zt|tailscale|dummy|sit|bond|team)"
+)
+_WIFI_IFACE = re.compile(r"^(wl|wlan|wifi)")
+_USB_IFACE = re.compile(r"^(usb|rndis|enx)")
+_BT_IFACE = re.compile(r"^(bnep|bt-pan)")
+_ETH_IFACE = re.compile(r"^(en|eth)")
+
+SIOCGIFADDR = 0x8915
+SIOCGIFNETMASK = 0x891B
+SO_BINDTODEVICE = getattr(socket, "SO_BINDTODEVICE", 25)
+
+
+def _iface_ipv4(name):
+    """IPv4 address and netmask of one interface, without third-party modules."""
+    try:
+        import fcntl
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            req = struct.pack("256s", name[:15].encode("utf-8"))
+            addr = socket.inet_ntoa(fcntl.ioctl(sock.fileno(), SIOCGIFADDR, req)[20:24])
+            mask = socket.inet_ntoa(fcntl.ioctl(sock.fileno(), SIOCGIFNETMASK, req)[20:24])
+        finally:
+            sock.close()
+        return addr, mask
+    except Exception:
+        return None
+
+
+def _transport_for(name):
+    if _WIFI_IFACE.match(name):
+        return "wifi"
+    if _USB_IFACE.match(name):
+        return "usb"
+    if _BT_IFACE.match(name):
+        return "bluetooth"
+    if _ETH_IFACE.match(name):
+        return "ethernet"
+    return "network"
+
+
+def _broadcast_for(address, netmask):
+    try:
+        ip = struct.unpack("!I", socket.inet_aton(address))[0]
+        mask = struct.unpack("!I", socket.inet_aton(netmask))[0]
+        return socket.inet_ntoa(struct.pack("!I", ip | (~mask & 0xFFFFFFFF)))
+    except Exception:
+        return None
+
+
+def usable_interfaces():
+    """Interfaces a phone can plausibly reach, with their transport kind.
+
+    Link-local, loopback, container bridges and VPN/tunnel devices are excluded:
+    advertising those was sending phones to 172.17.0.1 and friends.
+    """
+    found = []
+    try:
+        names = socket.if_nameindex()
+    except Exception:
+        names = []
+    for _, name in names:
+        if _VIRTUAL_IFACE.match(name):
+            continue
+        got = _iface_ipv4(name)
+        if not got:
+            continue
+        address, netmask = got
+        if address.startswith("127.") or address.startswith("169.254."):
+            continue
+        found.append({
+            "interface": name,
+            "address": address,
+            "netmask": netmask,
+            "broadcast": _broadcast_for(address, netmask),
+            "transport": _transport_for(name),
+        })
+    return sorted(found, key=lambda item: (item["transport"], item["interface"]))
+
+
 def local_ipv4_addresses():
     """Addresses a phone on the same hotspot could reach the laptop on."""
-    found = set()
+    return [item["address"] for item in usable_interfaces()]
+
+
+DEVICE_ID_FILE = os.path.join(os.path.dirname(CONNECTION_LOG), "device-id")
+
+
+def device_id():
+    """A stable id for this laptop, independent of its address or hostname."""
     try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            found.add(info[4][0])
+        with open(DEVICE_ID_FILE, "r", encoding="utf-8") as fh:
+            value = fh.read().strip()
+            if value:
+                return value
     except Exception:
         pass
+    value = secrets.token_hex(8)
     try:
-        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        probe.connect(("8.8.8.8", 80))
-        found.add(probe.getsockname()[0])
-        probe.close()
+        os.makedirs(os.path.dirname(DEVICE_ID_FILE), exist_ok=True)
+        with open(DEVICE_ID_FILE, "w", encoding="utf-8") as fh:
+            fh.write(value)
     except Exception:
         pass
-    return sorted(ip for ip in found if not ip.startswith("127."))
+    return value
+
+
+def cert_san():
+    """The SAN entries of the leaf certificate, or [] when it cannot be read."""
+    try:
+        decoded = ssl._ssl._test_decode_cert(TLS_CERT)
+        return list(decoded.get("subjectAltName", ()))
+    except Exception:
+        return []
+
+
+def cert_fingerprint():
+    """SHA-256 of the leaf DER, so a phone can pin the identity, not the IP."""
+    try:
+        with open(TLS_CERT, "r", encoding="utf-8") as fh:
+            der = ssl.PEM_cert_to_DER_cert(fh.read())
+        return hashlib.sha256(der).hexdigest()
+    except Exception:
+        return None
+
+
+def _required_cert_names():
+    """Names and addresses the certificate must cover right now."""
+    host = socket.gethostname()
+    names = {
+        "localhost",
+        "taildeck.local",
+        host,
+        host.lower(),
+        f"{host.lower()}.local",
+    }
+    tailnet = tailnet_dns_name()
+    if tailnet:
+        names.add(tailnet)
+    addresses = {"127.0.0.1"} | {item["address"] for item in usable_interfaces()}
+    return names, addresses
+
+
+def ensure_certificate(tls_context=None):
+    """Regenerate the leaf certificate when an address it must cover has moved.
+
+    The CA is reused, so phones that installed it stay valid. When a live TLS
+    context is supplied it is reloaded in place, which lets the running listener
+    pick up the new certificate without a restart.
+    """
+    ca_key = os.path.join(TLS_DIR, "ca.key")
+    if not all(os.path.isfile(path) for path in (TLS_CERT, TLS_KEY, TLS_CA, ca_key)):
+        return False
+    if not shutil.which("openssl"):
+        return False
+
+    names, addresses = _required_cert_names()
+    san = cert_san()
+    have_names = {value for kind, value in san if kind == "DNS"}
+    have_addresses = {value for kind, value in san if kind == "IP Address"}
+    if names.issubset(have_names) and addresses.issubset(have_addresses):
+        return False
+
+    san_text = ",".join(
+        [f"DNS:{name}" for name in sorted(names)]
+        + [f"IP:{address}" for address in sorted(addresses)]
+    )
+    csr = os.path.join(TLS_DIR, "taildeck.csr")
+    ext = os.path.join(TLS_DIR, "san.ext")
+    try:
+        with open(ext, "w", encoding="utf-8") as fh:
+            fh.write(
+                "basicConstraints=CA:FALSE\n"
+                "keyUsage=digitalSignature,keyEncipherment\n"
+                "extendedKeyUsage=serverAuth\n"
+                f"subjectAltName={san_text}\n"
+            )
+        subprocess.run(
+            ["openssl", "genrsa", "-out", TLS_KEY, "2048"],
+            check=True, capture_output=True, timeout=20,
+        )
+        subprocess.run(
+            ["openssl", "req", "-new", "-key", TLS_KEY, "-out", csr, "-subj", "/CN=TailDeck"],
+            check=True, capture_output=True, timeout=20,
+        )
+        subprocess.run(
+            [
+                "openssl", "x509", "-req", "-in", csr,
+                "-CA", TLS_CA, "-CAkey", ca_key, "-CAcreateserial",
+                "-out", TLS_CERT, "-days", "825", "-sha256", "-extfile", ext,
+            ],
+            check=True, capture_output=True, timeout=20,
+        )
+        try:
+            os.chmod(TLS_KEY, 0o600)
+        except Exception:
+            pass
+    except Exception as exc:
+        print(f"[TailDeck] certificate refresh failed: {exc}", flush=True)
+        return False
+    finally:
+        for path in (csr, ext):
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+
+    if tls_context is not None:
+        try:
+            tls_context.load_cert_chain(TLS_CERT, TLS_KEY)
+        except Exception as exc:
+            print(f"[TailDeck] TLS reload failed: {exc}", flush=True)
+    return True
+
+
+def discovery_payload():
+    """What the phone needs to decide how to reach this laptop."""
+    tailnet = tailnet_dns_name()
+    return {
+        "t": "td_beacon",
+        "v": 1,
+        "id": device_id(),
+        "name": socket.gethostname(),
+        "daemon": DAEMON_VERSION,
+        "ports": {"http": PORT, "https": TLS_PORT},
+        "interfaces": usable_interfaces(),
+        "addresses": local_ipv4_addresses(),
+        "certSha256": cert_fingerprint(),
+        "certNames": sorted({value for kind, value in cert_san() if kind == "DNS"}),
+        "tailnet": tailnet,
+        "ts": int(time.time()),
+    }
+
+
+_STOP = threading.Event()
+
+
+def _beacon_listener():
+    """Answer a phone's `td_probe` (unicast or multicast) without waiting a cycle."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("", BEACON_PORT))
+    except Exception:
+        sock.close()
+        return
+    # A phone that cannot broadcast on its own AP interface can still join the
+    # group and probe it. Join on every usable link; failures are non-fatal.
+    for item in usable_interfaces():
+        try:
+            mreq = socket.inet_aton(BEACON_GROUP) + socket.inet_aton(item["address"])
+            sock.setsockopt(socket.IPPROTO_IP, 35, mreq)  # IP_ADD_MEMBERSHIP
+        except Exception:
+            pass
+    sock.settimeout(2.0)
+    while not _STOP.is_set():
+        try:
+            data, peer = sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+        except Exception:
+            break
+        if not data.strip().startswith(b"td_probe"):
+            continue
+        try:
+            sock.sendto(json.dumps(discovery_payload()).encode("utf-8"), peer)
+        except Exception:
+            pass
+    try:
+        sock.close()
+    except Exception:
+        pass
+
+
+def _beacon_broadcaster():
+    """Announce on every usable interface, so no IP range is assumed."""
+    while not _STOP.wait(0.2):
+        payload = json.dumps(discovery_payload()).encode("utf-8")
+        for item in usable_interfaces():
+            for target in (item.get("broadcast"), "255.255.255.255", BEACON_GROUP):
+                if not target:
+                    continue
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    try:
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                        try:
+                            sock.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, item["interface"].encode())
+                        except Exception:
+                            pass
+                        sock.sendto(payload, (target, BEACON_PORT))
+                    finally:
+                        sock.close()
+                except Exception:
+                    pass
+        _STOP.wait(BEACON_INTERVAL)
+
+
+def start_discovery():
+    threading.Thread(target=_beacon_listener, daemon=True, name="taildeck-beacon-rx").start()
+    threading.Thread(target=_beacon_broadcaster, daemon=True, name="taildeck-beacon-tx").start()
+
+
+def _identity_watch(tls_context):
+    """Keep the certificate in step with the laptop's current addresses."""
+    while not _STOP.wait(30.0):
+        try:
+            if ensure_certificate(tls_context):
+                print(
+                    "[TailDeck] Certificate refreshed for the current addresses "
+                    f"({', '.join(local_ipv4_addresses()) or 'no LAN address'})",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(f"[TailDeck] certificate watch: {exc}", flush=True)
 
 
 def tailnet_dns_name():
@@ -3706,6 +5025,13 @@ def handle_websocket(conn):
         data = raw.decode('utf-8', errors='ignore')
         if "Upgrade: websocket" not in data:
             request_line = data.split("\r\n", 1)[0] if data else "GET / HTTP/1.1"
+            # _http needs the Origin to decide whether to echo it and whether
+            # a loopback caller is really the laptop's own page, and it has no
+            # request object of its own, so carry it on this handler thread.
+            try:
+                REQUEST_ORIGIN.origin = _parse_headers(data).get("origin", "")
+            except Exception:
+                REQUEST_ORIGIN.origin = ""
             if handle_api(conn, raw, request_line):
                 conn.close()
                 return
@@ -3758,9 +5084,17 @@ def handle_websocket(conn):
         conn.sendall(handshake_resp.encode('utf-8'))
 
         # Remote-desktop sessions ride the same listener but bypass the command
-        # protocol: the WebSocket *is* the RFB stream from here on.
+        # protocol: the WebSocket *is* the RFB stream from here on. An RFB
+        # client cannot send a JSON hello, so it proves itself with a query
+        # token instead (the app does not currently open this route).
         request_target = data.split(" ", 2)[1] if " " in data else ""
+        local_client = _request_is_local(conn, headers)
         if request_target.split("?")[0] == "/api/rdp/ws":
+            rdp_token = _query(request_target).get("token", "")
+            if not (local_client or _device_token_ok(rdp_token)):
+                send_ws_close(conn, 4401, "pairing required")
+                conn.close()
+                return
             print(f"[TailDeck] rdp open {logged_peer}", flush=True)
             record_connection("connected", logged_peer, scheme, route, "rdp")
             _rdp_proxy(conn)
@@ -3768,18 +5102,41 @@ def handle_websocket(conn):
             conn.close()
             return
 
+        # Pairing or an existing device token must arrive before anything else.
+        # A local browser is already trusted (a local process can drive input
+        # anyway); a remote client gets five seconds to prove itself.
+        authed = local_client
+        if not authed:
+            authed = _ws_authenticate(conn)
+
+        if not authed:
+            print(f"[TailDeck] ws rejected {logged_peer}: pairing required", flush=True)
+            send_ws_close(conn, 4401, "pairing required")
+            conn.close()
+            return
+
         # Send initial host handshake message
         welcome = {
             "type": "host_info",
+            # Stable identity, independent of the address or hostname. A phone
+            # keys its candidates on this so moving networks is not a new laptop.
+            "id": device_id(),
             "hostname": socket.gethostname(),
             "os": sys.platform,
             "session": "Wayland" if "wayland" in SESSION_TYPE else ("X11" if "x11" in SESSION_TYPE else "Unknown"),
             "backend": BACKEND_NAME,
             # How the phone can reach this laptop next time. The LAN addresses
             # only work on the same hotspot; the tailnet name works anywhere.
+            # Only interfaces a phone can actually reach are listed; container
+            # bridges and tunnels are filtered out.
             "addresses": local_ipv4_addresses(),
+            "interfaces": usable_interfaces(),
             "tailnet": tailnet_dns_name(),
             "ports": {"http": PORT, "https": TLS_PORT},
+            # Pin the leaf, not the address: a new DHCP lease must not look like
+            # a different laptop to a phone that has seen it before.
+            "certSha256": cert_fingerprint(),
+            "certNames": sorted({value for kind, value in cert_san() if kind == "DNS"}),
             # Which optional endpoint groups this daemon answers, so a client
             # can hide controls instead of probing.
             "capabilities": _capabilities(),
@@ -3886,9 +5243,18 @@ def handle_websocket(conn):
                     pong = {"type": "pong", "timestamp": msg.get("timestamp", time.time() * 1000)}
                     send_ws_frame(conn, json.dumps(pong))
             except Exception as e:
-                pass
+                # A malformed frame must not kill the connection, but it must
+                # not vanish either: this used to be a silent `pass`.
+                print(f"[TailDeck] {peer} message error: {e}", flush=True)
+                try:
+                    send_ws_frame(conn, json.dumps({
+                        "type": "error",
+                        "error": str(e)[:200] or "invalid message",
+                    }))
+                except Exception:
+                    pass
     except Exception as e:
-        pass
+        print(f"[TailDeck] {logged_peer} connection error: {e}", flush=True)
     finally:
         if is_ws:
             DICTATION.stop(conn)
@@ -3952,6 +5318,80 @@ def read_ws_frame(conn):
         return data.decode('utf-8', errors='ignore')
     except Exception:
         return None
+
+
+def send_ws_close(conn, code, reason=""):
+    """Close a websocket with a status code the client can act on."""
+    try:
+        payload = struct.pack("!H", int(code)) + str(reason).encode("utf-8")[:120]
+        header = bytearray([0x88])
+        if len(payload) <= 125:
+            header.append(len(payload))
+        else:
+            header.append(126)
+            header.extend(struct.pack("!H", len(payload)))
+        conn.sendall(bytes(header) + payload)
+    except Exception:
+        pass
+
+
+def _ws_authenticate(conn, timeout=5.0):
+    """Read the first frame: `hello` with a device token, or `pair` with a
+    one-time code. Returns True when the connection may proceed.
+
+    The server deliberately sends nothing before this, so an unauthenticated
+    client learns neither the hostname nor the addresses.
+    """
+    try:
+        conn.settimeout(timeout)
+    except Exception:
+        pass
+    try:
+        payload = read_ws_frame(conn)
+    finally:
+        try:
+            conn.settimeout(None)
+        except Exception:
+            pass
+    if not payload:
+        return False
+    try:
+        msg = json.loads(payload)
+    except Exception:
+        return False
+    if not isinstance(msg, dict):
+        return False
+
+    mtype = msg.get("type")
+    if mtype == "hello":
+        return _device_token_ok(str(msg.get("token") or ""))
+
+    if mtype == "pair":
+        label = _consume_pair_code(str(msg.get("code") or ""))
+        if label is None:
+            send_ws_frame(conn, json.dumps({
+                "type": "pair_error",
+                "error": "That pairing code is not valid or has expired.",
+            }))
+            return False
+        dev_id, token = _mint_device(msg.get("label") or label)
+        if not token:
+            send_ws_frame(conn, json.dumps({
+                "type": "pair_error",
+                "error": "Could not save the paired device.",
+            }))
+            return False
+        print(f"[TailDeck] paired device {dev_id} ({label})", flush=True)
+        send_ws_frame(conn, json.dumps({
+            "type": "paired",
+            "id": dev_id,
+            "token": token,
+            "label": label,
+        }))
+        return True
+
+    return False
+
 
 def run_ws_server(port=PORT, tls_context=None):
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -4036,8 +5476,18 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "notify":
         sys.exit(_cli_notify(sys.argv[2:]))
     try:
+        # A moved address used to leave the old IP in the certificate, which
+        # Android WebView cancels without explanation. Heal it before the TLS
+        # listener starts; the watcher below keeps it in step afterwards.
+        try:
+            if ensure_certificate():
+                print("[TailDeck] Certificate refreshed for the current addresses")
+        except Exception as exc:
+            print(f"[TailDeck] certificate check skipped: {exc}")
+
         tls_context = build_tls_context()
         atexit.register(_vnc_stop)
+        atexit.register(_STOP.set)
 
         print(f"[TailDeck] Daemon listening on 0.0.0.0:{PORT} (Tailscale IP compatible)")
         print(f"[TailDeck] Session: {SESSION_TYPE.upper()} | Backend: {BACKEND_NAME}")
@@ -4067,6 +5517,16 @@ if __name__ == "__main__":
                 print(f"[TailDeck]                  http://{ip}:{PORT}/    (control only)")
             else:
                 print(f"[TailDeck] Same-hotspot URL: http://{ip}:{PORT}/")
+        print(f"[TailDeck] Identity: {device_id()} "
+              f"cert={'pinned ' + (cert_fingerprint() or 'none')[:16] if cert_fingerprint() else 'none'}")
+        print(f"[TailDeck] Discovery: UDP {BEACON_PORT} every {BEACON_INTERVAL:g}s on "
+              f"{', '.join(item['interface'] for item in usable_interfaces()) or 'no usable interface'}")
+
+        start_discovery()
+        if tls_context is not None:
+            threading.Thread(
+                target=_identity_watch, args=(tls_context,), daemon=True, name="taildeck-identity"
+            ).start()
 
         if tls_context is not None:
             t = threading.Thread(

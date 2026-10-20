@@ -107,8 +107,7 @@ export const BottomClickButtons: React.FC<BottomClickButtonsProps> = ({
     }, LONG_PRESS_DURATION);
   };
 
-  const handleLeftUp = (e: React.PointerEvent) => {
-    e.preventDefault();
+  const handleLeftUp = (e: React.PointerEvent) => {    e.preventDefault();
     setIsLeftPressed(false);
     const holdTime = Date.now() - leftStartTimeRef.current;
     clearLeftHold();
@@ -189,6 +188,22 @@ export const BottomClickButtons: React.FC<BottomClickButtonsProps> = ({
     }
   };
 
+  // role="button" does not make Enter/Space click by itself. Keyboard users get
+  // the plain tap behaviour; hold gestures stay pointer-only.
+  const handleLeftKey = (e: React.KeyboardEvent) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    e.preventDefault();
+    triggerClick();
+    linuxClient.sendClick('left', 'click');
+  };
+
+  const handleRightKey = (e: React.KeyboardEvent) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    e.preventDefault();
+    triggerHeavyClick();
+    linuxClient.sendClick('right', 'click');
+  };
+
   return (
     <div className="w-full bg-slate-950 border-t border-slate-900 p-2.5 sm:p-3 select-none">
       {/* 2 Pure Tactile Click Buttons: Unlabelled, Clean, and Hardware-feeling */}
@@ -198,6 +213,7 @@ export const BottomClickButtons: React.FC<BottomClickButtonsProps> = ({
           onPointerDown={handleLeftDown}
           onPointerUp={handleLeftUp}
           onPointerCancel={handleLeftUp}
+          onKeyDown={handleLeftKey}
           role="button"
           tabIndex={0}
           aria-label="Left click"
@@ -217,7 +233,7 @@ export const BottomClickButtons: React.FC<BottomClickButtonsProps> = ({
           )}
           {/* Subtle center tactile pill indicator */}
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none opacity-40">
-            <div className="w-8 h-1 rounded-full bg-slate-500" />
+            <div className="w-8 h-1 rounded-full bg-sky-400" />
           </div>
         </div>
 
@@ -227,6 +243,7 @@ export const BottomClickButtons: React.FC<BottomClickButtonsProps> = ({
           onPointerMove={handleRightMove}
           onPointerUp={handleRightUp}
           onPointerCancel={handleRightUp}
+          onKeyDown={handleRightKey}
           role="button"
           tabIndex={0}
           aria-label="Right click. Hold and drag up or down to resize the buttons."
@@ -253,7 +270,7 @@ export const BottomClickButtons: React.FC<BottomClickButtonsProps> = ({
                 {Math.round(rightScaleRef.current * 100)}%
               </span>
             ) : (
-              <div className="w-8 h-1 rounded-full bg-slate-500 opacity-40" />
+              <div className="w-8 h-1 rounded-full bg-sky-400 opacity-40" />
             )}
           </div>
         </div>

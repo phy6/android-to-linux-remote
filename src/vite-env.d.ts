@@ -23,9 +23,36 @@ interface TailDeckNativeAppBridge {
    * only way a host switch keeps localStorage and the socket on one origin.
    */
   switchHost?: (host: string, port: number, isHttps: boolean) => void;
+  /**
+   * The shell's roster of laptops it has reached, as a JSON array of
+   * `{ host, name, port, isHttps, last }`. Origin-independent, so a host switch
+   * cannot strand the list in the origin that was left.
+   */
+  getSavedHosts?: () => string;
+  /** Record a laptop the page just reached (same JSON shape as one roster entry). */
+  rememberHost?: (json: string) => void;
+  /**
+   * The shell's origin-independent device-token store, as JSON. A host switch
+   * changes the WebView origin, so without this the next origin cannot open a
+   * background link to the laptop it left.
+   */
+  getDeviceTokens?: () => string;
+  /** Persist the whole token store in the shell after a pairing/re-key. */
+  saveDeviceTokens?: (json: string) => void;
 }
 
 interface Window {
   taildeck?: TailDeckNativeShim;
   TailDeckNative?: TailDeckNativeAppBridge;
+  /**
+   * Called by the native shell (via evaluateJavascript) from the laptop icon +
+   * host name in the status bar. Opens the device info sheet; the spatial
+   * canvas is linked one layer below it.
+   */
+  __taildeckOpenDeviceInfo?: () => void;
+  /**
+   * Legacy name for the same native status-bar action. Installed shells still
+   * call this; keep it aliased so the host identity works without an update.
+   */
+  __taildeckOpenSpatial?: () => void;
 }

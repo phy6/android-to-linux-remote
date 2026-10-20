@@ -40,6 +40,11 @@ decision to use **both** the phone-as-mic path and laptop coexistence.
 - **Owner-guard every session.** Dictation and recording are per-connection; only the
   connection that opened a session may feed or close it, and it must be finalised on
   disconnect.
+- **Remote callers need a device token.** The websocket sends `hello`/`pair` before
+  `host_info`; REST uses `Authorization: Bearer`. The only exemption is loopback
+  with no `X-Forwarded-For` and an allowlisted (or absent) `Origin`. Keep CORS
+  explicit — never reintroduce `Access-Control-Allow-Origin: *`. Details:
+  [`plans/security-hardening.md`](plans/security-hardening.md).
 
 ## Gates (run before calling anything done)
 

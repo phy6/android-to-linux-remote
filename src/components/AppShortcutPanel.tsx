@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Check, Loader2, Search, Star } from 'lucide-react';
+import { useIconObjectUrl } from '../hooks/useIconObjectUrl';
 import {
   AppEntry,
   appIconUrl,
@@ -19,10 +20,11 @@ interface AppShortcutPanelProps {
 type LaunchState = 'idle' | 'busy' | 'done' | 'failed';
 
 const AppIcon: React.FC<{ host: string; app: AppEntry; size: number }> = ({ host, app, size }) => {
-  const url = appIconUrl(host, app);
-  const [broken, setBroken] = useState(false);
+  // The daemon now requires the device token, which <img> cannot send; the
+  // hook fetches through the authenticated client and returns a blob URL.
+  const url = useIconObjectUrl(appIconUrl(host, app));
   const style = { width: `${size}px`, height: `${size}px` };
-  if (!url || broken) {
+  if (!url) {
     return (
       <div
         style={style}
@@ -40,7 +42,6 @@ const AppIcon: React.FC<{ host: string; app: AppEntry; size: number }> = ({ host
       decoding="async"
       style={style}
       className="shrink-0 rounded-lg object-contain"
-      onError={() => setBroken(true)}
     />
   );
 };

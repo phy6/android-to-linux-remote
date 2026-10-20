@@ -21,6 +21,9 @@ import {
 } from '../services/filesClient';
 import { ShareLinkDialog } from './ShareLinkDialog';
 import { ShareLinksPanel } from './ShareLinksPanel';
+import { useLongPressDrag, dropTargetAt } from '../hooks/useLongPressDrag';
+import { bestAddressForSaved } from '../services/hostRoutes';
+import { DragGhost } from './DragGhost';
 
 interface FilesTabProps {
   host: string;
@@ -118,8 +121,11 @@ export const FilesTab: React.FC<FilesTabProps> = ({ host, otherHosts = [] }) => 
   const onSendTo = async (entry: ShareEntry, target: { host: string; name: string }) => {
     setSendFor(null);
     setBusy(entry.path);
+    // Resolve the target identity to its best usable route (direct link first,
+    // and TLS when this page is https) before brokering the copy.
+    const targetAddress = bestAddressForSaved(target.host);
     if (entry.dir) {
-      const result = await transferFolderViaPhone(host, target.host, entry.path, '');
+      const result = await transferFolderViaPhone(host, targetAddress, entry.path, '');
       setBusy(null);
       setNote(
         result.ok
@@ -130,7 +136,7 @@ export const FilesTab: React.FC<FilesTabProps> = ({ host, otherHosts = [] }) => 
       );
       return;
     }
-    const result = await transferFileViaPhone(host, target.host, entry.path, '');
+    const result = await transferFileViaPhone(host, targetAddress, entry.path, '');
     setBusy(null);
     setNote(
       result.ok
@@ -138,6 +144,20 @@ export const FilesTab: React.FC<FilesTabProps> = ({ host, otherHosts = [] }) => 
         : `Could not send ${entry.name}: ${result.error ?? 'unknown error'}`,
     );
   };
+
+  // Long-press a row and drop it on a laptop chip to copy it across without
+  // opening the per-row tray. The tray button stays for discoverability.
+  const drag = useLongPressDrag<ShareEntry>({
+    onDrop: (entry, point) => {
+      const host = dropTargetAt(point, 'data-drop-host')?.dataset.dropHost;
+      const target = otherHosts.find((t) => t.host === host);
+      if (target) void onSendTo(entry, target);
+      else setNote('Drop on a laptop to copy');
+    },
+  });
+  const hoveredHost = drag.point
+    ? dropTargetAt(drag.point, 'data-drop-host')?.dataset.dropHost ?? null
+    : null;
 
   const parts = dir ? dir.split('/') : [];
   const crumbs = [
@@ -218,6 +238,8 @@ export const FilesTab: React.FC<FilesTabProps> = ({ host, otherHosts = [] }) => 
           {entries.map((entry) => (
             <div key={entry.path} className="space-y-1.5">
               <div
+                {...drag.handlers}
+                onPointerDown={drag.begin(entry)}
                 role="button"
                 tabIndex={0}
                 aria-disabled={busy === entry.path}
@@ -228,9 +250,10 @@ export const FilesTab: React.FC<FilesTabProps> = ({ host, otherHosts = [] }) => 
                   if (entry.dir) setDir(entry.path);
                   else void onDownload(entry);
                 }}
-                className={`w-full flex items-center gap-2.5 p-2.5 rounded-xl bg-slate-900 border border-slate-800 text-left hover:border-slate-700 active:bg-slate-800/60 ${
+                style={{ WebkitTouchCallout: 'none' }}
+                className={`w-full flex items-center gap-2.5 p-2.5 rounded-xl bg-slate-900 border border-slate-800 text-left hover:border-slate-700 active:bg-slate-800/60 select-none touch-manipulation ${
                   busy === entry.path ? 'opacity-60' : 'cursor-pointer'
-                }`}
+                } ${drag.active?.path === entry.path ? 'ring-2 ring-sky-500/60 opacity-60' : ''}`}
               >
                 <div
                   className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 border ${
@@ -251,6 +274,7 @@ export const FilesTab: React.FC<FilesTabProps> = ({ host, otherHosts = [] }) => 
                 {otherHosts.length > 0 && (
                   <button
                     type="button"
+                    onPointerDown={(e) => e.stopPropagation()}
                     onClick={(e) => {
                       e.stopPropagation();
                       setSendFor(sendFor === entry.path ? null : entry.path);
@@ -299,6 +323,39 @@ export const FilesTab: React.FC<FilesTabProps> = ({ host, otherHosts = [] }) => 
           dir={dir}
           onClose={() => setSharing(false)}
           onCreated={() => setSharesKey((k) => k + 1)}
+        />
+      )}
+
+      {/* Drop dock: only while a row is held, so it never covers the list. */}
+      {otherHosts.length > 0 && drag.active && (
+        <div className="fixed inset-x-0 bottom-0 z-[70] px-3 py-3 bg-slate-950/95 border-t border-sky-500/40 backdrop-blur">
+          <div className="text-[10px] uppercase tracking-wide text-slate-400 mb-2 text-center">
+            Drop <span className="text-sky-300">{drag.active.name}</span> on a laptop
+          </div>
+          <div className="flex flex-wrap gap-2 justify-center">
+            {otherHosts.map((target) => (
+              <div
+                key={target.host}
+                data-drop-host={target.host}
+                className={`px-4 py-3 rounded-2xl border text-center ${
+                  hoveredHost === target.host
+                    ? 'bg-sky-500 border-sky-400 text-slate-950'
+                    : 'bg-slate-900 border-slate-700 text-sky-300'
+                }`}
+              >
+                <div className="text-xs font-semibold">{target.name || target.host}</div>
+                <div className="text-[10px] font-mono opacity-70">{target.host}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {drag.active && drag.point && (
+        <DragGhost
+          point={drag.point}
+          label={drag.active.name}
+          detail={drag.active.dir ? 'Folder' : formatSize(drag.active.size)}
         />
       )}
     </div>

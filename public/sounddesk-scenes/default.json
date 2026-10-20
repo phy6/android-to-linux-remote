@@ -1,0 +1,16 @@
+{
+  "sources": {
+    "browser": { "id": "browser", "name": "Browser", "kind": "app", "target": "pw:browser" },
+    "mic": { "id": "mic", "name": "Laptop mic", "kind": "mic", "target": "alsa_input.pci-0000_00_1b.0.analog-stereo" },
+    "phone": { "id": "phone", "name": "Phone mic", "kind": "phone", "target": "taildeck:phone" }
+  },
+  "sinks": {
+    "jack": { "id": "jack", "name": "Laptop jack", "kind": "analog", "zone": "independent", "target": "alsa_output.pci-0000_00_1b.0.analog-stereo" },
+    "bt": { "id": "bt", "name": "BT speaker", "kind": "bluetooth", "zone": "independent", "target": "bluez_output.F8_5C_7E_85_B9_2B" },
+    "rooms": { "id": "rooms", "name": "Multi-room", "kind": "network", "zone": "synchronised", "target": "snapcast:default" }
+  },
+  "routes": [
+    { "source_id": "browser", "sink_id": "bt", "gain": 1.0, "mute": false },
+    { "source_id": "phone", "sink_id": "jack", "gain": 0.8, "mute": false }
+  ]
+}

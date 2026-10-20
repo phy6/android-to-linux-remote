@@ -12,3 +12,7 @@ __pycache__/
 
 # Generated pairing-QR pages; embed the live LAN IP and tailnet hostname.
 qrs/
+
+# Local dev artifacts: vite's dev-mode PWA output and playwright screenshots.
+dev-dist/
+.playwright-mcp/

@@ -1,5 +1,13 @@
 import { ConnectionStatus, InputEventPayload, MediaAction, SessionType, NowPlaying } from '../types';
 import type { AuthAssertion, AuthChallenge } from './authClient';
+import {
+  isMixedContentBlocked,
+  parseHostTarget,
+  preferHttps,
+  targetKey,
+  wsUrl,
+} from './netTarget';
+import { getDeviceToken, rememberDaemonId, saveDeviceToken } from './deviceAuth';
 
 export type { MediaAction };
 
@@ -54,6 +62,19 @@ class LinuxClientService {
   // The daemon's TLS port, learned from `host_info`. Used to pick wss:// vs
   // ws:// from the port we're dialing rather than the page's own scheme.
   private knownHttpsPort = 8443;
+  // A dropped link must recover on its own. The chain that tries alternative
+  // addresses opts out, so a dead candidate cannot retry forever; once a host
+  // answers, auto-reconnect is switched back on.
+  private autoReconnect = true;
+  private retryHost = '';
+  // A one-time code from a scanned QR. Sent instead of `hello` on the first
+  // connection; it is replaced by a device token when the daemon answers
+  // `paired`.
+  private pendingPairCode: string | null = null;
+  private retrySession: SessionType = 'auto';
+  private retryAttempt = 0;
+  private retryTimer: number | null = null;
+  private lastPongAt = 0;
 
   private status: ConnectionStatus = {
     connected: false,
@@ -166,54 +187,95 @@ class LinuxClientService {
     this.listeners.forEach((cb) => cb(payload));
   }
 
-  public connect(host: string, sessionType: SessionType = 'auto') {
-    this.disconnect();
+  public connect(
+    host: string,
+    sessionType: SessionType = 'auto',
+    autoReconnect = true,
+    pairCode?: string,
+  ) {
+    this.closeSocket();
+    this.autoReconnect = autoReconnect;
+    this.retryHost = host;
+    this.retrySession = sessionType;
+    // Only a caller that actually has a code should replace it; a route
+    // re-resolve or a reconnect must not discard a pending pairing.
+    if (pairCode !== undefined) this.setPendingPairCode(pairCode);
+    if (!this.pendingPairCode) {
+      try {
+        const stored = sessionStorage.getItem('taildeck_pair_code');
+        if (stored) this.pendingPairCode = stored;
+      } catch {
+        // Ignore.
+      }
+    }
+    this.clearRetryTimer();
 
-    const raw = host.trim();
-    const pageIsSecure =
-      typeof location !== 'undefined' && location.protocol === 'https:';
-    const explicitSecureScheme = /^(https|wss):\/\//i.test(raw);
-    const explicitPlainScheme = /^(http|ws):\/\//i.test(raw);
-    const cleanHost = raw
-      .replace(/^https?:\/\//i, '')
-      .replace(/^wss?:\/\//i, '');
+    const target = parseHostTarget(host);
+    if (!target) {
+      this.status = {
+        ...this.status,
+        connected: false,
+        connecting: false,
+        error: `Not a usable host address: ${host}`,
+      };
+      this.notifyStatus();
+      return;
+    }
 
-    // Choose the transport from the port we're dialing, not the page's scheme.
-    // The daemon serves plain HTTP on its http port and TLS on its https port,
-    // so an https page must reach the http port over ws:// and an http page
-    // must reach the https port over wss://. Using the page scheme broke
-    // `<host>:8443` (LAN/`.local` https) from an http page and `<host>:8080`
-    // from an https page.
-    const portMatch = cleanHost.match(/:(\d+)$/);
-    const port = portMatch ? Number(portMatch[1]) : null;
-    const secure =
-      explicitSecureScheme ||
-      (!explicitPlainScheme &&
-        (port === 443 ||
-          port === this.knownHttpsPort ||
-          (port === null && pageIsSecure)));
-    const wsUrl = `${secure ? 'wss' : 'ws'}://${cleanHost}`;
+    // An https page cannot open ws:// (mixed content). Move a plain target to
+    // the daemon's TLS port instead of constructing a socket the browser will
+    // refuse; a route resolved from the roster should already have done this.
+    const usable = isMixedContentBlocked(target, this.knownHttpsPort)
+      ? preferHttps(target, this.knownHttpsPort)
+      : target;
+    const cleanHost = targetKey(usable);
+    // The daemon serves plain HTTP on its http port and TLS on its https port.
+    // The shared parser lets an explicit scheme or port win; only a bare host
+    // follows the page scheme.
+    const socketUrl = wsUrl(usable, this.knownHttpsPort);
 
+    // A switch starts with the previous laptop's host_info still in state.
+    // Keeping it would let identity folding attribute the new route to the old
+    // laptop while the new handshake is still in flight.
+    const changedHost = cleanHost !== this.status.hostAddress;
     this.status = {
       ...this.status,
       hostAddress: cleanHost,
       sessionType,
       connecting: true,
       error: null,
+      hostOsInfo: changedHost ? undefined : this.status.hostOsInfo,
     };
     this.notifyStatus();
 
     try {
-      const ws = new WebSocket(wsUrl);
+      const ws = new WebSocket(socketUrl);
       this.socket = ws;
 
       ws.onopen = () => {
+        console.info('[TailDeck] connected', socketUrl, 'autoReconnect=', this.autoReconnect);
+        // Authenticate before anything else. A scanned pairing code is spent on
+        // this first connection; later ones use the stored device token.
+        const pairCode = this.pendingPairCode;
+        const token = getDeviceToken(this.retryHost || host);
+        try {
+          if (pairCode) {
+            ws.send(JSON.stringify({ type: 'pair', code: pairCode, label: 'phone' }));
+            this.clearPairCode();
+          } else if (token) {
+            ws.send(JSON.stringify({ type: 'hello', token }));
+          }
+        } catch {
+          // onerror/onclose drive the retry.
+        }
         this.status = {
           ...this.status,
           connected: true,
           connecting: false,
           error: null,
         };
+        this.retryAttempt = 0;
+        this.lastPongAt = performance.now();
         this.notifyStatus();
         this.startPingLoop();
       };
@@ -221,8 +283,27 @@ class LinuxClientService {
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-          if (data.type === 'pong') {
+          if (data.type === 'paired') {
+            const token = typeof data.token === 'string' ? data.token : '';
+            if (token) {
+              saveDeviceToken(this.retryHost || host, token);
+              this.clearPairCode();
+              console.info('[TailDeck] paired with', data.label || 'laptop');
+            }
+          } else if (data.type === 'pair_error') {
+            this.clearPairCode();
+            // A bad/expired code cannot succeed on retry.
+            this.autoReconnect = false;
+            this.status = {
+              ...this.status,
+              connected: false,
+              connecting: false,
+              error: String(data.error || 'Pairing code rejected. Show a new code on the laptop.'),
+            };
+            this.notifyStatus();
+          } else if (data.type === 'pong') {
             const now = performance.now();
+            this.lastPongAt = now;
             const latency = Math.max(1, Math.round(now - this.pingStart));
             this.status = { ...this.status, latencyMs: latency };
             this.notifyStatus();
@@ -336,16 +417,25 @@ class LinuxClientService {
             if (typeof data.ports?.https === 'number') {
               this.knownHttpsPort = data.ports.https;
             }
+            if (typeof data.id === 'string' && data.id) {
+              // Re-key the token under the daemon's stable id, so the same
+              // laptop on another route still finds it.
+              rememberDaemonId(this.retryHost || host, data.id);
+            }
             this.status = {
               ...this.status,
               hostOsInfo: {
+                id: typeof data.id === 'string' ? data.id : undefined,
                 hostname: data.hostname || 'linux-laptop',
                 os: data.os || 'Linux',
                 session: data.session || 'Wayland',
                 backend: data.backend || 'uinput',
                 addresses: Array.isArray(data.addresses) ? data.addresses : [],
+                interfaces: Array.isArray(data.interfaces) ? data.interfaces : [],
                 tailnet: data.tailnet ?? null,
                 ports: data.ports,
+                certSha256: typeof data.certSha256 === 'string' ? data.certSha256 : null,
+                certNames: Array.isArray(data.certNames) ? data.certNames : [],
               },
             };
             this.notifyStatus();
@@ -357,13 +447,17 @@ class LinuxClientService {
               try {
                 window.TailDeckNative?.onHostInfo(
                   JSON.stringify({
+                    id: data.id || '',
                     hostname: data.hostname || 'linux-laptop',
                     os: data.os || '',
                     session: data.session || 'Wayland',
                     backend: data.backend || '',
                     addresses: Array.isArray(data.addresses) ? data.addresses : [],
+                    interfaces: Array.isArray(data.interfaces) ? data.interfaces : [],
                     tailnet: data.tailnet ?? '',
                     ports: data.ports ?? null,
+                    certSha256: data.certSha256 ?? null,
+                    certNames: Array.isArray(data.certNames) ? data.certNames : [],
                     capabilities: Array.isArray(data.capabilities) ? data.capabilities : [],
                     screen: data.screen ?? null,
                   })
@@ -382,19 +476,37 @@ class LinuxClientService {
         this.status = {
           ...this.status,
           connecting: false,
-          error: 'Connection to Tailscale host failed or refused.',
+          error: `Could not reach ${cleanHost}. Check that the laptop is on the same link.`,
         };
         this.notifyStatus();
       };
 
-      ws.onclose = () => {
+      ws.onclose = (event) => {
+        // A replaced socket (host switch, retry) must not report for the one we
+        // are now using, or it would schedule a retry against the new host.
+        if (this.socket !== ws) {
+          console.info('[TailDeck] stale socket closed', socketUrl);
+          return;
+        }
+        // 4401 is the daemon saying it does not know this device. Retrying
+        // would only loop; the phone must scan a fresh pairing code.
+        if (event?.code === 4401) {
+          this.autoReconnect = false;
+          this.clearPairCode();
+        }
+        console.info('[TailDeck] socket closed', socketUrl, 'autoReconnect=', this.autoReconnect, 'retryHost=', this.retryHost);
         this.status = {
           ...this.status,
           connected: false,
           connecting: false,
+          error:
+            event?.code === 4401
+              ? 'This laptop needs pairing. Show a code on the laptop and scan it.'
+              : this.status.error,
         };
         this.stopPingLoop();
         this.notifyStatus();
+        this.scheduleReconnect();
       };
     } catch (err) {
       this.status = {
@@ -404,11 +516,95 @@ class LinuxClientService {
         error: String(err),
       };
       this.notifyStatus();
+      this.scheduleReconnect();
+    }
+  }
+
+  /** True while a scanned/typed pairing code is still waiting to be spent. */
+  public hasPendingPairCode(): boolean {
+    if (this.pendingPairCode) return true;
+    try {
+      return !!sessionStorage.getItem('taildeck_pair_code');
+    } catch {
+      return false;
+    }
+  }
+
+  /** Supply a one-time code from a scanned pairing QR before connecting. */
+  public setPendingPairCode(code?: string) {
+    this.pendingPairCode = code?.trim() || null;
+    try {
+      // The native shell reloads the WebView when switching laptops, so keep
+      // the code across that navigation until it is spent or rejected.
+      if (this.pendingPairCode) sessionStorage.setItem('taildeck_pair_code', this.pendingPairCode);
+      else sessionStorage.removeItem('taildeck_pair_code');
+    } catch {
+      // Private mode / disabled storage: the in-memory value still works.
+    }
+  }
+
+  private clearPairCode() {
+    this.pendingPairCode = null;
+    try {
+      sessionStorage.removeItem('taildeck_pair_code');
+    } catch {
+      // Ignore.
+    }
+  }
+
+  /** Turn retrying on or off; a manual disconnect turns it off. */
+  public setAutoReconnect(enabled: boolean) {
+    console.info('[TailDeck] autoReconnect=', enabled);
+    this.autoReconnect = enabled;
+    if (!enabled) this.clearRetryTimer();
+  }
+
+  private clearRetryTimer() {
+    if (this.retryTimer !== null) {
+      window.clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+  }
+
+  private scheduleReconnect() {
+    if (!this.autoReconnect || !this.retryHost || this.retryTimer !== null) return;
+    const base = Math.min(15000, 1000 * 2 ** Math.min(this.retryAttempt, 4));
+    const delay = base + Math.round(Math.random() * 400);
+    this.retryAttempt += 1;
+    console.info('[TailDeck] scheduling retry', delay, 'attempt', this.retryAttempt, 'host', this.retryHost);
+    this.status = {
+      ...this.status,
+      error: this.retryHost
+        ? `Reconnecting to ${this.retryHost} (attempt ${this.retryAttempt})…`
+        : this.status.error,
+    };
+    this.notifyStatus();
+    this.retryTimer = window.setTimeout(() => {
+      this.retryTimer = null;
+      if (!this.autoReconnect) return;
+      console.info('[TailDeck] retrying', this.retryHost);
+      this.connect(this.retryHost, this.retrySession, true);
+    }, delay);
+  }
+
+  private closeSocket() {
+    this.stopPingLoop();
+    if (this.socket) {
+      try {
+        this.socket.close();
+      } catch {
+        // Ignore
+      }
+      this.socket = null;
     }
   }
 
   public disconnect() {
-    this.stopPingLoop();
+    this.autoReconnect = false;
+    this.clearRetryTimer();
+    this.retryAttempt = 0;
+    this.clearPairCode();
+    this.closeSocket();
     // A stale track belongs to the laptop we just left; drop it so the next
     // connection starts from "nothing playing" instead of the last one.
     this.lastMediaNow = null;
@@ -436,7 +632,18 @@ class LinuxClientService {
     this.stopPingLoop();
     this.pingInterval = window.setInterval(() => {
       if (this.socket && this.socket.readyState === WS_OPEN) {
-        this.pingStart = performance.now();
+        const now = performance.now();
+        // Two missed pongs means the link is dead even if TCP has not noticed
+        // (a phone leaving the hotspot often looks like this).
+        if (this.lastPongAt && now - this.lastPongAt > 10000) {
+          try {
+            this.socket.close();
+          } catch {
+            // onclose drives the retry.
+          }
+          return;
+        }
+        this.pingStart = now;
         this.sendRaw({ type: 'ping', timestamp: Date.now() });
       }
     }, 2500);

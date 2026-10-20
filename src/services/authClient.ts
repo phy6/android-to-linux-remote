@@ -12,7 +12,7 @@
 //   * The rpId must match the page's own origin domain, so the client names it
 //     rather than relying on the daemon's default.
 
-import { apiBase } from './scriptsClient';
+import { apiBase, apiFetch } from './http';
 
 export interface AuthCredentialInfo {
   id: string;
@@ -149,7 +149,7 @@ export async function fetchAuthInfo(host: string): Promise<AuthInfo | null> {
   const base = apiBase(host);
   if (!base) return null;
   try {
-    const res = await fetch(`${base}/api/auth/info`, { cache: 'no-store' });
+    const res = await apiFetch(`${base}/api/auth/info`, { cache: 'no-store' });
     if (!res.ok) return null;
     return (await res.json()) as AuthInfo;
   } catch {
@@ -198,7 +198,7 @@ export async function registerPasskey(
     const publicKey = cosePublicKey(response.attestationObject);
     if (!publicKey) return { ok: false, error: 'could not read the new key' };
 
-    const res = await fetch(`${base}/api/webauthn/register`, {
+    const res = await apiFetch(`${base}/api/webauthn/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -221,7 +221,7 @@ export async function deleteCredential(host: string, id: string): Promise<boolea
   const base = apiBase(host);
   if (!base) return false;
   try {
-    const res = await fetch(`${base}/api/webauthn/credentials/${encodeURIComponent(id)}`, {
+    const res = await apiFetch(`${base}/api/webauthn/credentials/${encodeURIComponent(id)}`, {
       method: 'DELETE',
     });
     return res.ok;
@@ -268,7 +268,7 @@ export async function beginAuth(
   const base = apiBase(host);
   if (!base) return null;
   try {
-    const res = await fetch(`${base}/api/auth/begin`, {
+    const res = await apiFetch(`${base}/api/auth/begin`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -313,7 +313,7 @@ export async function verifyWithPhone(host: string, opts: { user?: string } = {}
   const assertion = await respondToChallenge(challenge);
   if (!assertion) return { ok: false, error: 'cancelled' };
   try {
-    const res = await fetch(`${base}/api/auth/response`, {
+    const res = await apiFetch(`${base}/api/auth/response`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(assertion),
