@@ -41,17 +41,26 @@ Phone evidence (Android 13, app 1.0.31, deck over `:8443`):
 `bun run typecheck` and `bun run build` are clean; `dist/` was republished with
 `rsync -a --delete dist/ ~/taildeck-web/` and the phone reloaded the new bundle.
 
-## Android shell (`/home/martin/Code/taildeck-android`, source only)
+## Android shell (`/home/martin/Code/taildeck-android`)
 
-No local JDK/Android SDK on this machine, so these compile in CI, not here.
+No local JDK/Android SDK on this machine; changes were pushed and validated by
+the Android CI run, then installed on the test phone from the signed release
+artifact.
 
-- `ConnectionSettingsDialog`: protocol buttons are a `selectableGroup` of radio
-  options that report `selected`; the auto-reconnect row is a single `toggleable`
-  checkbox node instead of a detached checkbox + label; the title is a heading;
-  close/supporting text are named.
-- `BottomNavBar`: Deck/Desktop switchers report `role=Role.Tab` + `selected` and
-  have clearer names.
+- `ConnectionSettingsDialog`: protocol is a `selectableGroup` of `Box +
+  selectable(role = Role.RadioButton)` options instead of `Button`s with an
+  extra `semantics{}` block (the button's own clickable kept overriding it).
+  On-device the nodes report `checkable=true` and flip `checked` true/false as
+  the protocol changes, and the port follows. The auto-reconnect row is a
+  single `toggleable` node with the label merged in. Title is a heading; close
+  is "Close connection settings"; the host error gets supporting text.
+- `BottomNavBar`: Deck/Desktop switchers are `Box + selectable(role = Role.Tab)`
+  so the tab node reports `selected` (verified: the active tab node has
+  `selected=true`).
 - `NativeStatusBar`: the host row is a named button with an `onClickLabel`.
+
+APKs must be installed from the CI release artifact so the signature matches the
+installed app; debug builds cannot upgrade a release install.
 
 ## Daemon update guard
 
@@ -65,13 +74,13 @@ Verified with a module-level harness that stubs `release_manifest`, plus a live
 `POST /api/update {"dryRun":true,"confirm":true}` after restarting
 `taildeck.service`.
 
-## Open
+## Release channel
 
-The GitHub Pages channel still advertises daemon 1.7.0 / app 1.0.0. Refreshing
-it means pushing `main`, which would also publish the 7 unpushed commits and the
-rest of this working tree (and the Android CI build). That is a public release,
-so it is left as an explicit decision.
+Published. `main` was pushed and Pages now serves `daemon 1.11.0`, `app 1.0.0`,
+with the daemon and web tarball checksums in `version.json`; the live
+`/api/version` reports `updateAvailable: false` against that manifest. The
+Android repo was pushed too and its CI builds green (debug + signed release).
 
-Note: the web app version (`package.json`) and the native APK version (`1.0.31`)
-are separate products; they should not be forced to match. The web app version
-only needs to bump when the daemon should offer a new bundled web app.
+Note: the web app version (`package.json`) and the native APK version are
+separate products; they should not be forced to match. The web app version only
+needs to bump when the daemon should offer a new bundled web app.
